@@ -124,6 +124,7 @@ use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
+use crate::ui_consts::ACTIVE_CELL_MAX_HEIGHT;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod agent;
@@ -3893,7 +3894,9 @@ impl ChatWidget {
 
     fn as_renderable(&self) -> RenderableItem<'_> {
         let active_cell_renderable = match &self.active_cell {
-            Some(cell) => RenderableItem::Borrowed(cell).inset(Insets::tlbr(1, 0, 0, 0)),
+            Some(cell) => RenderableItem::Borrowed(cell)
+                .inset(Insets::tlbr(1, 0, 0, 0))
+                .clamp_height(ACTIVE_CELL_MAX_HEIGHT),
             None => RenderableItem::Owned(Box::new(())),
         };
         let mut flex = FlexRenderable::new();

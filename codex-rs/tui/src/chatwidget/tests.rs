@@ -493,6 +493,21 @@ fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
 }
 
 #[tokio::test]
+async fn active_cell_height_is_clamped() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let width = 80;
+    let lines: Vec<Line<'static>> = (0..(crate::ui_consts::ACTIVE_CELL_MAX_HEIGHT as usize + 5))
+        .map(|idx| Line::from(format!("line {idx}")))
+        .collect();
+    chat.active_cell = Some(Box::new(crate::history_cell::PlainHistoryCell::new(lines)));
+
+    let bottom_height = chat.bottom_pane.desired_height(width) + 1;
+    let expected = bottom_height + crate::ui_consts::ACTIVE_CELL_MAX_HEIGHT;
+    let actual = chat.desired_height(width);
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn rate_limit_warnings_emit_thresholds() {
     let mut state = RateLimitWarningState::default();
     let mut warnings: Vec<String> = Vec::new();

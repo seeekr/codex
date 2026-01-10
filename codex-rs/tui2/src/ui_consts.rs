@@ -9,3 +9,4 @@
 /// - User history lines account for this many columns (e.g., "▌ ") when wrapping.
 pub(crate) const LIVE_PREFIX_COLS: u16 = 2;
 pub(crate) const FOOTER_INDENT_COLS: usize = LIVE_PREFIX_COLS as usize;
+pub(crate) const ACTIVE_CELL_MAX_HEIGHT: u16 = 8;

@@ -415,8 +415,45 @@ impl<'a> InsetRenderable<'a> {
     }
 }
 
+pub struct ClampHeightRenderable<'a> {
+    child: RenderableItem<'a>,
+    max_height: u16,
+}
+
+impl<'a> Renderable for ClampHeightRenderable<'a> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let clamped = Rect {
+            height: area.height.min(self.max_height),
+            ..area
+        };
+        self.child.render(clamped, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.child.desired_height(width).min(self.max_height)
+    }
+
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        let clamped = Rect {
+            height: area.height.min(self.max_height),
+            ..area
+        };
+        self.child.cursor_pos(clamped)
+    }
+}
+
+impl<'a> ClampHeightRenderable<'a> {
+    pub fn new(child: impl Into<RenderableItem<'a>>, max_height: u16) -> Self {
+        Self {
+            child: child.into(),
+            max_height,
+        }
+    }
+}
+
 pub trait RenderableExt<'a> {
     fn inset(self, insets: Insets) -> RenderableItem<'a>;
+    fn clamp_height(self, max_height: u16) -> RenderableItem<'a>;
 }
 
 impl<'a, R> RenderableExt<'a> for R
@@ -427,5 +464,11 @@ where
         let child: RenderableItem<'a> =
             RenderableItem::Owned(Box::new(self) as Box<dyn Renderable + 'a>);
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
+    }
+
+    fn clamp_height(self, max_height: u16) -> RenderableItem<'a> {
+        let child: RenderableItem<'a> =
+            RenderableItem::Owned(Box::new(self) as Box<dyn Renderable + 'a>);
+        RenderableItem::Owned(Box::new(ClampHeightRenderable::new(child, max_height)))
     }
 }
