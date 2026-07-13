@@ -11467,3 +11467,652 @@ fn test_tui_notification_condition_rejects_unknown_value() {
         "unexpected error: {err}"
     );
 }
+
+#[tokio::test]
+async fn locked_model_policy_requires_an_explicit_non_empty_model() {
+    let root = TempDir::new().expect("create test root");
+
+    for (case, model) in [("omitted", None), ("blank", Some("   "))] {
+        let mut overrides = vec![(
+            "model_settings_policy".to_string(),
+            TomlValue::String("locked".to_string()),
+        )];
+        if let Some(model) = model {
+            overrides.push(("model".to_string(), TomlValue::String(model.to_string())));
+        }
+        let codex_home = root.path().join(case);
+        std::fs::create_dir_all(&codex_home).expect("create case home");
+        let error = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.clone())
+            .fallback_cwd(Some(codex_home))
+            .cli_overrides(overrides)
+            .build()
+            .await
+            .expect_err("a locked model policy must reject an unresolved model");
+        let message = error.to_string();
+        assert!(
+            message.contains("requires an explicit non-empty model"),
+            "unexpected {case} error: {message}"
+        );
+    }
+
+    let mutable_home = root.path().join("mutable");
+    std::fs::create_dir_all(&mutable_home).expect("create mutable home");
+    let mutable = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(mutable_home.clone())
+        .fallback_cwd(Some(mutable_home))
+        .build()
+        .await
+        .expect("the compatibility default must still allow catalog model resolution");
+    assert_eq!(mutable.model_settings_policy, ModelSettingsPolicy::Mutable);
+    assert_eq!(mutable.model, None);
+
+    let locked_home = root.path().join("locked");
+    std::fs::create_dir_all(&locked_home).expect("create locked home");
+    let locked = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(locked_home.clone())
+        .fallback_cwd(Some(locked_home))
+        .cli_overrides(vec![
+            (
+                "model".to_string(),
+                TomlValue::String("gpt-explicit".to_string()),
+            ),
+            (
+                "model_settings_policy".to_string(),
+                TomlValue::String("locked".to_string()),
+            ),
+        ])
+        .build()
+        .await
+        .expect("an explicit model must satisfy the lock contract");
+    assert_eq!(locked.model.as_deref(), Some("gpt-explicit"));
+    assert_eq!(locked.model_settings_policy, ModelSettingsPolicy::Locked);
+}
+
+#[tokio::test]
+async fn locked_thread_settings_validator_covers_substantive_routes_and_reviewer_policies() {
+    let codex_home = tempdir().expect("create codex home");
+    let mut base = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("build base config");
+    base.model = Some("gpt-locked".to_string());
+    base.experimental_realtime_ws_base_url = Some("wss://pinned.example/v1/realtime".to_string());
+    base.experimental_realtime_webrtc_call_base_url = Some("https://pinned.example/v1".to_string());
+    base.experimental_realtime_ws_model = Some("gpt-realtime-pinned".to_string());
+    base.realtime.version = RealtimeWsVersion::V2;
+    base.realtime.session_type = RealtimeWsMode::Conversational;
+    base.realtime.transport = RealtimeTransport::Websocket;
+    base.model_reasoning_effort = Some(ReasoningEffort::High);
+    base.model_settings_policy = ModelSettingsPolicy::Locked;
+    base.server_model_validation = ServerModelValidation::RequireMatch;
+    base.review_model = Some("gpt-locked".to_string());
+    base.plan_mode_reasoning_effort = Some(ReasoningEffort::High);
+    base.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    base.approvals_reviewer_policy = ApprovalsReviewerPolicy::Locked;
+
+    validate_locked_settings_override(&base, &base.clone())
+        .expect("identical settings are a no-op");
+
+    let mut changed = base.clone();
+    changed.model = Some("gpt-lower".to_string());
+    changed.model_provider_id = "different-provider".to_string();
+    changed.model_provider.base_url = Some("https://attacker.example/v1".to_string());
+    changed.chatgpt_base_url = "https://attacker.example/backend-api/codex".to_string();
+    changed.respect_system_proxy = !base.respect_system_proxy;
+    changed.experimental_realtime_ws_base_url =
+        Some("wss://attacker.example/v1/realtime".to_string());
+    changed.experimental_realtime_webrtc_call_base_url =
+        Some("https://attacker.example/v1".to_string());
+    changed.experimental_realtime_ws_model = Some("gpt-realtime-other".to_string());
+    changed.realtime.version = RealtimeWsVersion::V1;
+    changed.realtime.session_type = RealtimeWsMode::Transcription;
+    changed.realtime.transport = RealtimeTransport::WebRtc;
+    changed.model_reasoning_effort = Some(ReasoningEffort::Low);
+    changed.review_model = Some("gpt-review-lower".to_string());
+    changed.plan_mode_reasoning_effort = Some(ReasoningEffort::Low);
+    changed.model_settings_policy = ModelSettingsPolicy::Mutable;
+    changed.server_model_validation = ServerModelValidation::Warn;
+    changed.approvals_reviewer = ApprovalsReviewer::User;
+    changed.approvals_reviewer_policy = ApprovalsReviewerPolicy::Mutable;
+    let error = validate_locked_settings_override(&base, &changed)
+        .expect_err("a changed substantive provider route must fail");
+    assert_eq!(
+        error.changed_fields(),
+        &[
+            "model",
+            "model_provider",
+            "chatgpt_base_url",
+            "auth_route",
+            "model_reasoning_effort",
+            "review_model",
+            "plan_mode_reasoning_effort",
+            "model_settings_policy",
+            "server_model_validation",
+            "approvals_reviewer",
+            "approvals_reviewer_policy"
+        ]
+    );
+
+    let mut fixed_purpose_realtime = base.clone();
+    fixed_purpose_realtime.experimental_realtime_ws_base_url =
+        Some("wss://harness.example/v1/realtime".to_string());
+    fixed_purpose_realtime.experimental_realtime_webrtc_call_base_url =
+        Some("https://harness.example/v1".to_string());
+    fixed_purpose_realtime.experimental_realtime_ws_model =
+        Some("gpt-realtime-harness".to_string());
+    fixed_purpose_realtime.realtime.version = RealtimeWsVersion::V1;
+    fixed_purpose_realtime.realtime.session_type = RealtimeWsMode::Transcription;
+    fixed_purpose_realtime.realtime.transport = RealtimeTransport::WebRtc;
+    fixed_purpose_realtime.realtime.voice = Some(RealtimeVoice::Cedar);
+    fixed_purpose_realtime.realtime_audio.microphone = Some("Studio Mic".to_string());
+    fixed_purpose_realtime.experimental_realtime_ws_backend_prompt =
+        Some("alternate voice prompt".to_string());
+    fixed_purpose_realtime.experimental_realtime_ws_startup_context =
+        Some("alternate startup context".to_string());
+    fixed_purpose_realtime.experimental_realtime_start_instructions =
+        Some("alternate transition instructions".to_string());
+    validate_locked_settings_override(&base, &fixed_purpose_realtime)
+        .expect("fixed-purpose realtime machinery is independent of substantive model settings");
+
+    let mut mutable = base.clone();
+    mutable.model_settings_policy = ModelSettingsPolicy::Mutable;
+    mutable.approvals_reviewer_policy = ApprovalsReviewerPolicy::Mutable;
+    validate_locked_settings_override(&mutable, &changed)
+        .expect("mutable remains the compatibility default");
+
+    let mut reviewer_only_base = base.clone();
+    reviewer_only_base.model_settings_policy = ModelSettingsPolicy::Mutable;
+    let mut reviewer_only_changed = reviewer_only_base.clone();
+    reviewer_only_changed.model = Some("allowed-model-change".to_string());
+    reviewer_only_changed.approvals_reviewer = ApprovalsReviewer::User;
+    let error = validate_locked_settings_override(&reviewer_only_base, &reviewer_only_changed)
+        .expect_err("reviewer routing has an independent lock");
+    assert_eq!(error.changed_fields(), &["approvals_reviewer"]);
+}
+
+fn locked_session_flags_config() -> TomlValue {
+    toml::from_str(
+        r#"
+model = "gpt-session"
+model_provider = "openai"
+openai_base_url = ""
+chatgpt_base_url = "https://chatgpt.com/backend-api/"
+experimental_realtime_ws_base_url = "wss://pinned.example/v1/realtime"
+experimental_realtime_webrtc_call_base_url = "https://pinned.example/v1"
+experimental_realtime_ws_model = "gpt-realtime-pinned"
+model_reasoning_effort = "high"
+review_model = "gpt-session-review"
+plan_mode_reasoning_effort = "high"
+model_settings_policy = "locked"
+server_model_validation = "require_match"
+approvals_reviewer = "auto_review"
+approvals_reviewer_policy = "locked"
+
+[realtime]
+version = "v2"
+type = "conversational"
+transport = "websocket"
+voice = "cedar"
+
+[features]
+respect_system_proxy = false
+"#,
+    )
+    .expect("locked SessionFlags config should parse")
+}
+
+fn incompatible_managed_model_config() -> TomlValue {
+    toml::from_str(
+        r#"
+model = "gpt-managed"
+model_provider = "managed"
+openai_base_url = "https://managed-openai.example/v1"
+chatgpt_base_url = "https://managed.example/backend-api/"
+experimental_realtime_ws_base_url = "wss://managed.example/v1/realtime"
+experimental_realtime_webrtc_call_base_url = "https://managed.example/v1"
+experimental_realtime_ws_model = "gpt-realtime-managed"
+model_reasoning_effort = "low"
+review_model = "gpt-managed-review"
+plan_mode_reasoning_effort = "low"
+model_settings_policy = "mutable"
+server_model_validation = "warn"
+approvals_reviewer = "user"
+approvals_reviewer_policy = "mutable"
+
+[realtime]
+version = "v1"
+type = "transcription"
+transport = "webrtc"
+voice = "marin"
+
+[features]
+respect_system_proxy = true
+
+[model_providers.managed]
+name = "Managed"
+base_url = "https://managed.example/v1"
+wire_api = "responses"
+"#,
+    )
+    .expect("managed config should parse")
+}
+
+async fn load_config_from_test_layers(
+    codex_home: &TempDir,
+    layers: Vec<ConfigLayerEntry>,
+) -> std::io::Result<Config> {
+    let stack = ConfigLayerStack::new(layers, Default::default(), Default::default())
+        .map_err(std::io::Error::other)?;
+    let cfg = stack
+        .effective_config()
+        .try_into()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        cfg,
+        ConfigOverrides {
+            cwd: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+        stack,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn locked_session_flags_fail_closed_against_both_legacy_managed_sources() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let managed_sources = [
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+            file: codex_home.path().join("managed_config.toml").abs(),
+        },
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+    ];
+    let expected_changed_fields = [
+        "model",
+        "model_provider",
+        "chatgpt_base_url",
+        "auth_route",
+        "model_reasoning_effort",
+        "review_model",
+        "plan_mode_reasoning_effort",
+        "model_settings_policy",
+        "server_model_validation",
+        "approvals_reviewer",
+        "approvals_reviewer_policy",
+    ];
+
+    for managed_source in managed_sources {
+        let error = load_config_from_test_layers(
+            &codex_home,
+            vec![
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::SessionFlags,
+                    locked_session_flags_config(),
+                ),
+                ConfigLayerEntry::new(managed_source.clone(), incompatible_managed_model_config()),
+            ],
+        )
+        .await
+        .expect_err("a managed override must make the locked invocation incompatible");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "higher-precedence configuration changed settings protected by locked SessionFlags"
+            ),
+            "unexpected error for {managed_source:?}: {message}"
+        );
+        for field in expected_changed_fields {
+            assert!(
+                message.contains(field),
+                "expected {field} in error for {managed_source:?}: {message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn locked_session_flags_accept_matching_managed_layers() {
+    let codex_home = TempDir::new().expect("create codex home");
+
+    for managed_source in [
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+            file: codex_home.path().join("managed_config.toml").abs(),
+        },
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+    ] {
+        let config = load_config_from_test_layers(
+            &codex_home,
+            vec![
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::SessionFlags,
+                    locked_session_flags_config(),
+                ),
+                ConfigLayerEntry::new(
+                    managed_source,
+                    toml::toml! {
+                        check_for_update_on_startup = false
+                    }
+                    .into(),
+                ),
+            ],
+        )
+        .await
+        .expect("an unrelated managed setting should remain compatible");
+        assert_eq!(config.model.as_deref(), Some("gpt-session"));
+        assert_eq!(config.model_settings_policy, ModelSettingsPolicy::Locked);
+        assert_eq!(
+            config.approvals_reviewer_policy,
+            ApprovalsReviewerPolicy::Locked
+        );
+    }
+}
+
+#[tokio::test]
+async fn locked_session_flags_allow_fixed_purpose_realtime_changes() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let presentation_config = toml::toml! {
+        experimental_realtime_ws_base_url = "wss://managed.example/v1/realtime"
+        experimental_realtime_webrtc_call_base_url = "https://managed.example/v1"
+        experimental_realtime_ws_model = "gpt-realtime-managed"
+        experimental_realtime_ws_backend_prompt = "managed voice prompt"
+        experimental_realtime_ws_startup_context = "managed startup context"
+        experimental_realtime_start_instructions = "managed transition instructions"
+
+        [audio]
+        microphone = "Managed Mic"
+        speaker = "Managed Speaker"
+
+        [realtime]
+        version = "v1"
+        type = "transcription"
+        transport = "webrtc"
+        voice = "marin"
+    }
+    .into();
+
+    let config = load_config_from_test_layers(
+        &codex_home,
+        vec![
+            ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                locked_session_flags_config(),
+            ),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+                presentation_config,
+            ),
+        ],
+    )
+    .await
+    .expect("fixed-purpose realtime changes should not alter the locked substantive route");
+
+    assert_eq!(
+        config.experimental_realtime_ws_base_url.as_deref(),
+        Some("wss://managed.example/v1/realtime")
+    );
+    assert_eq!(
+        config.experimental_realtime_webrtc_call_base_url.as_deref(),
+        Some("https://managed.example/v1")
+    );
+    assert_eq!(
+        config.experimental_realtime_ws_model.as_deref(),
+        Some("gpt-realtime-managed")
+    );
+    assert_eq!(config.realtime.version, RealtimeWsVersion::V1);
+    assert_eq!(config.realtime.session_type, RealtimeWsMode::Transcription);
+    assert_eq!(config.realtime.transport, RealtimeTransport::WebRtc);
+    assert_eq!(config.realtime.voice, Some(RealtimeVoice::Marin));
+    assert_eq!(
+        config.realtime_audio.microphone.as_deref(),
+        Some("Managed Mic")
+    );
+    assert_eq!(
+        config.experimental_realtime_ws_backend_prompt.as_deref(),
+        Some("managed voice prompt")
+    );
+}
+
+#[tokio::test]
+async fn managed_layer_can_impose_locks_when_session_flags_do_not_request_them() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let session_config = toml::toml! {
+        model = "gpt-session"
+        model_settings_policy = "mutable"
+        approvals_reviewer = "user"
+        approvals_reviewer_policy = "mutable"
+    }
+    .into();
+    let managed_config = toml::toml! {
+        model = "gpt-managed"
+        model_settings_policy = "locked"
+        approvals_reviewer = "auto_review"
+        approvals_reviewer_policy = "locked"
+    }
+    .into();
+
+    let config = load_config_from_test_layers(
+        &codex_home,
+        vec![
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, session_config),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+                managed_config,
+            ),
+        ],
+    )
+    .await
+    .expect("managed config may impose a stricter lock when SessionFlags do not request one");
+
+    assert_eq!(config.model.as_deref(), Some("gpt-managed"));
+    assert_eq!(config.model_settings_policy, ModelSettingsPolicy::Locked);
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(
+        config.approvals_reviewer_policy,
+        ApprovalsReviewerPolicy::Locked
+    );
+}
+
+#[tokio::test]
+async fn session_flags_launch_locks_are_orthogonal() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let session_config = toml::toml! {
+        model = "gpt-session"
+        model_settings_policy = "locked"
+        approvals_reviewer = "auto_review"
+        approvals_reviewer_policy = "mutable"
+    }
+    .into();
+    let managed_config = toml::toml! {
+        approvals_reviewer = "user"
+    }
+    .into();
+
+    let config = load_config_from_test_layers(
+        &codex_home,
+        vec![
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, session_config),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+                managed_config,
+            ),
+        ],
+    )
+    .await
+    .expect("the model lock must not implicitly lock approval-review routing");
+
+    assert_eq!(config.model.as_deref(), Some("gpt-session"));
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
+}
+
+#[tokio::test]
+async fn locked_session_flags_reject_reviewer_normalization_by_requirements() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let error = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![
+            (
+                "approvals_reviewer".to_string(),
+                TomlValue::String("auto_review".to_string()),
+            ),
+            (
+                "approvals_reviewer_policy".to_string(),
+                TomlValue::String("locked".to_string()),
+            ),
+        ])
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"allowed_approvals_reviewers = ["user"]"#,
+            ),
+        )
+        .build()
+        .await
+        .expect_err("requirements must not silently normalize an explicitly locked reviewer");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("settings protected by locked SessionFlags")
+            && message.contains("approvals_reviewer"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn locked_session_flags_reject_route_normalization_by_requirements() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let error = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![
+            (
+                "model".to_string(),
+                TomlValue::String("gpt-locked".to_string()),
+            ),
+            (
+                "model_settings_policy".to_string(),
+                TomlValue::String("locked".to_string()),
+            ),
+            (
+                "features.respect_system_proxy".to_string(),
+                TomlValue::Boolean(false),
+            ),
+        ])
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+respect_system_proxy = true
+"#,
+            ),
+        )
+        .build()
+        .await
+        .expect_err("requirements must not silently normalize an explicitly locked route");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("settings protected by locked SessionFlags")
+            && message.contains("auth_route"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn first_locked_session_layer_is_the_launch_anchor() {
+    let codex_home = TempDir::new().expect("create codex home");
+    let first_session = toml::toml! {
+        model = "gpt-locked-first"
+        model_reasoning_effort = "high"
+        model_settings_policy = "locked"
+    }
+    .into();
+    let later_session = toml::toml! {
+        model = "gpt-later"
+        model_reasoning_effort = "low"
+        model_settings_policy = "mutable"
+    }
+    .into();
+
+    let error = load_config_from_test_layers(
+        &codex_home,
+        vec![
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, first_session),
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, later_session),
+        ],
+    )
+    .await
+    .expect_err("a later same-precedence SessionFlags layer must not erase the first lock");
+
+    let message = error.to_string();
+    assert!(message.contains("model"), "unexpected error: {message}");
+    assert!(
+        message.contains("model_reasoning_effort"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("model_settings_policy"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn locked_session_flags_reject_config_lock_replay_from_any_config_origin() {
+    let root = TempDir::new().expect("create test root");
+    let cli_overrides = vec![
+        (
+            "model".to_string(),
+            TomlValue::String("gpt-locked".to_string()),
+        ),
+        (
+            "model_settings_policy".to_string(),
+            TomlValue::String("locked".to_string()),
+        ),
+    ];
+    let config_with_replay = r#"
+[debug.config_lockfile]
+load_path = "missing.config.lock.toml"
+"#;
+
+    for origin in ["user", "system", "managed"] {
+        let codex_home = root.path().join(origin);
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+        let user_config_path = codex_home.join(CONFIG_TOML_FILE);
+        let system_config_path = codex_home.join("system-config.toml");
+        let managed_config_path = codex_home.join("managed_config.toml");
+        let selected_path = match origin {
+            "user" => &user_config_path,
+            "system" => &system_config_path,
+            "managed" => &managed_config_path,
+            _ => unreachable!(),
+        };
+        std::fs::write(selected_path, config_with_replay).expect("write replay config");
+        let loader_overrides = LoaderOverrides {
+            user_config_path: Some(user_config_path.abs()),
+            system_config_path: Some(system_config_path),
+            managed_config_path: Some(managed_config_path),
+            system_requirements_path: Some(codex_home.join("requirements.toml")),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: Some(String::new()),
+            macos_managed_config_requirements_base64: Some(String::new()),
+            ..Default::default()
+        };
+
+        let error = ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .fallback_cwd(Some(codex_home))
+            .cli_overrides(cli_overrides.clone())
+            .loader_overrides(loader_overrides)
+            .build()
+            .await
+            .expect_err("config-lock replay must not discard locked SessionFlags");
+        let message = error.to_string();
+        assert!(
+            message.contains("config_lockfile.load_path") && message.contains("SessionFlags"),
+            "unexpected {origin} error: {message}"
+        );
+    }
+}

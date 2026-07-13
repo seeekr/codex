@@ -43,11 +43,15 @@ pub fn spawn_response_stream(
         .get("X-Models-Etag")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let server_model = stream_response
+    let server_model_attestations = stream_response
         .headers
-        .get(OPENAI_MODEL_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
+        .get_all(OPENAI_MODEL_HEADER)
+        .iter()
+        .map(|value| match value.to_str() {
+            Ok(model) => ResponseEvent::ServerModel(model.to_string()),
+            Err(_) => ResponseEvent::InvalidServerModelAttestation,
+        })
+        .collect::<Vec<_>>();
     let reasoning_included = stream_response
         .headers
         .get(X_REASONING_INCLUDED_HEADER)
@@ -69,8 +73,8 @@ pub fn spawn_response_stream(
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
-        if let Some(model) = server_model {
-            let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+        for attestation in server_model_attestations {
+            let _ = tx_event.send(Ok(attestation)).await;
         }
         for snapshot in rate_limit_snapshots {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
@@ -178,25 +182,23 @@ impl ResponsesStreamEvent {
         &self.kind
     }
 
-    /// Returns the effective model reported by the server, if present.
+    /// Returns every model attestation reported by the server.
     ///
-    /// Precedence:
-    /// 1. `response.headers` for standard Responses stream events.
-    /// 2. top-level `headers` for websocket metadata events.
-    pub fn response_model(&self) -> Option<String> {
-        let response_headers_model = self
+    /// Both response-local and top-level header collections are inspected. A server that reports
+    /// conflicting values must not be able to hide one behind precedence or an array-valued header.
+    pub fn response_models(&self) -> Vec<Option<String>> {
+        let mut models = Vec::new();
+        if let Some(headers) = self
             .response
             .as_ref()
             .and_then(|response| response.get("headers"))
-            .and_then(header_openai_model_value_from_json);
-
-        match response_headers_model {
-            Some(model) => Some(model),
-            None => self
-                .headers
-                .as_ref()
-                .and_then(header_openai_model_value_from_json),
+        {
+            models.extend(header_openai_model_values_from_json(headers));
         }
+        if let Some(headers) = &self.headers {
+            models.extend(header_openai_model_values_from_json(headers));
+        }
+        models
     }
 
     pub(crate) fn turn_state(&self) -> Option<String> {
@@ -247,16 +249,33 @@ impl ResponsesStreamEvent {
     }
 }
 
-fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
-    let headers = value.as_object()?;
-    headers.iter().find_map(|(name, value)| {
-        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
-        {
-            json_value_as_string(value)
-        } else {
-            None
+fn header_openai_model_values_from_json(value: &Value) -> Vec<Option<String>> {
+    let Some(headers) = value.as_object() else {
+        return Vec::new();
+    };
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            if name.eq_ignore_ascii_case("openai-model")
+                || name.eq_ignore_ascii_case("x-openai-model")
+            {
+                true
+            } else {
+                false
+            }
+        })
+        .flat_map(|(_, value)| json_value_as_strings(value))
+        .collect()
+}
+
+fn json_value_as_strings(value: &Value) -> Vec<Option<String>> {
+    match value {
+        Value::String(value) => vec![Some(value.clone())],
+        Value::Array(items) if !items.is_empty() => {
+            items.iter().flat_map(json_value_as_strings).collect()
         }
-    })
+        _ => vec![None],
+    }
 }
 
 fn header_turn_state_value_from_json(value: &Value) -> Option<String> {
@@ -540,17 +559,29 @@ async fn process_sse_with_treatment(
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
 
-        if let Some(model) = event.response_model()
-            && last_server_model.as_deref() != Some(model.as_str())
-        {
-            if tx_event
-                .send(Ok(ResponseEvent::ServerModel(model.clone())))
-                .await
-                .is_err()
-            {
-                return;
+        for attestation in event.response_models() {
+            match attestation {
+                Some(model) if last_server_model.as_deref() != Some(model.as_str()) => {
+                    if tx_event
+                        .send(Ok(ResponseEvent::ServerModel(model.clone())))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_server_model = Some(model);
+                }
+                Some(_) => {}
+                None => {
+                    if tx_event
+                        .send(Ok(ResponseEvent::InvalidServerModelAttestation))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
-            last_server_model = Some(model);
         }
         if let Some(verifications) = model_verifications
             && tx_event
@@ -1515,13 +1546,13 @@ mod tests {
         .expect("expected event to deserialize");
 
         assert_eq!(
-            ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
+            ev.response_models(),
+            vec![Some(CYBER_RESTRICTED_MODEL_FOR_TESTS.to_string())]
         );
     }
 
     #[test]
-    fn responses_stream_event_response_model_prefers_response_headers() {
+    fn responses_stream_event_response_models_preserve_conflicting_attestations() {
         let ev: ResponsesStreamEvent = serde_json::from_value(json!({
             "type": "response.created",
             "headers": {
@@ -1537,8 +1568,53 @@ mod tests {
         .expect("expected event to deserialize");
 
         assert_eq!(
-            ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
+            ev.response_models(),
+            vec![
+                Some(CYBER_RESTRICTED_MODEL_FOR_TESTS.to_string()),
+                Some("top-level-model".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_stream_event_response_models_flattens_aliases_and_arrays() {
+        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp-1",
+                "headers": {
+                    "OpenAI-Model": ["requested-model", "conflicting-model"],
+                    "X-OpenAI-Model": "another-model"
+                }
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(
+            ev.response_models(),
+            vec![
+                Some("requested-model".to_string()),
+                Some("conflicting-model".to_string()),
+                Some("another-model".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_stream_event_response_models_preserves_invalid_values() {
+        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "response": {
+                "headers": {
+                    "OpenAI-Model": ["requested-model", 42]
+                }
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(
+            ev.response_models(),
+            vec![Some("requested-model".to_string()), None]
         );
     }
 

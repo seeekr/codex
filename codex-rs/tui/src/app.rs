@@ -135,6 +135,7 @@ use codex_config::LoaderOverrides;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::MemoriesToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
+use codex_config::types::ModelSettingsPolicy;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsToml;
 use codex_exec_server::EnvironmentManager;

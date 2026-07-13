@@ -74,6 +74,8 @@ use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_config::types::ModelSettingsPolicy;
+use codex_config::types::ServerModelValidation;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_extension_api::TurnInputContext;
@@ -2233,6 +2235,28 @@ async fn try_run_sampling_request(
                         .store(true, Ordering::Relaxed);
                 }
             }
+            ResponseEvent::InvalidServerModelAttestation => {
+                warn!("server returned an invalid model attestation");
+            }
+            ResponseEvent::ServerModelConnectionDiagnostic(server_model) => {
+                if turn_context.config.server_model_validation == ServerModelValidation::Warn
+                    && !turn_context
+                        .server_model_warning_emitted
+                        .load(Ordering::Relaxed)
+                    && sess
+                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
+                        .await
+                {
+                    turn_context
+                        .server_model_warning_emitted
+                        .store(true, Ordering::Relaxed);
+                }
+            }
+            ResponseEvent::InvalidServerModelConnectionDiagnostic => {
+                if turn_context.config.server_model_validation == ServerModelValidation::Warn {
+                    warn!("server returned an invalid connection-scoped model diagnostic");
+                }
+            }
             ResponseEvent::ModelVerifications(verifications) => {
                 if !turn_context
                     .model_verification_emitted
@@ -2247,6 +2271,10 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::SafetyBuffering(buffering) => {
+                let faster_model = (turn_context.config.model_settings_policy
+                    == ModelSettingsPolicy::Mutable)
+                    .then_some(buffering.faster_model)
+                    .flatten();
                 sess.send_event(
                     &turn_context,
                     EventMsg::SafetyBuffering(SafetyBufferingEvent {
@@ -2254,7 +2282,7 @@ async fn try_run_sampling_request(
                         use_cases: buffering.use_cases,
                         reasons: buffering.reasons,
                         show_buffering_ui: buffering.show_buffering_ui,
-                        faster_model: buffering.faster_model,
+                        faster_model,
                     }),
                 )
                 .await;

@@ -34,6 +34,7 @@ use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
 use codex_config::types::ApprovalsReviewer;
+use codex_config::types::ApprovalsReviewerPolicy;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::History;
@@ -41,8 +42,10 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
 use codex_config::types::MemoriesConfig;
 use codex_config::types::ModelAvailabilityNuxConfig;
+use codex_config::types::ModelSettingsPolicy;
 use codex_config::types::Notice;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_config::types::ServerModelValidation;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestConfig;
 use codex_config::types::ToolSuggestDisabledTool;
@@ -624,6 +627,15 @@ pub struct Config {
     /// Optional override of model selection.
     pub model: Option<String>,
 
+    /// Whether derived addressable-work configs may change protected model execution settings.
+    pub model_settings_policy: ModelSettingsPolicy,
+
+    /// Whether derived addressable-work configs may change approval-review routing.
+    pub approvals_reviewer_policy: ApprovalsReviewerPolicy,
+
+    /// How server-reported model identities are validated against each request.
+    pub server_model_validation: ServerModelValidation,
+
     /// Effective service tier request id preference for new turns.
     /// `default` means the user explicitly selected standard routing.
     pub service_tier: Option<String>,
@@ -1081,6 +1093,486 @@ pub struct Config {
     pub otel: codex_config::types::OtelConfig,
 }
 
+/// A locked model policy cannot safely anchor a model that is still selected from a mutable
+/// catalog default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockedModelSelectionError;
+
+impl std::fmt::Display for LockedModelSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "model_settings_policy=locked requires an explicit non-empty model; a catalog default can change during the invocation and cannot be locked safely",
+        )
+    }
+}
+
+impl std::error::Error for LockedModelSelectionError {}
+
+/// Rejects an unresolved model before a locked configuration can become an invocation anchor.
+pub fn validate_locked_model_selection(config: &Config) -> Result<(), LockedModelSelectionError> {
+    if config.model_settings_policy == ModelSettingsPolicy::Locked
+        && config
+            .model
+            .as_deref()
+            .is_none_or(|model| model.trim().is_empty())
+    {
+        Err(LockedModelSelectionError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Protected settings changed by a derived thread or ordinary child-agent configuration while
+/// its base config has the corresponding lock enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedSettingsOverrideError {
+    changed_fields: Vec<&'static str>,
+}
+
+impl LockedSettingsOverrideError {
+    pub fn changed_fields(&self) -> &[&'static str] {
+        &self.changed_fields
+    }
+}
+
+impl std::fmt::Display for LockedSettingsOverrideError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "protected settings are locked for this invocation; derived configuration changed: {}",
+            self.changed_fields.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for LockedSettingsOverrideError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProtectedSettingsMask {
+    model: bool,
+    model_provider: bool,
+    chatgpt_base_url: bool,
+    auth_route: bool,
+    model_reasoning_effort: bool,
+    review_model: bool,
+    plan_mode_reasoning_effort: bool,
+    model_settings_policy: bool,
+    server_model_validation: bool,
+    approvals_reviewer: bool,
+    approvals_reviewer_policy: bool,
+}
+
+impl ProtectedSettingsMask {
+    fn all(model_settings_locked: bool, approvals_reviewer_locked: bool) -> Self {
+        Self {
+            model: model_settings_locked,
+            model_provider: model_settings_locked,
+            chatgpt_base_url: model_settings_locked,
+            auth_route: model_settings_locked,
+            model_reasoning_effort: model_settings_locked,
+            review_model: model_settings_locked,
+            plan_mode_reasoning_effort: model_settings_locked,
+            model_settings_policy: model_settings_locked,
+            server_model_validation: model_settings_locked,
+            approvals_reviewer: approvals_reviewer_locked,
+            approvals_reviewer_policy: approvals_reviewer_locked,
+        }
+    }
+
+    fn explicit_in_session_layer(session_config: &TomlValue) -> Self {
+        let has = |key: &str| session_config.get(key).is_some();
+        let has_feature = |key: &str| {
+            session_config
+                .get("features")
+                .and_then(TomlValue::as_table)
+                .is_some_and(|features| features.contains_key(key))
+        };
+        Self {
+            model: has("model"),
+            model_provider: has("model_provider")
+                || has("model_providers")
+                || has("openai_base_url"),
+            chatgpt_base_url: has("chatgpt_base_url"),
+            auth_route: has_feature("respect_system_proxy"),
+            model_reasoning_effort: has("model_reasoning_effort"),
+            review_model: has("review_model"),
+            plan_mode_reasoning_effort: has("plan_mode_reasoning_effort"),
+            model_settings_policy: has("model_settings_policy"),
+            server_model_validation: has("server_model_validation"),
+            approvals_reviewer: has("approvals_reviewer"),
+            approvals_reviewer_policy: has("approvals_reviewer_policy"),
+        }
+    }
+
+    fn union_with(&mut self, other: Self) {
+        self.model |= other.model;
+        self.model_provider |= other.model_provider;
+        self.chatgpt_base_url |= other.chatgpt_base_url;
+        self.auth_route |= other.auth_route;
+        self.model_reasoning_effort |= other.model_reasoning_effort;
+        self.review_model |= other.review_model;
+        self.plan_mode_reasoning_effort |= other.plan_mode_reasoning_effort;
+        self.model_settings_policy |= other.model_settings_policy;
+        self.server_model_validation |= other.server_model_validation;
+        self.approvals_reviewer |= other.approvals_reviewer;
+        self.approvals_reviewer_policy |= other.approvals_reviewer_policy;
+    }
+
+    fn model_only(self) -> Self {
+        Self {
+            approvals_reviewer: false,
+            approvals_reviewer_policy: false,
+            ..self
+        }
+    }
+
+    fn approvals_reviewer_only(self) -> Self {
+        Self {
+            model: false,
+            model_provider: false,
+            chatgpt_base_url: false,
+            auth_route: false,
+            model_reasoning_effort: false,
+            review_model: false,
+            plan_mode_reasoning_effort: false,
+            model_settings_policy: false,
+            server_model_validation: false,
+            ..self
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockedSettingsDomain {
+    Model,
+    ApprovalsReviewer,
+}
+
+impl LockedSettingsDomain {
+    fn all_fields(self) -> ProtectedSettingsMask {
+        match self {
+            Self::Model => ProtectedSettingsMask::all(true, false),
+            Self::ApprovalsReviewer => ProtectedSettingsMask::all(false, true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionFlagsLockAnchor {
+    domain: LockedSettingsDomain,
+    layer_position: usize,
+    explicit_fields: ProtectedSettingsMask,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionFlagsLockAnchors {
+    anchors: Vec<SessionFlagsLockAnchor>,
+}
+
+impl SessionFlagsLockAnchors {
+    fn from_layer_stack(config_layer_stack: &ConfigLayerStack) -> Self {
+        let mut cumulative_explicit_fields = ProtectedSettingsMask::default();
+        let mut model_anchor = None;
+        let mut approvals_reviewer_anchor = None;
+
+        for (layer_position, layer) in config_layer_stack
+            .get_layers(
+                ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                /* include_disabled */ false,
+            )
+            .into_iter()
+            .enumerate()
+        {
+            if !matches!(layer.name, ConfigLayerSource::SessionFlags) {
+                continue;
+            }
+            cumulative_explicit_fields.union_with(
+                ProtectedSettingsMask::explicit_in_session_layer(&layer.config),
+            );
+
+            if model_anchor.is_none()
+                && layer
+                    .config
+                    .get("model_settings_policy")
+                    .and_then(TomlValue::as_str)
+                    == Some("locked")
+            {
+                model_anchor = Some(SessionFlagsLockAnchor {
+                    domain: LockedSettingsDomain::Model,
+                    layer_position,
+                    explicit_fields: cumulative_explicit_fields.model_only(),
+                });
+            }
+            if approvals_reviewer_anchor.is_none()
+                && layer
+                    .config
+                    .get("approvals_reviewer_policy")
+                    .and_then(TomlValue::as_str)
+                    == Some("locked")
+            {
+                approvals_reviewer_anchor = Some(SessionFlagsLockAnchor {
+                    domain: LockedSettingsDomain::ApprovalsReviewer,
+                    layer_position,
+                    explicit_fields: cumulative_explicit_fields.approvals_reviewer_only(),
+                });
+            }
+        }
+
+        Self {
+            anchors: [model_anchor, approvals_reviewer_anchor]
+                .into_iter()
+                .flatten()
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchors.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProtectedSettingsSnapshot {
+    model: Option<String>,
+    model_provider_id: String,
+    model_provider: ModelProviderInfo,
+    chatgpt_base_url: String,
+    auth_route: Option<AuthRouteConfig>,
+    model_reasoning_effort: Option<ReasoningEffort>,
+    review_model: Option<String>,
+    plan_mode_reasoning_effort: Option<ReasoningEffort>,
+    model_settings_policy: ModelSettingsPolicy,
+    server_model_validation: ServerModelValidation,
+    approvals_reviewer: ApprovalsReviewer,
+    approvals_reviewer_policy: ApprovalsReviewerPolicy,
+}
+
+impl ProtectedSettingsSnapshot {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            model: config.model.clone(),
+            model_provider_id: config.model_provider_id.clone(),
+            model_provider: config.model_provider.clone(),
+            chatgpt_base_url: config.chatgpt_base_url.clone(),
+            auth_route: config.auth_route_config(),
+            model_reasoning_effort: config.model_reasoning_effort.clone(),
+            review_model: config.review_model.clone(),
+            plan_mode_reasoning_effort: config.plan_mode_reasoning_effort.clone(),
+            model_settings_policy: config.model_settings_policy,
+            server_model_validation: config.server_model_validation,
+            approvals_reviewer: config.approvals_reviewer,
+            approvals_reviewer_policy: config.approvals_reviewer_policy,
+        }
+    }
+
+    fn changed_fields(&self, candidate: &Config, mask: ProtectedSettingsMask) -> Vec<&'static str> {
+        let mut changed_fields = Vec::new();
+        if mask.model && self.model != candidate.model {
+            changed_fields.push("model");
+        }
+        if mask.model_provider
+            && (self.model_provider_id != candidate.model_provider_id
+                || self.model_provider != candidate.model_provider)
+        {
+            changed_fields.push("model_provider");
+        }
+        if mask.chatgpt_base_url && self.chatgpt_base_url != candidate.chatgpt_base_url {
+            changed_fields.push("chatgpt_base_url");
+        }
+        if mask.auth_route && self.auth_route != candidate.auth_route_config() {
+            changed_fields.push("auth_route");
+        }
+        if mask.model_reasoning_effort
+            && self.model_reasoning_effort != candidate.model_reasoning_effort
+        {
+            changed_fields.push("model_reasoning_effort");
+        }
+        if mask.review_model && self.review_model != candidate.review_model {
+            changed_fields.push("review_model");
+        }
+        if mask.plan_mode_reasoning_effort
+            && self.plan_mode_reasoning_effort != candidate.plan_mode_reasoning_effort
+        {
+            changed_fields.push("plan_mode_reasoning_effort");
+        }
+        if mask.model_settings_policy
+            && self.model_settings_policy != candidate.model_settings_policy
+        {
+            changed_fields.push("model_settings_policy");
+        }
+        if mask.server_model_validation
+            && self.server_model_validation != candidate.server_model_validation
+        {
+            changed_fields.push("server_model_validation");
+        }
+        if mask.approvals_reviewer && self.approvals_reviewer != candidate.approvals_reviewer {
+            changed_fields.push("approvals_reviewer");
+        }
+        if mask.approvals_reviewer_policy
+            && self.approvals_reviewer_policy != candidate.approvals_reviewer_policy
+        {
+            changed_fields.push("approvals_reviewer_policy");
+        }
+        changed_fields
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LockedSessionFlagsDomainContract {
+    effective_expected: ProtectedSettingsSnapshot,
+    explicit_expected: ProtectedSettingsSnapshot,
+    domain: LockedSettingsDomain,
+    explicit_fields: ProtectedSettingsMask,
+}
+
+impl LockedSessionFlagsDomainContract {
+    fn capture(
+        effective_expected: &Config,
+        explicit_expected: &Config,
+        anchor: SessionFlagsLockAnchor,
+    ) -> std::io::Result<Self> {
+        match anchor.domain {
+            LockedSettingsDomain::Model
+                if explicit_expected.model_settings_policy != ModelSettingsPolicy::Locked =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SessionFlags requested model_settings_policy=locked but its anchor config did not retain it",
+                ));
+            }
+            LockedSettingsDomain::ApprovalsReviewer
+                if explicit_expected.approvals_reviewer_policy
+                    != ApprovalsReviewerPolicy::Locked =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SessionFlags requested approvals_reviewer_policy=locked but its anchor config did not retain it",
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            effective_expected: ProtectedSettingsSnapshot::from_config(effective_expected),
+            explicit_expected: ProtectedSettingsSnapshot::from_config(explicit_expected),
+            domain: anchor.domain,
+            explicit_fields: anchor.explicit_fields,
+        })
+    }
+
+    fn changed_fields(&self, actual: &Config) -> Vec<&'static str> {
+        let mut changed_fields = self
+            .explicit_expected
+            .changed_fields(actual, self.explicit_fields);
+        for field in self
+            .effective_expected
+            .changed_fields(actual, self.domain.all_fields())
+        {
+            if !changed_fields.contains(&field) {
+                changed_fields.push(field);
+            }
+        }
+        changed_fields
+    }
+}
+
+/// Protected settings anchored at the first SessionFlags layer that explicitly locks each domain.
+///
+/// Legacy managed layers intentionally retain their higher precedence. This contract makes any
+/// later same-precedence SessionFlags mutation, managed override, or requirements normalization
+/// that is incompatible with explicit launcher intent fail closed.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct LockedSessionFlagsLaunchContract {
+    domains: Vec<LockedSessionFlagsDomainContract>,
+}
+
+impl LockedSessionFlagsLaunchContract {
+    fn validate(&self, actual: &Config) -> std::io::Result<()> {
+        let mut changed_fields = Vec::new();
+        for domain in &self.domains {
+            for field in domain.changed_fields(actual) {
+                if !changed_fields.contains(&field) {
+                    changed_fields.push(field);
+                }
+            }
+        }
+        if changed_fields.is_empty() {
+            return Ok(());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "higher-precedence configuration changed settings protected by locked SessionFlags: {}",
+                changed_fields.join(", ")
+            ),
+        ))
+    }
+}
+
+fn config_layer_stack_through_layer_position(
+    config_layer_stack: &ConfigLayerStack,
+    layer_position: usize,
+    preserve_requirements: bool,
+) -> std::io::Result<ConfigLayerStack> {
+    let layers = config_layer_stack
+        .get_layers(
+            ConfigLayerStackOrdering::LowestPrecedenceFirst,
+            /* include_disabled */ false,
+        )
+        .into_iter()
+        .take(layer_position.saturating_add(1))
+        .cloned()
+        .collect();
+    ConfigLayerStack::new(
+        layers,
+        if preserve_requirements {
+            config_layer_stack.requirements().clone()
+        } else {
+            ConfigRequirements::default()
+        },
+        if preserve_requirements {
+            config_layer_stack.requirements_toml().clone()
+        } else {
+            ConfigRequirementsToml::default()
+        },
+    )
+    .map(|stack| {
+        stack.with_user_and_project_exec_policy_rules_ignored(
+            config_layer_stack.ignore_user_and_project_exec_policy_rules(),
+        )
+    })
+}
+
+/// Rejects a derived thread or ordinary child-agent config that changes its base config's
+/// protected inference settings.
+///
+/// Structurally internal subsystems that intentionally construct their own base [`Config`] (for
+/// instance, Guardian review) do not pass through this admission boundary and retain independent
+/// model selection.
+pub fn validate_locked_settings_override(
+    base: &Config,
+    candidate: &Config,
+) -> Result<(), LockedSettingsOverrideError> {
+    let model_settings_locked = base.model_settings_policy == ModelSettingsPolicy::Locked;
+    let approvals_reviewer_locked =
+        base.approvals_reviewer_policy == ApprovalsReviewerPolicy::Locked;
+    if !model_settings_locked && !approvals_reviewer_locked {
+        return Ok(());
+    }
+
+    let changed_fields = ProtectedSettingsSnapshot::from_config(base).changed_fields(
+        candidate,
+        ProtectedSettingsMask::all(model_settings_locked, approvals_reviewer_locked),
+    );
+
+    if changed_fields.is_empty() {
+        Ok(())
+    } else {
+        Err(LockedSettingsOverrideError { changed_fields })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
     pub excluded_tool_namespaces: Vec<String>,
@@ -1358,6 +1850,16 @@ impl ConfigBuilder {
             .debug
             .as_ref()
             .and_then(|debug| debug.config_lockfile.as_ref());
+        if config_lock_settings
+            .and_then(|config_lock| config_lock.load_path.as_ref())
+            .is_some()
+            && !SessionFlagsLockAnchors::from_layer_stack(&config_layer_stack).is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "debug.config_lockfile.load_path cannot replay a config while SessionFlags model or approval-review settings are locked",
+            ));
+        }
         if let Some(config_lock_load_path) =
             config_lock_settings.and_then(|config_lock| config_lock.load_path.as_ref())
         {
@@ -2968,6 +3470,100 @@ impl Config {
         codex_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
+        let lock_anchors = SessionFlagsLockAnchors::from_layer_stack(&config_layer_stack);
+        if lock_anchors.is_empty() {
+            return Self::load_config_with_layer_stack_inner(
+                fs,
+                cfg,
+                overrides,
+                codex_home,
+                config_layer_stack,
+            )
+            .await;
+        }
+
+        let mut anchor_positions = lock_anchors
+            .anchors
+            .iter()
+            .map(|anchor| anchor.layer_position)
+            .collect::<Vec<_>>();
+        anchor_positions.sort_unstable();
+        anchor_positions.dedup();
+        let mut launch_contract = LockedSessionFlagsLaunchContract::default();
+        for layer_position in anchor_positions {
+            let effective_expected_layer_stack = config_layer_stack_through_layer_position(
+                &config_layer_stack,
+                layer_position,
+                true,
+            )?;
+            let effective_expected_cfg = deserialize_config_toml_with_base(
+                effective_expected_layer_stack.effective_config(),
+                codex_home.as_path(),
+            )?;
+            let effective_expected = Self::load_config_with_layer_stack_inner(
+                fs,
+                effective_expected_cfg,
+                overrides.clone(),
+                codex_home.clone(),
+                effective_expected_layer_stack,
+            )
+            .await?;
+            // Always capture a second view without requirements. This deliberately avoids
+            // coupling the fail-closed contract to today's requirements schema: if a future
+            // requirement normalizes any explicitly pinned protected field, the launch must
+            // still detect that change.
+            let explicit_expected_layer_stack = config_layer_stack_through_layer_position(
+                &config_layer_stack,
+                layer_position,
+                false,
+            )?;
+            let explicit_expected_cfg = deserialize_config_toml_with_base(
+                explicit_expected_layer_stack.effective_config(),
+                codex_home.as_path(),
+            )?;
+            let explicit_expected = Self::load_config_with_layer_stack_inner(
+                fs,
+                explicit_expected_cfg,
+                overrides.clone(),
+                codex_home.clone(),
+                explicit_expected_layer_stack,
+            )
+            .await?;
+
+            for anchor in lock_anchors
+                .anchors
+                .iter()
+                .filter(|anchor| anchor.layer_position == layer_position)
+            {
+                launch_contract
+                    .domains
+                    .push(LockedSessionFlagsDomainContract::capture(
+                        &effective_expected,
+                        &explicit_expected,
+                        *anchor,
+                    )?);
+            }
+        }
+
+        let actual = Self::load_config_with_layer_stack_inner(
+            fs,
+            cfg,
+            overrides,
+            codex_home,
+            config_layer_stack,
+        )
+        .await?;
+        launch_contract.validate(&actual)?;
+        Ok(actual)
+    }
+
+    async fn load_config_with_layer_stack_inner(
+        fs: &dyn ExecutorFileSystem,
+        cfg: ConfigToml,
+        overrides: ConfigOverrides,
+        codex_home: AbsolutePathBuf,
+        config_layer_stack: ConfigLayerStack,
+    ) -> std::io::Result<Self> {
         // Keep the large config-construction future off small test thread stacks.
         Box::pin(async move {
         if cfg.experimental_thread_store_endpoint.is_some() {
@@ -3924,6 +4520,9 @@ impl Config {
                 .unwrap_or(false),
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
+            model_settings_policy: cfg.model_settings_policy.unwrap_or_default(),
+            approvals_reviewer_policy: cfg.approvals_reviewer_policy.unwrap_or_default(),
+            server_model_validation: cfg.server_model_validation.unwrap_or_default(),
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
@@ -4041,6 +4640,9 @@ impl Config {
                 .unwrap_or_default(),
             otel,
         };
+        validate_locked_model_selection(&config).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
         Ok(config)
         })
         .await

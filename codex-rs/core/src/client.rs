@@ -63,6 +63,7 @@ use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
+use codex_config::types::ServerModelValidation;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
@@ -208,6 +209,7 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     item_ids_enabled: bool,
     concurrent_reasoning_summaries_enabled: bool,
+    server_model_validation: ServerModelValidation,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
@@ -422,6 +424,7 @@ impl ModelClient {
         beta_features_header: Option<String>,
         item_ids_enabled: bool,
         concurrent_reasoning_summaries_enabled: bool,
+        server_model_validation: ServerModelValidation,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         http_client_factory: HttpClientFactory,
     ) -> Self {
@@ -446,6 +449,7 @@ impl ModelClient {
                 beta_features_header,
                 item_ids_enabled,
                 concurrent_reasoning_summaries_enabled,
+                server_model_validation,
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
@@ -621,15 +625,33 @@ impl ModelClient {
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
         let trace_attempt = compaction_trace.start_attempt(&payload);
+        let pending_turn_state = (self.state.server_model_validation
+            == ServerModelValidation::RequireMatch)
+            .then(|| Arc::new(OnceLock::new()));
+        let response_turn_state = pending_turn_state.as_ref().or(turn_state.as_ref());
         let result = client
-            .compact_input(
+            .compact_input_with_metadata(
                 &payload,
                 extra_headers,
                 compact_request_timeout,
-                turn_state.as_deref(),
+                response_turn_state.map(AsRef::as_ref),
             )
             .await
-            .map_err(|error| self.state.provider.map_api_error(error));
+            .map_err(|error| self.state.provider.map_api_error(error))
+            .and_then(|response| {
+                validate_server_model_attestations(
+                    self.state.server_model_validation,
+                    model_info.slug.as_str(),
+                    &response.server_model_attestations,
+                )?;
+                if let (Some(pending), Some(committed)) =
+                    (pending_turn_state.as_ref(), turn_state.as_ref())
+                    && let Some(value) = pending.get()
+                {
+                    let _ = committed.set(value.clone());
+                }
+                Ok(response.output)
+            });
         trace_attempt.record_result(result.as_deref());
         result
     }
@@ -1433,6 +1455,19 @@ impl ModelClientSession {
                     model_info.use_responses_lite,
                 )
                 .await;
+            let validation = if self.client.state.server_model_validation
+                == ServerModelValidation::RequireMatch
+            {
+                let pending_turn_state = Arc::new(OnceLock::new());
+                options.turn_state = Some(Arc::clone(&pending_turn_state));
+                ResponseValidationContext::strict(
+                    model_info.slug.clone(),
+                    pending_turn_state,
+                    Arc::clone(&self.turn_state),
+                )
+            } else {
+                ResponseValidationContext::warn(model_info.slug.clone())
+            };
 
             let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
@@ -1466,6 +1501,7 @@ impl ModelClientSession {
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
+                        validation,
                     );
                     return Ok(stream);
                 }
@@ -1645,11 +1681,29 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
+            let (response_turn_state, validation) = if !warmup
+                && self.client.state.server_model_validation == ServerModelValidation::RequireMatch
+            {
+                let pending_turn_state = Arc::new(OnceLock::new());
+                (
+                    Arc::clone(&pending_turn_state),
+                    ResponseValidationContext::strict(
+                        model_info.slug.clone(),
+                        pending_turn_state,
+                        Arc::clone(&self.turn_state),
+                    ),
+                )
+            } else {
+                (
+                    Arc::clone(&self.turn_state),
+                    ResponseValidationContext::warn(model_info.slug.clone()),
+                )
+            };
             let stream_result = websocket_connection
                 .stream_request(
                     ws_request,
                     self.websocket_session.connection_reused(),
-                    Some(Arc::clone(&self.turn_state)),
+                    Some(response_turn_state),
                 )
                 .await
                 .map_err(|err| {
@@ -1668,6 +1722,7 @@ impl ModelClientSession {
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
+                validation,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -1911,12 +1966,204 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
+// Strict validation intentionally trades bounded latency and memory for fail-closed delivery.
+// The byte cap bounds ordinary large responses, while the event cap prevents tiny metadata or
+// status events from consuming unbounded allocator overhead.
+const SERVER_MODEL_VALIDATION_MAX_EVENTS: usize = 262_144;
+const SERVER_MODEL_VALIDATION_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn validate_server_model_attestations(
+    policy: ServerModelValidation,
+    requested_model: &str,
+    server_models: &[Option<String>],
+) -> Result<()> {
+    if policy == ServerModelValidation::Warn {
+        for server_model in server_models {
+            match server_model {
+                Some(server_model) if !server_model.eq_ignore_ascii_case(requested_model) => {
+                    warn!(
+                        requested_model,
+                        server_model, "server reported a different model than requested"
+                    );
+                }
+                None => warn!("server reported an invalid model attestation"),
+                Some(_) => {}
+            }
+        }
+        return Ok(());
+    }
+
+    if server_models.is_empty() {
+        return Err(CodexErr::ServerModelValidation(format!(
+            "server model validation failed: the completed response did not attest the requested model {requested_model}"
+        )));
+    }
+    for server_model in server_models {
+        match server_model {
+            Some(server_model) if !server_model.eq_ignore_ascii_case(requested_model) => {
+                return Err(CodexErr::ServerModelValidation(format!(
+                    "server model validation failed: requested {requested_model}, but the server reported {server_model}"
+                )));
+            }
+            None => {
+                return Err(CodexErr::ServerModelValidation(
+                    "server model validation failed: the server reported an invalid model attestation"
+                        .to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ResponseValidationContext {
+    policy: ServerModelValidation,
+    requested_model: String,
+    pending_turn_state: Option<Arc<OnceLock<String>>>,
+    committed_turn_state: Option<Arc<OnceLock<String>>>,
+}
+
+impl ResponseValidationContext {
+    fn warn(requested_model: String) -> Self {
+        Self {
+            policy: ServerModelValidation::Warn,
+            requested_model,
+            pending_turn_state: None,
+            committed_turn_state: None,
+        }
+    }
+
+    fn strict(
+        requested_model: String,
+        pending_turn_state: Arc<OnceLock<String>>,
+        committed_turn_state: Arc<OnceLock<String>>,
+    ) -> Self {
+        Self {
+            policy: ServerModelValidation::RequireMatch,
+            requested_model,
+            pending_turn_state: Some(pending_turn_state),
+            committed_turn_state: Some(committed_turn_state),
+        }
+    }
+
+    fn commit_turn_state(&self) {
+        let (Some(pending), Some(committed)) =
+            (&self.pending_turn_state, &self.committed_turn_state)
+        else {
+            return;
+        };
+        if let Some(value) = pending.get() {
+            let _ = committed.set(value.clone());
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ValidationBufferAction {
+    Buffered,
+    SafetyStatus(ResponseEvent),
+    Completed,
+}
+
+struct ServerModelValidationBuffer {
+    requested_model: String,
+    events: std::collections::VecDeque<ResponseEvent>,
+    event_count: usize,
+    serialized_bytes: usize,
+    server_model_attested: bool,
+    max_events: usize,
+    max_bytes: usize,
+}
+
+impl ServerModelValidationBuffer {
+    fn new(requested_model: String) -> Self {
+        Self::with_limits(
+            requested_model,
+            SERVER_MODEL_VALIDATION_MAX_EVENTS,
+            SERVER_MODEL_VALIDATION_MAX_BYTES,
+        )
+    }
+
+    fn with_limits(requested_model: String, max_events: usize, max_bytes: usize) -> Self {
+        Self {
+            requested_model,
+            events: std::collections::VecDeque::new(),
+            event_count: 0,
+            serialized_bytes: 0,
+            server_model_attested: false,
+            max_events,
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, event: ResponseEvent) -> Result<ValidationBufferAction> {
+        let event_bytes = serde_json::to_vec(&event).map_err(|err| {
+            CodexErr::ServerModelValidation(format!(
+                "server model validation failed while sizing a response event: {err}"
+            ))
+        })?;
+        let next_event_count = self.event_count.saturating_add(1);
+        let next_serialized_bytes = self.serialized_bytes.saturating_add(event_bytes.len());
+        if next_event_count > self.max_events || next_serialized_bytes > self.max_bytes {
+            return Err(CodexErr::ServerModelValidation(format!(
+                "server model validation buffer exceeded its limit of {} events or {} bytes",
+                self.max_events, self.max_bytes
+            )));
+        }
+        self.event_count = next_event_count;
+        self.serialized_bytes = next_serialized_bytes;
+
+        if let ResponseEvent::ServerModel(server_model) = &event {
+            self.server_model_attested = true;
+            if !server_model.eq_ignore_ascii_case(&self.requested_model) {
+                return Err(CodexErr::ServerModelValidation(format!(
+                    "server model validation failed: requested {}, but the server reported {}",
+                    self.requested_model, server_model
+                )));
+            }
+        }
+        if matches!(event, ResponseEvent::InvalidServerModelAttestation) {
+            return Err(CodexErr::ServerModelValidation(
+                "server model validation failed: the server reported an invalid model attestation"
+                    .to_string(),
+            ));
+        }
+        let event = match event {
+            ResponseEvent::SafetyBuffering(buffering) => {
+                return Ok(ValidationBufferAction::SafetyStatus(
+                    ResponseEvent::SafetyBuffering(buffering),
+                ));
+            }
+            event => event,
+        };
+        let completed = matches!(event, ResponseEvent::Completed { .. });
+        self.events.push_back(event);
+        if completed {
+            if !self.server_model_attested {
+                return Err(CodexErr::ServerModelValidation(format!(
+                    "server model validation failed: the completed response did not attest the requested model {}",
+                    self.requested_model
+                )));
+            }
+            Ok(ValidationBufferAction::Completed)
+        } else {
+            Ok(ValidationBufferAction::Buffered)
+        }
+    }
+
+    fn into_events(self) -> std::collections::VecDeque<ResponseEvent> {
+        self.events
+    }
+}
 
 fn map_response_stream(
     api_stream: codex_api::ResponseStream,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    validation: ResponseValidationContext,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -1932,6 +2179,7 @@ fn map_response_stream(
         session_telemetry,
         inference_trace_attempt,
         provider,
+        validation,
     )
 }
 
@@ -1941,6 +2189,7 @@ fn map_response_events<S>(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    validation: ResponseValidationContext,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1961,12 +2210,89 @@ where
         let (request_start, mut ttft_ms) = (Instant::now(), None);
         let mut api_stream = api_stream;
         let upstream_request_id = upstream_request_id.as_deref();
-        if let Some(upstream_request_id) = upstream_request_id {
+        if validation.policy == ServerModelValidation::Warn
+            && let Some(upstream_request_id) = upstream_request_id
+        {
             feedback_tags!(last_model_request_id = upstream_request_id);
         }
+        let mut replay_events = std::collections::VecDeque::new();
+        if validation.policy == ServerModelValidation::RequireMatch {
+            let mut validation_buffer =
+                ServerModelValidationBuffer::new(validation.requested_model.clone());
+            loop {
+                let event = tokio::select! {
+                    _ = consumer_dropped.cancelled() => {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
+                    event = api_stream.next() => event,
+                };
+                let Some(event) = event else {
+                    let error = CodexErr::Stream(
+                        "stream closed before response.completed".to_string(),
+                        None,
+                    );
+                    inference_trace_attempt.record_failed(
+                        &error,
+                        upstream_request_id,
+                        &items_added,
+                    );
+                    session_telemetry.see_event_completed_failed(&error);
+                    let _ = tx_event.send(Err(error)).await;
+                    return;
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(err) => {
+                        let response_debug_context =
+                            extract_response_debug_context_from_api_error(&err);
+                        let request_id =
+                            upstream_request_id.or(response_debug_context.request_id.as_deref());
+                        let mapped = provider.map_api_error(err);
+                        inference_trace_attempt.record_failed(&mapped, request_id, &items_added);
+                        session_telemetry.see_event_completed_failed(&mapped);
+                        let _ = tx_event.send(Err(mapped)).await;
+                        return;
+                    }
+                };
+                match validation_buffer.push(event) {
+                    Ok(ValidationBufferAction::Buffered) => {}
+                    Ok(ValidationBufferAction::SafetyStatus(event)) => {
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            inference_trace_attempt.record_cancelled(
+                                STREAM_DROPPED_REASON,
+                                upstream_request_id,
+                                &items_added,
+                            );
+                            return;
+                        }
+                    }
+                    Ok(ValidationBufferAction::Completed) => break,
+                    Err(error) => {
+                        inference_trace_attempt.record_failed(
+                            &error,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        session_telemetry.see_event_completed_failed(&error);
+                        let _ = tx_event.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+            replay_events = validation_buffer.into_events();
+            validation.commit_turn_state();
+            if let Some(upstream_request_id) = upstream_request_id {
+                feedback_tags!(last_model_request_id = upstream_request_id);
+            }
+        }
         loop {
-            let event = tokio::select! {
-                _ = consumer_dropped.cancelled() => {
+            let event = if validation.policy == ServerModelValidation::RequireMatch {
+                if consumer_dropped.is_cancelled() {
                     inference_trace_attempt.record_cancelled(
                         STREAM_DROPPED_REASON,
                         upstream_request_id,
@@ -1974,7 +2300,19 @@ where
                     );
                     return;
                 }
-                event = api_stream.next() => event,
+                replay_events.pop_front().map(Ok)
+            } else {
+                tokio::select! {
+                    _ = consumer_dropped.cancelled() => {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
+                    event = api_stream.next() => event,
+                }
             };
             let Some(event) = event else {
                 break;
@@ -2034,6 +2372,9 @@ where
                     {
                         return;
                     }
+                    // response.completed is terminal. Do not admit or inspect trailing events,
+                    // which cannot belong to the validated response contract.
+                    return;
                 }
                 Ok(event) => {
                     if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {

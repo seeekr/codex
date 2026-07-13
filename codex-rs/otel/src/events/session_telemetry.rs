@@ -1220,6 +1220,15 @@ impl SessionTelemetry {
                 "reasoning_summary_part_added".into()
             }
             ResponseEvent::ServerModel(_) => "server_model".into(),
+            ResponseEvent::InvalidServerModelAttestation => {
+                "invalid_server_model_attestation".into()
+            }
+            ResponseEvent::ServerModelConnectionDiagnostic(_) => {
+                "server_model_connection_diagnostic".into()
+            }
+            ResponseEvent::InvalidServerModelConnectionDiagnostic => {
+                "invalid_server_model_connection_diagnostic".into()
+            }
             ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
             ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
             ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),

@@ -3,6 +3,7 @@
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
 mod model_catalog;
+mod model_settings_policy;
 mod plugin_catalog;
 mod session_summary;
 mod startup;

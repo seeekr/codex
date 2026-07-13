@@ -70,7 +70,7 @@ pub async fn run_main(
         )
     })?;
     let config = ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
+        .cli_overrides(cli_kv_overrides.clone())
         .strict_config(strict_config)
         .build()
         .await
@@ -152,6 +152,8 @@ pub async fn run_main(
             outgoing_message_sender,
             arg0_paths,
             Arc::new(config),
+            cli_kv_overrides,
+            strict_config,
             environment_manager,
             state_db,
             installation_id,

@@ -129,6 +129,19 @@ impl App {
             approvals_reviewer,
             display_label,
         } = selection;
+        let approvals_reviewer = if self.chat_widget.approvals_reviewer_locked() {
+            if approvals_reviewer.is_some_and(|reviewer| reviewer != self.config.approvals_reviewer)
+            {
+                tracing::warn!(
+                    current = %self.config.approvals_reviewer,
+                    requested = ?approvals_reviewer,
+                    "permission profile requested a different approvals reviewer while routing is locked; preserving the current reviewer"
+                );
+            }
+            None
+        } else {
+            approvals_reviewer
+        };
         let selected_config = match self
             .rebuild_config_for_permission_profile(profile_id.as_str())
             .await
@@ -333,6 +346,16 @@ impl App {
     }
 
     pub(super) fn set_approvals_reviewer_in_app_and_widget(&mut self, reviewer: ApprovalsReviewer) {
+        if self.chat_widget.approvals_reviewer_locked()
+            && self.config.approvals_reviewer != reviewer
+        {
+            tracing::warn!(
+                current = %self.config.approvals_reviewer,
+                requested = %reviewer,
+                "ignored effective-config approvals reviewer because reviewer routing is locked"
+            );
+            return;
+        }
         self.config.approvals_reviewer = reviewer;
         self.chat_widget.set_approvals_reviewer(reviewer);
     }
@@ -432,7 +455,8 @@ impl App {
                 continue;
             }
             let effective_enabled = feature_config.features.enabled(feature);
-            if feature == Feature::GuardianApproval {
+            if feature == Feature::GuardianApproval && !self.chat_widget.approvals_reviewer_locked()
+            {
                 let previous_approvals_reviewer = feature_config.approvals_reviewer;
                 if effective_enabled {
                     // Persist the reviewer setting so future sessions keep the

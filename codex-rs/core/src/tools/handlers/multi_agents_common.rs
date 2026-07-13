@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
+use crate::config::validate_locked_settings_override;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -190,13 +191,21 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     let mut config = (*base_config).clone();
     config.model = Some(turn.model_info.slug.clone());
     config.model_provider = turn.provider.info().clone();
-    config.model_reasoning_effort = turn
-        .reasoning_effort
-        .clone()
-        .or_else(|| turn.model_info.default_reasoning_level.clone());
+    config.model_reasoning_effort =
+        if turn.config.model_settings_policy == codex_config::types::ModelSettingsPolicy::Locked {
+            // `None` is itself part of the locked pair. Do not turn an explicitly nullable parent
+            // effort into the catalog default while constructing an ordinary child.
+            turn.reasoning_effort.clone()
+        } else {
+            turn.reasoning_effort
+                .clone()
+                .or_else(|| turn.model_info.default_reasoning_level.clone())
+        };
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.developer_instructions = turn.developer_instructions.clone();
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    validate_locked_settings_override(turn.config.as_ref(), &config)
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
 
     Ok(config)
 }
@@ -250,6 +259,21 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
+        return Ok(());
+    }
+
+    if turn.config.model_settings_policy == codex_config::types::ModelSettingsPolicy::Locked {
+        let model_changed =
+            requested_model.is_some_and(|requested| Some(requested) != config.model.as_deref());
+        let effort_changed = requested_reasoning_effort
+            .as_ref()
+            .is_some_and(|requested| Some(requested) != config.model_reasoning_effort.as_ref());
+        if model_changed || effort_changed {
+            return Err(FunctionCallError::RespondToModel(
+                "spawned-agent model and reasoning settings are locked to the parent invocation"
+                    .to_string(),
+            ));
+        }
         return Ok(());
     }
 

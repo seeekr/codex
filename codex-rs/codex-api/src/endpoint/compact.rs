@@ -14,6 +14,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const OPENAI_MODEL_HEADER: &str = "openai-model";
+
+#[derive(Debug, PartialEq)]
+pub struct CompactResponse {
+    pub output: Vec<ResponseItem>,
+    pub server_model_attestations: Vec<Option<String>>,
+}
 
 pub struct CompactClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -43,6 +50,18 @@ impl<T: HttpTransport> CompactClient<T> {
         request_timeout: Duration,
         turn_state: Option<&OnceLock<String>>,
     ) -> Result<Vec<ResponseItem>, ApiError> {
+        self.compact_with_metadata(body, extra_headers, request_timeout, turn_state)
+            .await
+            .map(|response| response.output)
+    }
+
+    pub async fn compact_with_metadata(
+        &self,
+        body: serde_json::Value,
+        extra_headers: HeaderMap,
+        request_timeout: Duration,
+        turn_state: Option<&OnceLock<String>>,
+    ) -> Result<CompactResponse, ApiError> {
         let resp = self
             .session
             .execute_with(
@@ -63,9 +82,18 @@ impl<T: HttpTransport> CompactClient<T> {
         {
             let _ = turn_state.set(header_value.to_string());
         }
+        let server_model_attestations = resp
+            .headers
+            .get_all(OPENAI_MODEL_HEADER)
+            .iter()
+            .map(|value| value.to_str().ok().map(ToString::to_string))
+            .collect();
         let parsed: CompactHistoryResponse =
             serde_json::from_slice(&resp.body).map_err(|e| ApiError::Stream(e.to_string()))?;
-        Ok(parsed.output)
+        Ok(CompactResponse {
+            output: parsed.output,
+            server_model_attestations,
+        })
     }
 
     pub async fn compact_input(
@@ -75,9 +103,21 @@ impl<T: HttpTransport> CompactClient<T> {
         request_timeout: Duration,
         turn_state: Option<&OnceLock<String>>,
     ) -> Result<Vec<ResponseItem>, ApiError> {
+        self.compact_input_with_metadata(input, extra_headers, request_timeout, turn_state)
+            .await
+            .map(|response| response.output)
+    }
+
+    pub async fn compact_input_with_metadata(
+        &self,
+        input: &CompactionInput<'_>,
+        extra_headers: HeaderMap,
+        request_timeout: Duration,
+        turn_state: Option<&OnceLock<String>>,
+    ) -> Result<CompactResponse, ApiError> {
         let body = serde_json::to_value(input)
             .map_err(|e| ApiError::Stream(format!("failed to encode compaction input: {e}")))?;
-        self.compact(body, extra_headers, request_timeout, turn_state)
+        self.compact_with_metadata(body, extra_headers, request_timeout, turn_state)
             .await
     }
 }

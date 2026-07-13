@@ -16,6 +16,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionModelSettings;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
@@ -373,6 +374,37 @@ impl SessionConfiguration {
         if let Some(app_server_client_version) = updates.app_server_client_version.clone() {
             next_configuration.app_server_client_version = Some(app_server_client_version);
         }
+        if self.original_config_do_not_use.model_settings_policy == ModelSettingsPolicy::Locked
+            && (next_configuration.collaboration_mode.model() != self.collaboration_mode.model()
+                || next_configuration.collaboration_mode.reasoning_effort()
+                    != self.collaboration_mode.reasoning_effort())
+        {
+            return Err(ConstraintError::InvalidValue {
+                field_name: "collaboration_mode",
+                candidate: format!(
+                    "{}/{:?}",
+                    next_configuration.collaboration_mode.model(),
+                    next_configuration.collaboration_mode.reasoning_effort()
+                ),
+                allowed: format!(
+                    "[{}/{:?}]",
+                    self.collaboration_mode.model(),
+                    self.collaboration_mode.reasoning_effort()
+                ),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            });
+        }
+        if self.original_config_do_not_use.approvals_reviewer_policy
+            == codex_config::types::ApprovalsReviewerPolicy::Locked
+            && next_configuration.approvals_reviewer != self.approvals_reviewer
+        {
+            return Err(ConstraintError::InvalidValue {
+                field_name: "approvals_reviewer",
+                candidate: next_configuration.approvals_reviewer.to_string(),
+                allowed: format!("[{}]", self.approvals_reviewer),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            });
+        }
         Ok(next_configuration)
     }
 
@@ -521,6 +553,13 @@ impl Session {
         session_configuration.parent_thread_id = parent_thread_id;
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
+        let establish_resumed_model_settings = config.model_settings_policy
+            == ModelSettingsPolicy::Locked
+            && resume_needs_model_settings_establishment(
+                &initial_history,
+                session_configuration.collaboration_mode.model(),
+                session_configuration.collaboration_mode.reasoning_effort(),
+            );
 
         let thread_id = match &initial_history {
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
@@ -596,6 +635,17 @@ impl Session {
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
                             originator: session_configuration.originator.clone(),
+                            model_settings: (config.model_settings_policy
+                                == ModelSettingsPolicy::Locked)
+                                .then(|| SessionModelSettings {
+                                    model: session_configuration
+                                        .collaboration_mode
+                                        .model()
+                                        .to_string(),
+                                    reasoning_effort: session_configuration
+                                        .collaboration_mode
+                                        .reasoning_effort(),
+                                }),
                             base_instructions: BaseInstructions {
                                 text: session_configuration.base_instructions.clone(),
                             },
@@ -1125,6 +1175,7 @@ impl Session {
                     /*concurrent_reasoning_summaries_enabled*/ config
                         .features
                         .enabled(Feature::ConcurrentReasoningSummaries),
+                    config.server_model_validation,
                     attestation_provider,
                     config.http_client_factory(),
                 )
@@ -1196,6 +1247,13 @@ impl Session {
             .chain(post_session_configured_events.into_iter());
             for event in events {
                 sess.send_event_raw(event).await;
+            }
+            if establish_resumed_model_settings {
+                sess.send_event_raw(Event {
+                    id: INITIAL_SUBMIT_ID.to_owned(),
+                    msg: handlers::thread_settings_applied_event(&sess).await,
+                })
+                .await;
             }
 
             let mcp_startup_cancellation_token = {

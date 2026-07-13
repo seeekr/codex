@@ -62,26 +62,32 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary as CoreReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy as CoreSandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource as RolloutSessionSource;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
@@ -689,6 +695,292 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
     assert_eq!(reasoning_effort, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn locked_thread_resume_reanchors_to_process_pair_and_rejects_request_override_atomically()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "model = \"gpt-5.4\"",
+            "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\nmodel_settings_policy = \"locked\"",
+        ),
+    )?;
+
+    let filename_ts = "2025-01-05T12-00-00";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        filename_ts,
+        "2025-01-05T12:00:00Z",
+        "discarded fixture turn",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), filename_ts, &thread_id);
+    let contents = std::fs::read_to_string(&path)?;
+    let mut session_meta: serde_json::Value = serde_json::from_str(
+        contents
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("fake rollout missing session meta"))?,
+    )?;
+    session_meta["payload"]["model_settings"] = json!({
+        "model": "gpt-5.2-codex",
+        "reasoning_effort": null
+    });
+    // A SessionMeta-only rollout exercises cold resume before the first turn can establish model
+    // settings through TurnContext or ThreadSettingsApplied.
+    std::fs::write(&path, format!("{session_meta}\n"))?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        model,
+        reasoning_effort,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(model, "gpt-5.4");
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+    drop(mcp);
+
+    let applied_settings = || -> Result<Vec<ThreadSettingsAppliedEvent>> {
+        Ok(std::fs::read_to_string(&path)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+            .filter_map(|line| match line.item {
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+                _ => None,
+            })
+            .collect())
+    };
+    let established = applied_settings()?;
+    assert_eq!(established.len(), 1);
+    assert_eq!(established[0].thread_settings.model, "gpt-5.4");
+    assert_eq!(
+        established[0].thread_settings.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resumed_again = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed_again.model, "gpt-5.4");
+    assert_eq!(resumed_again.reasoning_effort, Some(ReasoningEffort::High));
+    drop(mcp);
+    assert_eq!(
+        applied_settings()?.len(),
+        1,
+        "a matching second cold resume must not append a duplicate anchor"
+    );
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "use the current locked pair".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    drop(mcp);
+    let response_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 1);
+    let request_body: serde_json::Value = serde_json::from_slice(&response_requests[0].body)?;
+    assert_eq!(request_body["model"].as_str(), Some("gpt-5.4"));
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert!(
+        resume_error
+            .error
+            .message
+            .contains("protected settings are locked for this invocation"),
+        "unexpected resume error: {}",
+        resume_error.error.message
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count(),
+        1,
+        "locked resume rejection must happen before provider requests"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn locked_thread_resume_upgrades_legacy_turn_context_to_current_process_pair() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "model = \"gpt-5.4\"",
+        "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\nmodel_settings_policy = \"locked\"",
+    );
+    std::fs::write(&config_path, config)?;
+
+    let filename_ts = "2025-01-07T12-00-00";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        filename_ts,
+        "2025-01-07T12:00:00Z",
+        "legacy low-model turn",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), filename_ts, &thread_id);
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some("legacy-turn".to_string()),
+            cwd: test_absolute_path("/"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: CoreAskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: CoreSandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "legacy-lower-model".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            effort: Some(ReasoningEffort::Low),
+            summary: CoreReasoningSummary::Auto,
+        }),
+    )
+    .await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let response = to_response::<ThreadResumeResponse>(response)?;
+    assert_eq!(response.model, "gpt-5.4");
+    assert_eq!(response.reasoning_effort, Some(ReasoningEffort::High));
+
+    let established = std::fs::read_to_string(&path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            _ => None,
+        })
+        .next_back()
+        .expect("locked legacy resume must persist its new model-settings anchor");
+    assert_eq!(established.thread_settings.model, "gpt-5.4");
+    assert_eq!(
+        established.thread_settings.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
 
     Ok(())
 }
@@ -2504,6 +2796,7 @@ stream_max_retries = 0
         history_mode: Default::default(),
         multi_agent_version: None,
         context_window: None,
+        model_settings: None,
     };
     std::fs::write(
         &rollout_path,

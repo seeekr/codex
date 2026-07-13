@@ -34,6 +34,7 @@ pub(super) async fn create_thread(
             params.source,
             params.thread_source,
             params.originator,
+            params.model_settings,
             params.base_instructions,
             params.dynamic_tools,
         )

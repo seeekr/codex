@@ -167,6 +167,41 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
 }
 
 #[tokio::test]
+async fn locked_safety_buffering_is_status_only_and_keys_cannot_retry() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.model_settings_policy = ModelSettingsPolicy::Locked;
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        /*replay_kind*/ None,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("locked_safety_buffering_status_only", popup);
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            AppEvent::RetrySafetyBufferedTurn { .. }
+                | AppEvent::UpdateModel(_)
+                | AppEvent::UpdateReasoningEffort(_)
+        )),
+        "locked safety buffering emitted a model-setting event: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn safety_buffering_remains_visible_until_turn_completes() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);

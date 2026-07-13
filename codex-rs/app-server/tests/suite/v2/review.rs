@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
@@ -5,6 +6,7 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
+use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -22,12 +24,14 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -379,6 +383,201 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(started.thread.id, review_thread_id);
     assert_eq!(started.thread.session_id, review_thread_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn detached_review_inherits_locked_parent_thread_model_settings() -> Result<()> {
+    let review_payload = json!({
+        "findings": [],
+        "overall_correctness": "ok",
+        "overall_explanation": "locked parent review",
+        "overall_confidence_score": 1.0
+    })
+    .to_string();
+    let mut response_created = core_test_support::responses::ev_response_created("resp-1");
+    response_created["response"]["headers"] = json!({ "OpenAI-Model": "unexpected-server-model" });
+    let routed_server =
+        create_mock_responses_server_sequence(vec![core_test_support::responses::sse(vec![
+            response_created,
+            core_test_support::responses::ev_assistant_message("msg-1", review_payload.as_str()),
+            core_test_support::responses::ev_completed("resp-1"),
+        ])])
+        .await;
+    let decoy_server = create_mock_responses_server_repeating_assistant("wrong provider").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &decoy_server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path)?;
+    config.push_str(&format!(
+        r#"
+
+[model_providers.thread_provider]
+name = "Thread provider"
+base_url = "{}/thread-route"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+        routed_server.uri()
+    ));
+    std::fs::write(config_path, config)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model_provider: Some("thread_provider".to_string()),
+            config: Some(HashMap::from([
+                ("model".to_string(), json!("thread-model")),
+                ("review_model".to_string(), json!("thread-review-model")),
+                ("model_reasoning_effort".to_string(), json!("high")),
+                ("plan_mode_reasoning_effort".to_string(), json!("high")),
+                (
+                    "chatgpt_base_url".to_string(),
+                    json!("https://thread-auth.example/backend-api/codex"),
+                ),
+                ("features.respect_system_proxy".to_string(), json!(false)),
+                ("model_settings_policy".to_string(), json!("locked")),
+                (
+                    "server_model_validation".to_string(),
+                    json!("require_match"),
+                ),
+                ("approvals_reviewer".to_string(), json!("auto_review")),
+                ("approvals_reviewer_policy".to_string(), json!("locked")),
+            ])),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/started"),
+    )
+    .await??;
+
+    let review_req = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id: thread.id,
+            delivery: Some(ReviewDelivery::Detached),
+            target: ReviewTarget::Custom {
+                instructions: "inherit locked settings".to_string(),
+            },
+        })
+        .await?;
+    let review_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
+    )
+    .await??;
+    let ReviewStartResponse {
+        review_thread_id, ..
+    } = to_response::<ReviewStartResponse>(review_resp)?;
+    let completed_notif: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notif
+            .params
+            .context("turn/completed params must be present")?,
+    )?;
+    assert_eq!(completed.thread_id, review_thread_id);
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    let turn_error = completed
+        .turn
+        .error
+        .context("strict server-model mismatch must fail the detached review")?;
+    assert!(
+        turn_error
+            .message
+            .contains("server model validation failed: requested thread-review-model"),
+        "unexpected strict-validation error: {}",
+        turn_error.message
+    );
+
+    let requests = routed_server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?;
+    let review_request = requests
+        .iter()
+        .rev()
+        .find(|request| request.url.path().ends_with("/responses"))
+        .context("expected detached review model request")?;
+    let body = review_request
+        .body_json::<serde_json::Value>()
+        .context("detached review request body should be JSON")?;
+    assert_eq!(review_request.url.path(), "/thread-route/responses");
+    assert_eq!(body.get("model"), Some(&json!("thread-review-model")));
+    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+    assert!(
+        decoy_server
+            .received_requests()
+            .await
+            .context("failed to fetch decoy-provider requests")?
+            .is_empty(),
+        "detached review escaped to the process-default provider route"
+    );
+
+    let model_override_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: review_thread_id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "attempt model downgrade".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("lower-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let model_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(model_override_req)),
+    )
+    .await??;
+    assert_eq!(model_error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(
+        model_error.error.message.contains("model"),
+        "unexpected model-lock error: {}",
+        model_error.error.message
+    );
+
+    let reviewer_override_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: review_thread_id,
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "attempt reviewer downgrade".to_string(),
+                text_elements: Vec::new(),
+            }],
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            ..Default::default()
+        })
+        .await?;
+    let reviewer_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(reviewer_override_req)),
+    )
+    .await??;
+    assert_eq!(reviewer_error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(
+        reviewer_error.error.message.contains("approvals_reviewer"),
+        "unexpected reviewer-lock error: {}",
+        reviewer_error.error.message
+    );
 
     Ok(())
 }

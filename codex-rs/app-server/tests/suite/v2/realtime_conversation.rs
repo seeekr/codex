@@ -88,6 +88,89 @@ const V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT: &str =
     "Background agent finished. Use the preceding [BACKEND] messages as the result.";
 const RESPONSE_ITEM_PREFIX: &str =
     "Use the following context to inform future responses, but do not speak it to the user.";
+
+#[tokio::test]
+async fn locked_substantive_settings_allow_realtime_route_choices_and_protect_handoffs()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_remote!(Ok(()), "realtime route tests use local mock servers");
+    let mut harness = RealtimeE2eHarness::new_locked(
+        RealtimeTestVersion::V1,
+        main_loop_responses(vec![create_final_assistant_message_sse_response(
+            "delegated under the substantive lock",
+        )?]),
+        realtime_sideband(vec![realtime_sideband_connection(vec![
+            vec![
+                session_updated("sess_locked_route"),
+                v2_background_agent_tool_call("call_locked_route", "delegate under lock"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+        ])]),
+    )
+    .await?;
+
+    let realtime_model = "gpt-realtime-harness";
+    let request_id = harness
+        .mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            thread_id: harness.thread_id.clone(),
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_prefix: None,
+            model: Some(realtime_model.to_string()),
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: Some(ThreadRealtimeStartTransport::Websocket),
+            version: Some(RealtimeConversationVersion::V2),
+            voice: Some(RealtimeVoice::Cedar),
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        harness
+            .mcp
+            .read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(response)?;
+
+    let started = harness
+        .read_notification::<ThreadRealtimeStartedNotification>("thread/realtime/started")
+        .await?;
+    assert_eq!(started.thread_id, harness.thread_id);
+    assert_eq!(started.version, RealtimeConversationVersion::V2);
+    assert_eq!(
+        harness.realtime_server.single_handshake().uri(),
+        "/v1/realtime?model=gpt-realtime-harness"
+    );
+
+    let turn_started = harness
+        .read_notification::<TurnStartedNotification>("turn/started")
+        .await?;
+    assert_eq!(turn_started.thread_id, harness.thread_id);
+    let turn_completed = harness
+        .read_notification::<TurnCompletedNotification>("turn/completed")
+        .await?;
+    assert_eq!(turn_completed.thread_id, harness.thread_id);
+
+    let requests = harness.main_loop_responses_requests().await?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"].as_str(), Some("mock-model"));
+    assert!(
+        response_request_contains_text(&requests[0], "<input>delegate under lock</input>"),
+        "realtime handoff should enter the substantive root turn: {}",
+        requests[0]
+    );
+
+    harness.shutdown().await;
+    Ok(())
+}
 const RESPONSE_HANDOFF_PREFIX: &str =
     "Silent Codex context. Do not speak, acknowledge, or summarize this item.";
 
@@ -230,6 +313,23 @@ impl RealtimeE2eHarness {
         .await
     }
 
+    async fn new_locked(
+        realtime_version: RealtimeTestVersion,
+        main_loop: MainLoopResponsesScript,
+        realtime_sideband: RealtimeSidebandScript,
+    ) -> Result<Self> {
+        let main_loop_responses_server =
+            create_mock_responses_server_sequence_unchecked(main_loop.responses).await;
+        Self::new_with_main_loop_responses_server_sandbox_and_policy(
+            realtime_version,
+            main_loop_responses_server,
+            realtime_sideband,
+            RealtimeTestSandbox::ReadOnly,
+            /*model_settings_locked*/ true,
+        )
+        .await
+    }
+
     async fn new_with_sandbox(
         realtime_version: RealtimeTestVersion,
         main_loop: MainLoopResponsesScript,
@@ -267,6 +367,23 @@ impl RealtimeE2eHarness {
         realtime_sideband: RealtimeSidebandScript,
         sandbox: RealtimeTestSandbox,
     ) -> Result<Self> {
+        Self::new_with_main_loop_responses_server_sandbox_and_policy(
+            realtime_version,
+            main_loop_responses_server,
+            realtime_sideband,
+            sandbox,
+            /*model_settings_locked*/ false,
+        )
+        .await
+    }
+
+    async fn new_with_main_loop_responses_server_sandbox_and_policy(
+        realtime_version: RealtimeTestVersion,
+        main_loop_responses_server: MockServer,
+        realtime_sideband: RealtimeSidebandScript,
+        sandbox: RealtimeTestSandbox,
+        model_settings_locked: bool,
+    ) -> Result<Self> {
         let call_capture = RealtimeCallRequestCapture::new();
         Mock::given(method("POST"))
             .and(path("/v1/realtime/calls"))
@@ -291,6 +408,14 @@ impl RealtimeE2eHarness {
             realtime_version,
             sandbox,
         )?;
+        if model_settings_locked {
+            let config_path = codex_home.path().join("config.toml");
+            let config = std::fs::read_to_string(&config_path)?.replace(
+                "model = \"mock-model\"",
+                "model = \"mock-model\"\nmodel_settings_policy = \"locked\"",
+            );
+            std::fs::write(config_path, config)?;
+        }
 
         let mut mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())

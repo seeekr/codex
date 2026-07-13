@@ -262,6 +262,7 @@ impl MemoryStartupContext {
             /*beta_features_header*/ None,
             config.features.enabled(Feature::ItemIds),
             /*concurrent_reasoning_summaries_enabled*/ false,
+            config.server_model_validation,
             /*attestation_provider*/ None,
             config.http_client_factory(),
         );

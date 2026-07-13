@@ -106,6 +106,7 @@ fn test_model_client_with_thread_id(
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        codex_config::types::ServerModelValidation::Warn,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
@@ -152,6 +153,7 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        codex_config::types::ServerModelValidation::Warn,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
@@ -590,6 +592,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        super::ResponseValidationContext::warn("test-model".to_string()),
     );
 
     let observed = stream
@@ -620,6 +623,181 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn strict_response_stream_cancellation_releases_no_buffered_effects() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let attempt = started_inference_attempt(&temp)?;
+    let buffered_item_yielded = Arc::new(Notify::new());
+    let mut events = VecDeque::new();
+    events.push_back(ResponseEvent::ServerModel("test-model".to_string()));
+    events.push_back(ResponseEvent::OutputItemDone(output_message(
+        "1",
+        "unvalidated answer",
+    )));
+    let api_stream = NotifyAfterEventStream {
+        events,
+        yielded: 0,
+        notify_after: 2,
+        notify: Arc::clone(&buffered_item_yielded),
+    };
+    let pending_turn_state = Arc::new(std::sync::OnceLock::new());
+    pending_turn_state
+        .set("pending-state".to_string())
+        .expect("pending state should be empty");
+    let committed_turn_state = Arc::new(std::sync::OnceLock::new());
+
+    let (stream, last_response) = super::map_response_events(
+        Some("request-before-validation".to_string()),
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+        test_model_provider(),
+        super::ResponseValidationContext::strict(
+            "test-model".to_string(),
+            Arc::clone(&pending_turn_state),
+            Arc::clone(&committed_turn_state),
+        ),
+    );
+
+    buffered_item_yielded.notified().await;
+    drop(stream);
+    assert!(
+        last_response.await.is_err(),
+        "an unvalidated response must not produce resumable response state"
+    );
+
+    let rollout = replay_until_cancelled(&temp).await?;
+    let inference = rollout
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference should be reduced");
+    assert_eq!(inference.execution.status, ExecutionStatus::Cancelled);
+    assert!(inference.response_item_ids.is_empty());
+    assert_eq!(committed_turn_state.get(), None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_response_stream_upstream_error_releases_no_buffered_effects() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let attempt = started_inference_attempt(&temp)?;
+    let pending_turn_state = Arc::new(std::sync::OnceLock::new());
+    pending_turn_state
+        .set("pending-state".to_string())
+        .expect("pending state should be empty");
+    let committed_turn_state = Arc::new(std::sync::OnceLock::new());
+    let tags = Arc::new(Mutex::new(BTreeMap::new()));
+    let _guard = tracing_subscriber::registry()
+        .with(TagCollectorLayer { tags: tags.clone() })
+        .set_default();
+    let api_stream = futures::stream::iter([
+        Ok(ResponseEvent::ServerModel("test-model".to_string())),
+        Ok(ResponseEvent::OutputItemDone(output_message(
+            "1",
+            "unvalidated answer",
+        ))),
+        Err(ApiError::Stream("upstream failed".to_string())),
+    ]);
+
+    let (mut stream, last_response) = super::map_response_events(
+        Some("request-before-validation".to_string()),
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+        test_model_provider(),
+        super::ResponseValidationContext::strict(
+            "test-model".to_string(),
+            Arc::clone(&pending_turn_state),
+            Arc::clone(&committed_turn_state),
+        ),
+    );
+
+    let error = stream
+        .next()
+        .await
+        .expect("mapped stream should report the upstream error")
+        .expect_err("buffered output must not be replayed before the error");
+    assert!(error.to_string().contains("upstream failed"));
+    assert!(stream.next().await.is_none());
+    assert!(
+        last_response.await.is_err(),
+        "an unvalidated response must not produce resumable response state"
+    );
+
+    let rollout = replay_bundle(temp.path())?;
+    let inference = rollout
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference should be reduced");
+    assert_eq!(inference.execution.status, ExecutionStatus::Failed);
+    assert!(inference.response_item_ids.is_empty());
+    assert_eq!(committed_turn_state.get(), None);
+    let tags = tags.lock().unwrap();
+    assert_eq!(tags.get("last_model_request_id"), None);
+    assert_eq!(tags.get("last_model_response_id"), None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_response_stream_eof_releases_no_buffered_effects() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let attempt = started_inference_attempt(&temp)?;
+    let pending_turn_state = Arc::new(std::sync::OnceLock::new());
+    pending_turn_state
+        .set("pending-state".to_string())
+        .expect("pending state should be empty");
+    let committed_turn_state = Arc::new(std::sync::OnceLock::new());
+    let api_stream = futures::stream::iter([
+        Ok(ResponseEvent::ServerModel("test-model".to_string())),
+        Ok(ResponseEvent::OutputItemDone(output_message(
+            "1",
+            "unvalidated answer",
+        ))),
+    ]);
+
+    let (mut stream, last_response) = super::map_response_events(
+        Some("request-before-validation".to_string()),
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+        test_model_provider(),
+        super::ResponseValidationContext::strict(
+            "test-model".to_string(),
+            Arc::clone(&pending_turn_state),
+            Arc::clone(&committed_turn_state),
+        ),
+    );
+
+    let error = stream
+        .next()
+        .await
+        .expect("mapped stream should report premature EOF")
+        .expect_err("buffered output must not be replayed before premature EOF");
+    assert!(error.to_string().contains("stream closed"));
+    assert!(stream.next().await.is_none());
+    assert!(
+        last_response.await.is_err(),
+        "an unvalidated response must not produce resumable response state"
+    );
+
+    let rollout = replay_bundle(temp.path())?;
+    let inference = rollout
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference should be reduced");
+    assert_eq!(inference.execution.status, ExecutionStatus::Failed);
+    assert!(inference.response_item_ids.is_empty());
+    assert_eq!(committed_turn_state.get(), None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn response_stream_records_last_model_feedback_ids() {
     let tags = Arc::new(Mutex::new(BTreeMap::new()));
     let _guard = tracing_subscriber::registry()
@@ -640,6 +818,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        super::ResponseValidationContext::warn("test-model".to_string()),
     );
 
     while stream.next().await.is_some() {}
@@ -715,6 +894,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        super::ResponseValidationContext::warn("test-model".to_string()),
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output
@@ -827,6 +1007,7 @@ fn model_client_with_counting_attestation(
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        codex_config::types::ServerModelValidation::Warn,
         Some(Arc::new(CountingAttestationProvider {
             calls: attestation_calls.clone(),
         })),
@@ -891,4 +1072,102 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+fn completed_response_event() -> ResponseEvent {
+    ResponseEvent::Completed {
+        response_id: "response-1".to_string(),
+        token_usage: None,
+        end_turn: Some(true),
+    }
+}
+
+#[test]
+fn strict_server_model_buffer_accepts_all_case_insensitive_matches() {
+    let mut buffer =
+        super::ServerModelValidationBuffer::with_limits("Requested-Model".to_string(), 8, 4096);
+    assert!(matches!(
+        buffer.push(ResponseEvent::ServerModel("requested-model".to_string())),
+        Ok(super::ValidationBufferAction::Buffered)
+    ));
+    assert!(matches!(
+        buffer.push(ResponseEvent::ServerModel("REQUESTED-MODEL".to_string())),
+        Ok(super::ValidationBufferAction::Buffered)
+    ));
+    assert!(matches!(
+        buffer.push(completed_response_event()),
+        Ok(super::ValidationBufferAction::Completed)
+    ));
+}
+
+#[test]
+fn strict_server_model_buffer_rejects_conflicting_or_invalid_attestations() {
+    for event in [
+        ResponseEvent::ServerModel("other-model".to_string()),
+        ResponseEvent::InvalidServerModelAttestation,
+    ] {
+        let mut buffer =
+            super::ServerModelValidationBuffer::with_limits("requested-model".to_string(), 8, 4096);
+        buffer
+            .push(ResponseEvent::ServerModel("requested-model".to_string()))
+            .expect("matching attestation should be buffered");
+        let error = buffer
+            .push(event)
+            .expect_err("every conflicting or invalid attestation must fail");
+        assert!(matches!(
+            error,
+            codex_protocol::error::CodexErr::ServerModelValidation(_)
+        ));
+    }
+}
+
+#[test]
+fn strict_server_model_buffer_does_not_count_connection_diagnostics_as_attestation() {
+    let mut buffer =
+        super::ServerModelValidationBuffer::with_limits("requested-model".to_string(), 8, 4096);
+    buffer
+        .push(ResponseEvent::ServerModelConnectionDiagnostic(
+            "requested-model".to_string(),
+        ))
+        .expect("connection diagnostic should remain diagnostic-only");
+
+    let error = buffer
+        .push(completed_response_event())
+        .expect_err("connection metadata must not satisfy response attestation");
+    assert!(error.to_string().contains("did not attest"));
+}
+
+#[test]
+fn strict_server_model_buffer_counts_safety_status_toward_limits_and_preserves_retry_model() {
+    let mut buffer =
+        super::ServerModelValidationBuffer::with_limits("requested-model".to_string(), 1, 4096);
+    let action = buffer
+        .push(ResponseEvent::SafetyBuffering(codex_api::SafetyBuffering {
+            use_cases: vec!["cyber".to_string()],
+            reasons: vec!["review".to_string()],
+            show_buffering_ui: true,
+            faster_model: Some("faster-model".to_string()),
+        }))
+        .expect("safety status should pass promptly");
+    let super::ValidationBufferAction::SafetyStatus(ResponseEvent::SafetyBuffering(status)) =
+        action
+    else {
+        panic!("expected safety status");
+    };
+    assert_eq!(status.faster_model.as_deref(), Some("faster-model"));
+
+    let error = buffer
+        .push(ResponseEvent::ServerModel("requested-model".to_string()))
+        .expect_err("safety status must count toward the event limit");
+    assert!(error.to_string().contains("buffer exceeded"));
+}
+
+#[test]
+fn strict_server_model_buffer_enforces_serialized_byte_limit() {
+    let mut buffer =
+        super::ServerModelValidationBuffer::with_limits("requested-model".to_string(), 8, 1);
+    let error = buffer
+        .push(ResponseEvent::Created)
+        .expect_err("serialized response events must be byte bounded");
+    assert!(error.to_string().contains("buffer exceeded"));
 }

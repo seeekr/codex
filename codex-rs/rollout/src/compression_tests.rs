@@ -477,6 +477,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             history_mode: Default::default(),
             multi_agent_version: None,
             context_window: None,
+            model_settings: None,
         },
         git: None,
     };

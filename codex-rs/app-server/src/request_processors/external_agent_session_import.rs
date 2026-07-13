@@ -214,6 +214,12 @@ impl ExternalAgentSessionImporter {
             source: source.clone(),
             thread_source: None,
             originator: codex_login::default_client::originator().value,
+            model_settings: (config.model_settings_policy
+                == codex_config::types::ModelSettingsPolicy::Locked)
+                .then(|| codex_protocol::protocol::SessionModelSettings {
+                    model: model.clone(),
+                    reasoning_effort: config.model_reasoning_effort.clone(),
+                }),
             base_instructions: BaseInstructions {
                 text: config
                     .base_instructions

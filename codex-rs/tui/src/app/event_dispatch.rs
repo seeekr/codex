@@ -347,6 +347,14 @@ impl App {
                 model,
                 mut turn,
             } => {
+                if self.chat_widget.model_settings_locked() {
+                    tracing::warn!(
+                        %thread_id,
+                        %turn_id,
+                        "ignored safety-buffering retry because model settings are locked"
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 if self.active_thread_id != Some(thread_id)
                     || self.chat_widget.thread_id() != Some(thread_id)
                 {
@@ -1001,11 +1009,28 @@ impl App {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
             AppEvent::UpdateReasoningEffort(effort) => {
+                if self.chat_widget.model_settings_locked() {
+                    if self.chat_widget.current_reasoning_effort() != effort {
+                        tracing::warn!(
+                            "ignored reasoning-effort update because model settings are locked"
+                        );
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 self.on_update_reasoning_effort(effort.clone());
                 self.sync_active_thread_reasoning_setting(app_server, effort)
                     .await;
             }
             AppEvent::UpdateModel(model) => {
+                if self.chat_widget.model_settings_locked() {
+                    if self.chat_widget.current_model() != model {
+                        tracing::warn!(
+                            requested_model = %model,
+                            "ignored model update because model settings are locked"
+                        );
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 self.chat_widget.set_model(&model);
                 self.sync_active_thread_model_setting(app_server, model)
                     .await;
@@ -1034,6 +1059,10 @@ impl App {
                 self.chat_widget.open_advanced_reasoning_popup(model);
             }
             AppEvent::ApplyAdvancedReasoning { model, effort } => {
+                if self.chat_widget.model_settings_locked() {
+                    self.chat_widget.show_model_settings_locked_message();
+                    return Ok(AppRunControl::Continue);
+                }
                 let default_effort =
                     self.on_apply_advanced_reasoning(model.as_str(), effort.clone());
                 if let Some(mut params) =
@@ -1579,6 +1608,14 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
+                if self.chat_widget.model_settings_locked() {
+                    tracing::warn!(
+                        requested_model = %model,
+                        requested_effort = ?effort,
+                        "ignored model-selection persistence because model settings are locked"
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 match crate::config_update::write_config_batch(
                     app_server.request_handle(),
                     crate::config_update::build_model_selection_edits(
@@ -1791,6 +1828,17 @@ impl App {
                 }
             }
             AppEvent::UpdateApprovalsReviewer(policy) => {
+                if self.chat_widget.approvals_reviewer_locked() {
+                    if self.config.approvals_reviewer != policy {
+                        tracing::warn!(
+                            current = %self.config.approvals_reviewer,
+                            requested = %policy,
+                            "ignored approvals-reviewer update because reviewer routing is locked"
+                        );
+                        self.chat_widget.show_approvals_reviewer_locked_message();
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 self.config.approvals_reviewer = policy;
                 self.chat_widget.set_approvals_reviewer(policy);
                 self.sync_active_thread_permission_settings_to_cached_session()
@@ -1843,6 +1891,14 @@ impl App {
                 self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
             }
             AppEvent::UpdatePlanModeReasoningEffort(effort) => {
+                if self.chat_widget.model_settings_locked() {
+                    if self.chat_widget.current_reasoning_effort() != effort {
+                        tracing::warn!(
+                            "ignored Plan-mode reasoning update because model settings are locked"
+                        );
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 self.on_update_plan_mode_reasoning_effort(effort);
                 self.sync_active_thread_plan_mode_reasoning_setting(app_server)
                     .await;
@@ -1893,6 +1949,13 @@ impl App {
                 }
             }
             AppEvent::PersistPlanModeReasoningEffort(effort) => {
+                if self.chat_widget.model_settings_locked() {
+                    tracing::warn!(
+                        requested_effort = ?effort,
+                        "ignored Plan-mode reasoning persistence because model settings are locked"
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 let key_path = "plan_mode_reasoning_effort";
                 let edit = if let Some(effort) = effort {
                     crate::config_update::replace_config_value(

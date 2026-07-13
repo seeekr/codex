@@ -31,6 +31,7 @@ use rmcp::model::ServerCapabilities;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::task;
+use toml::Value as TomlValue;
 
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
@@ -42,6 +43,9 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
     arg0_paths: Arg0DispatchPaths,
+    base_config: Arc<Config>,
+    process_cli_overrides: Arc<Vec<(String, TomlValue)>>,
+    strict_config: bool,
     thread_manager: Arc<ThreadManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 }
@@ -53,6 +57,8 @@ impl MessageProcessor {
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
+        process_cli_overrides: Vec<(String, TomlValue)>,
+        strict_config: bool,
         environment_manager: Arc<EnvironmentManager>,
         state_db: Option<StateDbHandle>,
         installation_id: String,
@@ -90,6 +96,9 @@ impl MessageProcessor {
             outgoing,
             initialized: false,
             arg0_paths,
+            base_config: config,
+            process_cli_overrides: Arc::new(process_cli_overrides),
+            strict_config,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -363,7 +372,15 @@ impl MessageProcessor {
         let arguments = arguments.map(serde_json::Value::Object);
         let (initial_prompt, config): (String, Config) = match arguments {
             Some(json_val) => match serde_json::from_value::<CodexToolCallParam>(json_val) {
-                Ok(tool_cfg) => match tool_cfg.into_config(self.arg0_paths.clone()).await {
+                Ok(tool_cfg) => match tool_cfg
+                    .into_config(
+                        self.arg0_paths.clone(),
+                        self.base_config.as_ref(),
+                        self.process_cli_overrides.as_slice(),
+                        self.strict_config,
+                    )
+                    .await
+                {
                     Ok(cfg) => cfg,
                     Err(e) => {
                         let result = CallToolResult::error(vec![rmcp::model::Content::text(

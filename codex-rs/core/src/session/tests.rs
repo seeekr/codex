@@ -4,6 +4,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
+use crate::config::ConstraintError;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
 use crate::context::TurnAborted;
@@ -28,6 +29,7 @@ use codex_config::Sourced;
 use codex_config::loader::project_trust_key;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_config::types::ModelSettingsPolicy;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_core_skills::HostSkillsSnapshot;
 use core_test_support::test_codex::local_selections;
@@ -517,6 +519,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        codex_config::types::ServerModelValidation::Warn,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
@@ -2792,6 +2795,107 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test]
+async fn locked_spawn_admission_requires_an_explicit_non_empty_model() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    config.model_settings_policy = ModelSettingsPolicy::Locked;
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+
+    for model in [None, Some("   ".to_string())] {
+        config.model = model;
+        let error = manager
+            .start_thread(config.clone())
+            .await
+            .err()
+            .expect("the real spawn path must reject an unresolved locked model");
+        assert!(matches!(error, CodexErr::ModelSettingsPolicy(_)));
+        assert!(error.to_string().contains("explicit non-empty model"));
+    }
+
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    let started = manager
+        .start_thread(config)
+        .await
+        .expect("the real spawn path must accept an explicit locked model");
+    started
+        .thread
+        .codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down admitted test thread");
+}
+
+#[tokio::test]
+async fn locked_fork_persists_child_model_settings_after_copied_source_settings() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.model_settings_policy = ModelSettingsPolicy::Locked;
+        },
+    )
+    .await;
+    let current_mode = session.collaboration_mode().await;
+    let expected_model = current_mode.model().to_string();
+    let expected_effort = current_mode.reasoning_effort();
+    let rollout_path =
+        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let mut copied_source_event = handlers::thread_settings_applied_event(&session).await;
+    let EventMsg::ThreadSettingsApplied(copied_source_settings) = &mut copied_source_event else {
+        panic!("expected settings event");
+    };
+    copied_source_settings.thread_settings.model = "copied-source-model".to_string();
+    copied_source_settings.thread_settings.reasoning_effort = Some(ReasoningEffortConfig::Low);
+
+    session
+        .record_initial_history(InitialHistory::Forked(vec![RolloutItem::EventMsg(
+            copied_source_event,
+        )]))
+        .await;
+    session.flush_rollout().await.expect("fork should flush");
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read fork rollout")
+    else {
+        panic!("expected resumed fork rollout history");
+    };
+    let persisted_settings = resumed
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some(&event.thread_settings)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_settings
+            .first()
+            .expect("copied source settings should persist")
+            .model,
+        "copied-source-model"
+    );
+    let child_settings = persisted_settings
+        .last()
+        .expect("child settings should follow copied source settings");
+    assert_eq!(child_settings.model, expected_model);
+    assert_eq!(child_settings.reasoning_effort, expected_effort);
+
+    let resumed_history = InitialHistory::Resumed(resumed);
+    assert_eq!(
+        resumed_model_settings(&resumed_history),
+        Some((expected_model, expected_effort))
+    );
+}
+
+#[tokio::test]
 async fn start_new_context_window_assigns_and_persists_item_ids() {
     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
@@ -4135,6 +4239,15 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
 
 async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     let config = session.get_config().await;
+    let model_settings = if config.model_settings_policy == ModelSettingsPolicy::Locked {
+        let mode = session.collaboration_mode().await;
+        Some(codex_protocol::protocol::SessionModelSettings {
+            model: mode.model().to_string(),
+            reasoning_effort: mode.reasoning_effort(),
+        })
+    } else {
+        None
+    };
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
         CreateThreadParams {
@@ -4146,6 +4259,7 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
+            model_settings,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
@@ -4384,6 +4498,308 @@ async fn session_settings_legacy_fast_service_tier_update_uses_priority_request_
         updated.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+}
+
+#[tokio::test]
+async fn locked_model_settings_accept_same_pair_and_reject_model_or_effort_changes() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.model_settings_policy = ModelSettingsPolicy::Locked;
+    session_configuration.original_config_do_not_use = Arc::new(config);
+    let initial_personality = session_configuration.personality;
+
+    let mut same_pair = session_configuration.collaboration_mode.clone();
+    same_pair.mode = ModeKind::Plan;
+    let updated = session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(same_pair),
+            personality: Some(Personality::Pragmatic),
+            ..Default::default()
+        })
+        .expect("non-model settings and a mode change with the same pair should apply");
+    assert_eq!(updated.personality, Some(Personality::Pragmatic));
+
+    let mut different_model = session_configuration.collaboration_mode.clone();
+    different_model.settings.model = "different-model".to_string();
+    assert!(matches!(
+        session_configuration.apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(different_model),
+            personality: Some(Personality::Friendly),
+            ..Default::default()
+        }),
+        Err(ConstraintError::InvalidValue {
+            field_name: "collaboration_mode",
+            ..
+        })
+    ));
+    assert_eq!(session_configuration.personality, initial_personality);
+    assert_eq!(
+        session_configuration.collaboration_mode.model(),
+        updated.collaboration_mode.model()
+    );
+
+    let mut different_effort = session_configuration.collaboration_mode.clone();
+    different_effort.settings.reasoning_effort = Some(ReasoningEffortConfig::Ultra);
+    assert!(matches!(
+        session_configuration.apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(different_effort),
+            ..Default::default()
+        }),
+        Err(ConstraintError::InvalidValue {
+            field_name: "collaboration_mode",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn locked_approvals_reviewer_accepts_same_value_and_rejects_changes_atomically() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.approvals_reviewer_policy = codex_config::types::ApprovalsReviewerPolicy::Locked;
+    session_configuration.original_config_do_not_use = Arc::new(config);
+    let original_reviewer = session_configuration.approvals_reviewer;
+    let original_personality = session_configuration.personality;
+
+    let same_value = session_configuration
+        .apply(&SessionSettingsUpdate {
+            approvals_reviewer: Some(original_reviewer),
+            personality: Some(Personality::Pragmatic),
+            ..Default::default()
+        })
+        .expect("same reviewer and unrelated settings should apply");
+    assert_eq!(same_value.approvals_reviewer, original_reviewer);
+    assert_eq!(same_value.personality, Some(Personality::Pragmatic));
+
+    let changed_reviewer = match original_reviewer {
+        codex_config::types::ApprovalsReviewer::User => {
+            codex_config::types::ApprovalsReviewer::AutoReview
+        }
+        _ => codex_config::types::ApprovalsReviewer::User,
+    };
+    assert!(matches!(
+        session_configuration.apply(&SessionSettingsUpdate {
+            approvals_reviewer: Some(changed_reviewer),
+            personality: Some(Personality::Friendly),
+            ..Default::default()
+        }),
+        Err(ConstraintError::InvalidValue {
+            field_name: "approvals_reviewer",
+            ..
+        })
+    ));
+    assert_eq!(session_configuration.approvals_reviewer, original_reviewer);
+    assert_eq!(session_configuration.personality, original_personality);
+}
+
+#[tokio::test]
+async fn locked_spawn_agent_override_gate_shared_by_v1_and_v2_rejects_changes() {
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.model_settings_policy = ModelSettingsPolicy::Locked,
+    )
+    .await;
+    let base_instructions = session.get_base_instructions().await;
+    let inherited = crate::tools::handlers::multi_agents_common::build_agent_spawn_config(
+        &base_instructions,
+        turn_context.as_ref(),
+    )
+    .expect("build inherited child config");
+    let inherited_model = inherited.model.clone().expect("resolved parent model");
+    let inherited_effort = inherited.model_reasoning_effort.clone();
+
+    // Both v1 and v2 spawn handlers route through this gate before applying a role.
+    let mut child = inherited.clone();
+    crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides(
+        session.as_ref(),
+        turn_context.as_ref(),
+        &mut child,
+        Some(inherited_model.as_str()),
+        inherited_effort.clone(),
+    )
+    .await
+    .expect("same pair should be a no-op");
+    assert_eq!(child.model, inherited.model);
+    assert_eq!(child.model_reasoning_effort, inherited_effort);
+
+    let mut child = inherited.clone();
+    let error =
+        crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides(
+            session.as_ref(),
+            turn_context.as_ref(),
+            &mut child,
+            Some("gpt-lower"),
+            Some(ReasoningEffortConfig::Low),
+        )
+        .await
+        .expect_err("changed pair must be rejected");
+    assert!(format!("{error:?}").contains("locked to the parent invocation"));
+    assert_eq!(child.model, inherited.model);
+    assert_eq!(child.model_reasoning_effort, inherited_effort);
+}
+
+#[tokio::test]
+async fn locked_resume_model_settings_reanchor_to_current_pair_and_disable_fallback() {
+    let (session, turn_context) = make_session_and_context().await;
+    let thread_id = ThreadId::default();
+    let mut first_turn_context = turn_context.to_turn_context_item();
+    first_turn_context.model = "turn-context-model".to_string();
+    first_turn_context.effort = Some(ReasoningEffortConfig::High);
+
+    let snapshot = {
+        let state = session.state.lock().await;
+        state.session_configuration.thread_config_snapshot()
+    };
+    let cwd = snapshot.cwd().clone();
+    let settings_model = "settings-event-model".to_string();
+    let settings_effort = Some(ReasoningEffortConfig::Max);
+    let settings_event = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        codex_protocol::protocol::ThreadSettingsAppliedEvent {
+            thread_settings: codex_protocol::protocol::ThreadSettingsSnapshot {
+                model: settings_model.clone(),
+                model_provider_id: snapshot.model_provider_id,
+                service_tier: snapshot.service_tier,
+                approval_policy: snapshot.approval_policy,
+                approvals_reviewer: snapshot.approvals_reviewer,
+                permission_profile: snapshot.permission_profile,
+                active_permission_profile: snapshot.active_permission_profile,
+                cwd,
+                reasoning_effort: settings_effort.clone(),
+                reasoning_summary: snapshot.reasoning_summary,
+                personality: snapshot.personality,
+                collaboration_mode: snapshot.collaboration_mode,
+            },
+        },
+    ));
+
+    let resumed_with_settings_latest = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![
+            RolloutItem::TurnContext(first_turn_context.clone()),
+            settings_event.clone(),
+        ]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        resumed_model_settings(&resumed_with_settings_latest),
+        Some((settings_model.clone(), settings_effort.clone()))
+    );
+
+    let mut latest_turn_context = first_turn_context.clone();
+    latest_turn_context.model = "latest-turn-context-model".to_string();
+    latest_turn_context.effort = Some(ReasoningEffortConfig::Ultra);
+    let resumed_with_turn_context_latest = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![
+            RolloutItem::TurnContext(first_turn_context.clone()),
+            settings_event.clone(),
+            RolloutItem::TurnContext(latest_turn_context.clone()),
+        ]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        resumed_model_settings(&resumed_with_turn_context_latest),
+        Some((settings_model.clone(), settings_effort.clone()))
+    );
+
+    let anchor_model = "session-anchor-model".to_string();
+    let anchor = RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+        meta: SessionMeta {
+            session_id: thread_id.into(),
+            id: thread_id,
+            model_settings: Some(codex_protocol::protocol::SessionModelSettings {
+                model: anchor_model.clone(),
+                reasoning_effort: None,
+            }),
+            ..SessionMeta::default()
+        },
+        git: None,
+    });
+    let copied_source_anchor =
+        RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+            meta: SessionMeta {
+                model_settings: Some(codex_protocol::protocol::SessionModelSettings {
+                    model: "copied-source-model".to_string(),
+                    reasoning_effort: Some(ReasoningEffortConfig::Low),
+                }),
+                ..SessionMeta::default()
+            },
+            git: None,
+        });
+    let resumed_with_session_anchor = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![
+            anchor,
+            copied_source_anchor,
+            RolloutItem::TurnContext(latest_turn_context.clone()),
+        ]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        resumed_model_settings(&resumed_with_session_anchor),
+        Some((anchor_model.clone(), None))
+    );
+    assert!(!resume_needs_model_settings_establishment(
+        &resumed_with_session_anchor,
+        &anchor_model,
+        None,
+    ));
+
+    let legacy_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![RolloutItem::TurnContext(latest_turn_context.clone())]),
+        rollout_path: None,
+    });
+    assert_eq!(resumed_model_settings(&legacy_history), None);
+    assert!(
+        resume_needs_model_settings_establishment(
+            &legacy_history,
+            "current-locked-model",
+            Some(ReasoningEffortConfig::Ultra),
+        ),
+        "legacy TurnContext settings are historical requests, not a lock anchor"
+    );
+
+    for independent_history in [
+        InitialHistory::New,
+        InitialHistory::Cleared,
+        InitialHistory::Forked(vec![
+            RolloutItem::TurnContext(first_turn_context),
+            settings_event,
+        ]),
+    ] {
+        assert_eq!(resumed_model_settings(&independent_history), None);
+    }
+
+    assert!(!resume_needs_model_settings_establishment(
+        &resumed_with_turn_context_latest,
+        &settings_model,
+        settings_effort.clone(),
+    ));
+    assert!(resume_needs_model_settings_establishment(
+        &resumed_with_turn_context_latest,
+        "different-model",
+        latest_turn_context.effort.clone(),
+    ));
+    assert!(resume_needs_model_settings_establishment(
+        &resumed_with_turn_context_latest,
+        &settings_model,
+        Some(ReasoningEffortConfig::Low),
+    ));
+
+    assert!(provider_model_fallback_allowed(
+        true,
+        ModelSettingsPolicy::Mutable
+    ));
+    assert!(!provider_model_fallback_allowed(
+        true,
+        ModelSettingsPolicy::Locked
+    ));
+    assert!(!provider_model_fallback_allowed(
+        false,
+        ModelSettingsPolicy::Mutable
+    ));
 }
 
 pub(crate) async fn make_session_configuration_for_tests() -> SessionConfiguration {
@@ -5550,6 +5966,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
+            config.server_model_validation,
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
@@ -6737,6 +7154,86 @@ async fn user_turn_updates_approvals_reviewer() {
 }
 
 #[tokio::test]
+async fn locked_public_thread_settings_and_user_input_overrides_reject_atomically() {
+    let (session, turn_context, rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.model_settings_policy = ModelSettingsPolicy::Locked,
+    )
+    .await;
+    let original_model = turn_context.model_info.slug.clone();
+    let original_reviewer = {
+        let state = session.state.lock().await;
+        state.session_configuration.approvals_reviewer
+    };
+    let conflicting_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model: "different-model".to_string(),
+            reasoning_effort: turn_context.reasoning_effort.clone(),
+            developer_instructions: None,
+        },
+    };
+
+    handlers::update_thread_settings(
+        &session,
+        "settings-op".to_string(),
+        ThreadSettingsOverrides {
+            approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
+            collaboration_mode: Some(conflicting_mode.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let settings_error = rx.recv().await.expect("settings rejection event");
+    assert!(matches!(settings_error.msg, EventMsg::Error(_)));
+    {
+        let state = session.state.lock().await;
+        assert_eq!(
+            state.session_configuration.collaboration_mode.model(),
+            original_model
+        );
+        assert_eq!(
+            state.session_configuration.approvals_reviewer,
+            original_reviewer
+        );
+    }
+
+    handlers::user_input_or_turn(
+        &session,
+        "input-op".to_string(),
+        Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "must not start".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
+                collaboration_mode: Some(conflicting_mode),
+                ..Default::default()
+            },
+        },
+        /*client_user_message_id*/ None,
+    )
+    .await;
+    let input_error = rx.recv().await.expect("user input rejection event");
+    assert!(matches!(input_error.msg, EventMsg::Error(_)));
+    assert!(session.active_turn.lock().await.is_none());
+    let state = session.state.lock().await;
+    assert_eq!(
+        state.session_configuration.collaboration_mode.model(),
+        original_model
+    );
+    assert_eq!(
+        state.session_configuration.approvals_reviewer,
+        original_reviewer
+    );
+}
+
+#[tokio::test]
 async fn turn_environments_set_primary_environment() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let selected_cwd =
@@ -7042,6 +7539,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
+            model_settings: None,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
@@ -7119,6 +7617,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
+            model_settings: None,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
@@ -7681,6 +8180,7 @@ where
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
+            config.server_model_validation,
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
@@ -9289,6 +9789,7 @@ async fn attach_in_memory_thread_store(
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
+            model_settings: None,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),

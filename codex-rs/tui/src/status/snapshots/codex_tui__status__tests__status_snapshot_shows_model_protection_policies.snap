@@ -1,0 +1,23 @@
+---
+source: tui/src/status/tests.rs
+expression: sanitized
+---
+/status
+
+╭───────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.0.0)                                                 │
+│                                                                           │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date             │
+│ information on rate limits and credits                                    │
+│                                                                           │
+│  Model:            gpt-5.1-codex-max (reasoning none, summaries auto)     │
+│  Model settings:   locked for this thread                                 │
+│  Server model:     must match request                                     │
+│  Reviewer:         auto_review (locked)                                   │
+│  Directory: [[workspace]]                                                 │
+│  Permissions:      Custom (workspace with network access, Approve for me) │
+│  Agents.md:        <none>                                                 │
+│                                                                           │
+│  Token usage:      0 total  (0 input + 0 output)                          │
+│  Limits:           data not available yet                                 │
+╰───────────────────────────────────────────────────────────────────────────╯

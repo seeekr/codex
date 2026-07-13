@@ -11,6 +11,10 @@ impl ChatWidget {
     /// Open a popup to choose a quick auto model. Selecting "All models"
     /// opens the full picker with every available preset.
     pub(crate) fn open_model_popup(&mut self) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         if !self.is_session_configured() {
             self.add_info_message(
                 "Model selection is disabled until startup completes.".to_string(),
@@ -72,6 +76,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_model_popup_with_presets(&mut self, presets: Vec<ModelPreset>) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         let presets: Vec<ModelPreset> = presets
             .into_iter()
             .filter(|preset| preset.show_in_picker)
@@ -187,6 +195,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         if presets.is_empty() {
             self.add_info_message(
                 "No additional models are available right now.".to_string(),
@@ -293,6 +305,10 @@ impl ChatWidget {
         model: String,
         effort: Option<ReasoningEffortConfig>,
     ) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         let reasoning_phrase = match effort.as_ref() {
             Some(ReasoningEffortConfig::None) => "no reasoning".to_string(),
             Some(selected_effort) => {
@@ -398,6 +414,10 @@ impl ChatWidget {
     /// Max and Ultra require an explicit second step so expensive efforts cannot
     /// be selected accidentally while moving through the normal effort scale.
     pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         let default_effort = preset.default_reasoning_effort.clone();
         let supported = &preset.supported_reasoning_efforts;
         let in_plan_mode =
@@ -568,6 +588,10 @@ impl ChatWidget {
 
     /// Open the explicit Max/Ultra effort picker for the given model.
     pub(crate) fn open_advanced_reasoning_popup(&mut self, preset: ModelPreset) {
+        if self.model_settings_locked() {
+            self.show_model_settings_locked_message();
+            return;
+        }
         let mut choices = preset
             .supported_reasoning_efforts
             .iter()

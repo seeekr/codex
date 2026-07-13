@@ -60,6 +60,46 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Controls whether derived addressable-work configs may change protected model execution
+/// settings.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSettingsPolicy {
+    /// Preserve the existing behavior: runtime, thread, and ordinary subagent settings may select
+    /// different substantive model execution settings.
+    #[default]
+    Mutable,
+    /// Keep the effective model and provider route, nullable reasoning effort, review and plan
+    /// overrides, and server-validation policy across runtime updates, externally created threads,
+    /// and ordinary subagents. Requires an explicit non-empty model because a mutable catalog
+    /// default is not a safe lock anchor.
+    Locked,
+}
+
+/// Controls whether derived addressable-work configs may change approval-review routing.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalsReviewerPolicy {
+    /// Preserve the existing behavior: runtime and per-thread settings may change the reviewer.
+    #[default]
+    Mutable,
+    /// Keep the invocation's effective reviewer across runtime and per-thread settings.
+    Locked,
+}
+
+/// Controls validation of the model identity reported by the inference server.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerModelValidation {
+    /// Preserve compatibility behavior: stream responses without requiring an identity and warn
+    /// when a reported identity is invalid or does not match the request.
+    #[default]
+    Warn,
+    /// Buffer each response until completion and release it only after at least one matching model
+    /// identity was reported and no conflicting or invalid identity was reported.
+    RequireMatch,
+}
+
 /// Preferred layout for the resume/fork session picker.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]

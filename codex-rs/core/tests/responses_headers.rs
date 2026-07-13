@@ -132,6 +132,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        config.server_model_validation,
         /*attestation_provider*/ None,
         config.http_client_factory(),
     );
@@ -268,6 +269,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        config.server_model_validation,
         /*attestation_provider*/ None,
         config.http_client_factory(),
     );
@@ -389,6 +391,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        config.server_model_validation,
         /*attestation_provider*/ None,
         config.http_client_factory(),
     );

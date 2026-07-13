@@ -19,6 +19,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::protocol::SessionModelSettings;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -97,6 +98,7 @@ pub enum RolloutRecorderParams {
         source: Box<SessionSource>,
         thread_source: Option<ThreadSource>,
         originator: String,
+        model_settings: Option<SessionModelSettings>,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -179,6 +181,7 @@ impl RolloutRecorderParams {
         source: SessionSource,
         thread_source: Option<ThreadSource>,
         originator: String,
+        model_settings: Option<SessionModelSettings>,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
     ) -> Self {
@@ -190,6 +193,7 @@ impl RolloutRecorderParams {
             source: Box::new(source),
             thread_source,
             originator,
+            model_settings,
             base_instructions,
             dynamic_tools,
             selected_capability_roots: Vec::new(),
@@ -768,6 +772,7 @@ impl RolloutRecorder {
                 source,
                 thread_source,
                 originator,
+                model_settings,
                 base_instructions,
                 dynamic_tools,
                 selected_capability_roots,
@@ -797,6 +802,7 @@ impl RolloutRecorder {
                     timestamp,
                     cwd: cwd.clone(),
                     originator,
+                    model_settings,
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),

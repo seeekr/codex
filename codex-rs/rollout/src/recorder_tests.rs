@@ -180,6 +180,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             history_mode: Default::default(),
             multi_agent_version: None,
             context_window: None,
+            model_settings: None,
         },
         git: None,
     };
@@ -501,6 +502,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
             SessionSource::Exec,
             /*thread_source*/ None,
             "test_originator".to_string(),
+            /*model_settings*/ None,
             BaseInstructions::default(),
             Vec::new(),
         )
@@ -600,6 +602,7 @@ async fn recorder_omits_ordinals_from_legacy_rollouts() -> std::io::Result<()> {
             SessionSource::Exec,
             /*thread_source*/ None,
             "test_originator".to_string(),
+            /*model_settings*/ None,
             BaseInstructions::default(),
             Vec::new(),
         ),
@@ -658,6 +661,7 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
             SessionSource::Exec,
             /*thread_source*/ None,
             "test_originator".to_string(),
+            /*model_settings*/ None,
             BaseInstructions::default(),
             Vec::new(),
         ),

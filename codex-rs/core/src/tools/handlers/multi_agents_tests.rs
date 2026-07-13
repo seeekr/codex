@@ -4580,6 +4580,27 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
 }
 
 #[tokio::test]
+async fn locked_agent_spawn_preserves_nullable_parent_reasoning_effort() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let mut parent_config = (*turn.config).clone();
+    parent_config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Locked;
+    parent_config.model_reasoning_effort = None;
+    turn.config = Arc::new(parent_config);
+    turn.reasoning_effort = None;
+
+    let child = build_agent_spawn_config(
+        &BaseInstructions {
+            text: "base".to_string(),
+        },
+        &turn,
+    )
+    .expect("build locked child config");
+
+    assert_eq!(child.model.as_deref(), Some(turn.model_info.slug.as_str()));
+    assert_eq!(child.model_reasoning_effort, None);
+}
+
+#[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();

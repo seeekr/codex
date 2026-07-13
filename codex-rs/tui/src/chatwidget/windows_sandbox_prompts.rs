@@ -132,6 +132,7 @@ impl ChatWidget {
             header_children.push(Box::new(Paragraph::new(lines).wrap(Wrap { trim: false })));
         }
         let header = ColumnRenderable::with(header_children);
+        let approvals_reviewer = self.effective_approvals_reviewer(ApprovalsReviewer::User);
 
         // Build actions ensuring acknowledgement happens before applying the
         // new permission profile, so downstream policy-change hooks don't
@@ -156,7 +157,7 @@ impl ChatWidget {
                 permission_profile,
                 active_permission_profile,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
+                approvals_reviewer,
             ));
         }
 
@@ -176,7 +177,7 @@ impl ChatWidget {
                 permission_profile,
                 active_permission_profile,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
+                approvals_reviewer,
             ));
         }
 

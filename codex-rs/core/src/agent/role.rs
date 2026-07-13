@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::agent_roles::parse_agent_role_file_contents;
 use crate::config::deserialize_config_toml_with_base;
+use crate::config::validate_locked_settings_override;
 use anyhow::anyhow;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
@@ -45,12 +46,28 @@ pub(crate) async fn apply_role_to_config(
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_resolved_role_to_config(config, role_name, &role).await
+}
+
+async fn apply_resolved_role_to_config(
+    config: &mut Config,
+    role_name: &str,
+    role: &AgentRoleConfig,
+) -> Result<(), String> {
+    let inherited_config = config.clone();
+
+    apply_role_to_config_inner(config, role_name, role)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
             AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
-        })
+        })?;
+
+    if let Err(error) = validate_locked_settings_override(&inherited_config, config) {
+        *config = inherited_config;
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 async fn apply_role_to_config_inner(

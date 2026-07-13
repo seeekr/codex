@@ -182,7 +182,7 @@ pub struct ResponsesWebsocketConnection {
     idle_timeout: Duration,
     server_reasoning_included: bool,
     models_etag: Option<String>,
-    server_model: Option<String>,
+    server_model_attestations: Vec<Option<String>>,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 }
 
@@ -193,7 +193,7 @@ impl std::fmt::Debug for ResponsesWebsocketConnection {
             .field("idle_timeout", &self.idle_timeout)
             .field("server_reasoning_included", &self.server_reasoning_included)
             .field("models_etag", &self.models_etag)
-            .field("server_model", &self.server_model)
+            .field("server_model_attestations", &self.server_model_attestations)
             .field("telemetry", &self.telemetry.as_ref().map(|_| "<telemetry>"))
             .finish()
     }
@@ -205,7 +205,7 @@ impl ResponsesWebsocketConnection {
         idle_timeout: Duration,
         server_reasoning_included: bool,
         models_etag: Option<String>,
-        server_model: Option<String>,
+        server_model_attestations: Vec<Option<String>>,
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     ) -> Self {
         Self {
@@ -213,7 +213,7 @@ impl ResponsesWebsocketConnection {
             idle_timeout,
             server_reasoning_included,
             models_etag,
-            server_model,
+            server_model_attestations,
             telemetry,
         }
     }
@@ -240,7 +240,7 @@ impl ResponsesWebsocketConnection {
         let idle_timeout = self.idle_timeout;
         let server_reasoning_included = self.server_reasoning_included;
         let models_etag = self.models_etag.clone();
-        let server_model = self.server_model.clone();
+        let server_model_attestations = self.server_model_attestations.clone();
         let telemetry = self.telemetry.clone();
         let ResponsesWsRequest::ResponseCreate(ws_request) = &request;
         let client_metadata = ws_request.client_metadata.as_ref();
@@ -276,8 +276,12 @@ impl ResponsesWebsocketConnection {
                 reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
             )]
             async move {
-                if let Some(model) = server_model {
-                    let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+                for attestation in server_model_attestations {
+                    let event = match attestation {
+                        Some(model) => ResponseEvent::ServerModelConnectionDiagnostic(model),
+                        None => ResponseEvent::InvalidServerModelConnectionDiagnostic,
+                    };
+                    let _ = tx_event.send(Ok(event)).await;
                 }
                 if let Some(etag) = models_etag {
                     let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
@@ -390,14 +394,14 @@ impl ResponsesWebsocketClient {
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         self.auth.add_auth_headers(&mut headers);
 
-        let (stream, _status, server_reasoning_included, models_etag, server_model) =
+        let (stream, _status, server_reasoning_included, models_etag, server_model_attestations) =
             connect_websocket(ws_url, headers, http_client_factory, turn_state.clone()).await?;
         Ok(ResponsesWebsocketConnection::new(
             stream,
             self.provider.stream_idle_timeout,
             server_reasoning_included,
             models_etag,
-            server_model,
+            server_model_attestations,
             telemetry,
         ))
     }
@@ -448,7 +452,7 @@ impl ResponsesWebsocketClient {
             status,
             reasoning_included,
             models_etag_present: models_etag.is_some(),
-            server_model_present: server_model.is_some(),
+            server_model_present: !server_model.is_empty(),
             immediate_close,
         })
     }
@@ -488,7 +492,16 @@ async fn connect_websocket(
     headers: HeaderMap,
     http_client_factory: &HttpClientFactory,
     turn_state: Option<Arc<OnceLock<String>>>,
-) -> Result<(WsStream, StatusCode, bool, Option<String>, Option<String>), ApiError> {
+) -> Result<
+    (
+        WsStream,
+        StatusCode,
+        bool,
+        Option<String>,
+        Vec<Option<String>>,
+    ),
+    ApiError,
+> {
     info!("connecting to websocket: {url}");
 
     let mut request = url
@@ -521,11 +534,12 @@ async fn connect_websocket(
         .get(X_MODELS_ETAG_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
-    let server_model = response
+    let server_model_attestations = response
         .headers()
-        .get(OPENAI_MODEL_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
+        .get_all(OPENAI_MODEL_HEADER)
+        .iter()
+        .map(|value| value.to_str().ok().map(ToString::to_string))
+        .collect::<Vec<_>>();
     if let Some(turn_state) = turn_state
         && let Some(header_value) = response
             .headers()
@@ -539,7 +553,7 @@ async fn connect_websocket(
         response.status(),
         reasoning_included,
         models_etag,
-        server_model,
+        server_model_attestations,
     ))
 }
 
@@ -736,19 +750,27 @@ async fn run_websocket_response_stream(
                 let turn_moderation_metadata = event.turn_moderation_metadata();
                 let safety_buffering =
                     safety_buffering_for_event(&event, &mut safety_buffering_treatment);
+                for attestation in event.response_models() {
+                    match attestation {
+                        Some(model) if last_server_model.as_deref() != Some(model.as_str()) => {
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::ServerModel(model.clone())))
+                                .await;
+                            last_server_model = Some(model);
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::InvalidServerModelAttestation))
+                                .await;
+                        }
+                    }
+                }
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text) {
                         let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
                     }
                     continue;
-                }
-                if let Some(model) = event.response_model()
-                    && last_server_model.as_deref() != Some(model.as_str())
-                {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::ServerModel(model.clone())))
-                        .await;
-                    last_server_model = Some(model);
                 }
                 if let Some(verifications) = model_verifications
                     && tx_event

@@ -1607,6 +1607,26 @@ async fn set_reasoning_effort_does_not_override_active_plan_override() {
 }
 
 #[tokio::test]
+async fn locked_plan_mode_switch_preserves_model_and_effort() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Ultra));
+    chat.config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::Low);
+    chat.config.model_settings_policy = ModelSettingsPolicy::Locked;
+    chat.thread_id = Some(ThreadId::new());
+    let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
+        .expect("expected plan collaboration mask");
+
+    chat.set_collaboration_mask(plan_mask);
+
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert_eq!(chat.current_model(), "gpt-5.4");
+    assert_eq!(
+        chat.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::Ultra)
+    );
+}
+
+#[tokio::test]
 async fn collab_mode_is_sent_after_enabling() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());

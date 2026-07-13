@@ -256,6 +256,11 @@ impl AppServerSession {
         matches!(&self.client, AppServerClient::InProcess(_))
     }
 
+    #[cfg(test)]
+    pub(crate) fn next_request_id_for_tests(&self) -> i64 {
+        self.next_request_id
+    }
+
     pub(crate) fn codex_home_path(
         &self,
         local_codex_home: &AbsolutePathBuf,

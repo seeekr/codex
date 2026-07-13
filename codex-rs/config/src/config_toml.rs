@@ -9,6 +9,7 @@ use crate::permissions_toml::PermissionsToml;
 use crate::profile_toml::ConfigProfile;
 use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
+use crate::types::ApprovalsReviewerPolicy;
 use crate::types::AppsConfigToml;
 use crate::types::AuthCredentialsStoreMode;
 use crate::types::FeedbackConfigToml;
@@ -16,11 +17,13 @@ use crate::types::History;
 use crate::types::MarketplaceConfig;
 use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
+use crate::types::ModelSettingsPolicy;
 use crate::types::Notice;
 use crate::types::OAuthCredentialsStoreMode;
 use crate::types::OtelConfigToml;
 use crate::types::PluginConfig;
 use crate::types::SandboxWorkspaceWrite;
+use crate::types::ServerModelValidation;
 use crate::types::ShellEnvironmentPolicyToml;
 use crate::types::SkillsConfig;
 use crate::types::ToolSuggestConfig;
@@ -154,6 +157,12 @@ pub struct OrchestratorFeatureToml {
 pub struct ConfigToml {
     /// Optional override of model selection.
     pub model: Option<String>,
+    /// Whether derived addressable-work configs may change protected model execution settings.
+    pub model_settings_policy: Option<ModelSettingsPolicy>,
+    /// Whether derived addressable-work configs may change approval-review routing.
+    pub approvals_reviewer_policy: Option<ApprovalsReviewerPolicy>,
+    /// How server-reported model identities are validated against each request.
+    pub server_model_validation: Option<ServerModelValidation>,
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
 

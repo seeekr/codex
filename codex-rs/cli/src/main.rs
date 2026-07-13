@@ -863,12 +863,61 @@ fn delete_action(target: &str, force: bool) -> anyhow::Result<codex_tui::Session
     Ok(codex_tui::SessionArchiveAction::Delete(confirmation))
 }
 
-async fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Result<()> {
+fn debug_app_server_config_overrides(
+    root_config_overrides: &CliConfigOverrides,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut overrides = root_config_overrides.raw_overrides.clone();
+    if let Some(model) = model {
+        overrides.push(format!("model={}", toml::Value::String(model.to_string())));
+    }
+    overrides
+}
+
+fn ensure_debug_app_server_child_is_allowed(
+    config: &codex_core::config::Config,
+) -> anyhow::Result<()> {
+    if config.model_settings_policy == codex_config::types::ModelSettingsPolicy::Locked
+        || config.approvals_reviewer_policy == codex_config::types::ApprovalsReviewerPolicy::Locked
+    {
+        anyhow::bail!(
+            "`codex debug app-server send-message-v2` cannot launch a nested app-server while protected settings are locked; run `codex app-server` directly with the same invocation config"
+        );
+    }
+    Ok(())
+}
+
+async fn run_debug_app_server_command(
+    cmd: DebugAppServerCommand,
+    root_config_overrides: &CliConfigOverrides,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
     match cmd.subcommand {
         DebugAppServerSubcommand::SendMessageV2(cmd) => {
+            let cli_overrides = root_config_overrides
+                .parse_overrides()
+                .map_err(anyhow::Error::msg)?;
+            let config = ConfigBuilder::default()
+                .cli_overrides(cli_overrides)
+                .harness_overrides(ConfigOverrides {
+                    model: model.map(str::to_string),
+                    ..Default::default()
+                })
+                .build()
+                .await?;
+            // This debug helper creates a second process. Raw CLI forwarding cannot faithfully
+            // encode every protected effective value (notably nullable settings), so fail closed
+            // instead of allowing the child to establish a different locked pair.
+            ensure_debug_app_server_child_is_allowed(&config)?;
             let codex_bin = std::env::current_exe()?;
-            codex_app_server_test_client::send_message_v2(&codex_bin, &[], cmd.user_message, &None)
-                .await
+            let config_overrides = debug_app_server_config_overrides(root_config_overrides, model);
+            codex_app_server_test_client::send_message_v2(
+                &codex_bin,
+                &config_overrides,
+                cmd.user_message,
+                &None,
+            )
+            .await
         }
     }
 }
@@ -1502,7 +1551,12 @@ async fn cli_main(
                     root_remote_auth_token_env.as_deref(),
                     "debug app-server",
                 )?;
-                run_debug_app_server_command(cmd).await?;
+                run_debug_app_server_command(
+                    cmd,
+                    &root_config_overrides,
+                    interactive.model.as_deref(),
+                )
+                .await?;
             }
             DebugSubcommand::PromptInput(cmd) => {
                 reject_remote_mode_for_subcommand(
@@ -2500,6 +2554,74 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn debug_app_server_child_inherits_root_config_and_model_overrides() {
+        let root = CliConfigOverrides {
+            raw_overrides: vec![
+                "model_settings_policy=locked".to_string(),
+                "model_reasoning_effort=max".to_string(),
+                "model=from-root-config".to_string(),
+            ],
+        };
+
+        let child_overrides =
+            debug_app_server_config_overrides(&root, Some("model with an embedded \"quote\""));
+        let parsed = CliConfigOverrides {
+            raw_overrides: child_overrides,
+        }
+        .parse_overrides()
+        .expect("child overrides should remain parseable");
+
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "model_settings_policy".to_string(),
+                    toml::Value::String("locked".to_string()),
+                ),
+                (
+                    "model_reasoning_effort".to_string(),
+                    toml::Value::String("max".to_string()),
+                ),
+                (
+                    "model".to_string(),
+                    toml::Value::String("from-root-config".to_string()),
+                ),
+                (
+                    "model".to_string(),
+                    toml::Value::String("model with an embedded \"quote\"".to_string()),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_app_server_child_is_rejected_when_either_policy_is_locked() {
+        let codex_home = tempfile::tempdir().expect("create codex home");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .build()
+            .await
+            .expect("build test config");
+
+        ensure_debug_app_server_child_is_allowed(&config)
+            .expect("mutable defaults should allow the debug child");
+        config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Locked;
+        let error = ensure_debug_app_server_child_is_allowed(&config)
+            .expect_err("model lock must reject the nested child");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot launch a nested app-server")
+        );
+
+        config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Mutable;
+        config.approvals_reviewer_policy = codex_config::types::ApprovalsReviewerPolicy::Locked;
+        ensure_debug_app_server_child_is_allowed(&config)
+            .expect_err("reviewer lock must independently reject the nested child");
+    }
 
     #[test]
     fn exec_server_remote_auth_accepts_api_key_auth() {

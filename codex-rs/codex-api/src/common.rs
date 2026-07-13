@@ -70,7 +70,7 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum ResponseEvent {
     Created,
     SafetyBuffering(SafetyBuffering),
@@ -79,6 +79,14 @@ pub enum ResponseEvent {
     /// Emitted when the server includes `OpenAI-Model` on the stream response.
     /// This can differ from the requested model when backend safety routing applies.
     ServerModel(String),
+    /// Emitted when a server model attestation is present but cannot be interpreted as text.
+    /// Strict consumers must treat this as a failed attestation rather than silently ignoring it.
+    InvalidServerModelAttestation,
+    /// Connection-scoped model metadata from a WebSocket upgrade. This is diagnostic only: the
+    /// connection can serve requests for different models, so it cannot attest a response.
+    ServerModelConnectionDiagnostic(String),
+    /// An uninterpretable connection-scoped WebSocket model header. Diagnostic only.
+    InvalidServerModelConnectionDiagnostic,
     /// Emitted when the server recommends additional account verification.
     ModelVerifications(Vec<ModelVerification>),
     /// Emitted when the server includes moderation metadata for first-party turn presentation.
@@ -120,7 +128,7 @@ pub enum ResponseEvent {
     ModelsEtag(String),
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SafetyBuffering {
     pub use_cases: Vec<String>,
     pub reasons: Vec<String>,

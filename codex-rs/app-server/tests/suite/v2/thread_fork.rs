@@ -255,6 +255,88 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
 }
 
 #[tokio::test]
+async fn locked_thread_fork_inherits_process_pair_and_rejects_overrides() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "model = \"mock-model\"",
+        r#"model = "mock-model"
+model_reasoning_effort = "high"
+model_settings_policy = "locked""#,
+    );
+    std::fs::write(&config_path, config)?;
+
+    let source_thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-06T12-00-00",
+        "2025-01-06T12:00:00Z",
+        "legacy source without a model-settings anchor",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let same_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let same_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(same_id)),
+    )
+    .await??;
+    let same_response = to_response::<ThreadForkResponse>(same_response)?;
+    assert_eq!(same_response.model, "mock-model");
+    assert_eq!(
+        same_response.reasoning_effort,
+        Some(codex_protocol::openai_models::ReasoningEffort::High)
+    );
+
+    let cases = [
+        ThreadForkParams {
+            thread_id: source_thread_id.clone(),
+            model: Some("lower-model".to_string()),
+            ..Default::default()
+        },
+        ThreadForkParams {
+            thread_id: source_thread_id,
+            config: Some(std::collections::HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                json!("low"),
+            )])),
+            ..Default::default()
+        },
+    ];
+    for params in cases {
+        let request_id = mcp.send_thread_fork_request(params).await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, -32600);
+        assert!(
+            error
+                .error
+                .message
+                .contains("protected settings are locked for this invocation"),
+            "unexpected locked fork error: {}",
+            error.error.message
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_fork_at_last_turn_id_keeps_only_terminal_prefix() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
