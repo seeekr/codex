@@ -78,6 +78,7 @@ async fn locked_new_thread_persists_exact_model_settings_anchor() -> Result<()> 
             config.model_settings_policy = ModelSettingsPolicy::Locked;
         });
     let test = builder.build(&server).await?;
+    test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
 
     let history = test.codex.load_history(/*include_archived*/ false).await?;
@@ -104,6 +105,7 @@ async fn mutable_new_thread_omits_model_settings_anchor() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
+    test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
 
     let history = test.codex.load_history(/*include_archived*/ false).await?;
