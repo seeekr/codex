@@ -21,6 +21,7 @@ use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
+use crate::config::validate_locked_model_selection;
 use crate::context::ApprovalPromptContext;
 use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AvailableSkillsInstructions;
@@ -54,6 +55,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::SubAgentThreadStartedInput;
 use codex_analytics::TurnCodexErrorFact;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::ModelSettingsPolicy;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
@@ -465,6 +467,68 @@ pub(crate) fn resolve_multi_agent_version(
         })
 }
 
+fn resumed_model_settings(
+    conversation_history: &InitialHistory,
+) -> Option<(String, Option<ReasoningEffortConfig>)> {
+    let InitialHistory::Resumed(resumed) = conversation_history else {
+        return None;
+    };
+    if let Some(settings) = resumed.history.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some((
+            event.thread_settings.model.clone(),
+            event.thread_settings.reasoning_effort.clone(),
+        )),
+        _ => None,
+    }) {
+        return Some(settings);
+    }
+
+    // Forked histories can contain source-thread SessionMeta records after the child's canonical
+    // record. Match the resumed thread id instead of relying on position.
+    if let Some(settings) = resumed.history.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta) if meta.meta.id == resumed.conversation_id => meta
+            .meta
+            .model_settings
+            .as_ref()
+            .map(|settings| (settings.model.clone(), settings.reasoning_effort.clone())),
+        _ => None,
+    }) {
+        return Some(settings);
+    }
+
+    // A rollout with neither canonical SessionMeta settings nor a settings event predates the
+    // lock feature. Its TurnContext records describe past requests, not an adopted lock anchor.
+    // The first locked resume establishes the current process pair instead.
+    None
+}
+
+fn resume_needs_model_settings_establishment(
+    conversation_history: &InitialHistory,
+    resolved_model: &str,
+    resolved_effort: Option<ReasoningEffortConfig>,
+) -> bool {
+    if !matches!(conversation_history, InitialHistory::Resumed(_)) {
+        return false;
+    }
+    resumed_model_settings(conversation_history).is_none_or(
+        |(persisted_model, persisted_effort)| {
+            persisted_model != resolved_model || persisted_effort != resolved_effort
+        },
+    )
+}
+
+fn provider_model_fallback_allowed(
+    configured: bool,
+    model_settings_policy: ModelSettingsPolicy,
+) -> bool {
+    configured && model_settings_policy == ModelSettingsPolicy::Mutable
+}
+
+fn validate_spawn_model_settings(config: &Config) -> CodexResult<()> {
+    validate_locked_model_selection(config)
+        .map_err(|error| CodexErr::ModelSettingsPolicy(error.to_string()))
+}
+
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
@@ -534,6 +598,7 @@ impl Codex {
             external_time_provider,
             inherited_multi_agent_version,
         } = args;
+        validate_spawn_model_settings(&config)?;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -545,6 +610,10 @@ impl Codex {
         config
             .startup_warnings
             .extend(user_instruction_provider_warnings);
+        let allow_provider_model_fallback = provider_model_fallback_allowed(
+            allow_provider_model_fallback,
+            config.model_settings_policy,
+        );
         let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
             // Guardian review should rely on the built-in shell safety checks,
             // not on caller-provided exec-policy rules that could shape the
@@ -1318,12 +1387,19 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let is_subagent = {
+        let (is_subagent, model_settings_locked) = {
             let state = self.state.lock().await;
-            state
-                .session_configuration
-                .session_source
-                .is_non_root_agent()
+            (
+                state
+                    .session_configuration
+                    .session_source
+                    .is_non_root_agent(),
+                state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .model_settings_policy
+                    == ModelSettingsPolicy::Locked,
+            )
         };
         let has_prior_user_turns = initial_history_has_prior_user_turns(&conversation_history);
         {
@@ -1346,10 +1422,11 @@ impl Session {
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
-                if let Some(prev) = previous_turn_settings
-                    .as_ref()
-                    .map(|settings| settings.model.as_str())
-                    .filter(|model| *model != curr)
+                if !model_settings_locked
+                    && let Some(prev) = previous_turn_settings
+                        .as_ref()
+                        .map(|settings| settings.model.as_str())
+                        .filter(|model| *model != curr)
                 {
                     warn!("resuming session with different model: previous={prev}, current={curr}");
                     self.send_event(
@@ -1399,6 +1476,14 @@ impl Session {
                 // If persisting, persist all rollout items as-is (the store filters).
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
+                }
+                if model_settings_locked {
+                    // Copied source settings are persisted after the child's canonical
+                    // SessionMeta. Re-anchor the unscoped settings event stream after that copy
+                    // so a cold resume cannot mistake the source thread's pair for the child's.
+                    let child_settings = handlers::thread_settings_applied_event(self).await;
+                    self.persist_rollout_items(&[RolloutItem::EventMsg(child_settings)])
+                        .await;
                 }
 
                 // Forked threads should remain file-backed immediately after startup.

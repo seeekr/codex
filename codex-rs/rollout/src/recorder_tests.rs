@@ -93,6 +93,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
             originator: "test".to_string(),
+            model_settings: None,
             cli_version: "test".to_string(),
             source: SessionSource::Cli,
             thread_source: None,
@@ -426,6 +427,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
             SessionSource::Exec,
             /*thread_source*/ None,
             "test_originator".to_string(),
+            /*model_settings*/ None,
             BaseInstructions::default(),
             Vec::new(),
         )
@@ -521,6 +523,7 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
             SessionSource::Exec,
             /*thread_source*/ None,
             "test_originator".to_string(),
+            /*model_settings*/ None,
             BaseInstructions::default(),
             Vec::new(),
         ),

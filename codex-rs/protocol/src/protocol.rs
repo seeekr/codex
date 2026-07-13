@@ -2999,6 +2999,17 @@ pub struct SessionContextWindow {
     pub window_id: String,
 }
 
+/// Canonical model selection established when a thread is created.
+///
+/// `reasoning_effort` intentionally serializes as `null` when absent so an explicit no-effort
+/// selection remains distinguishable from legacy session metadata that has no anchor at all.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionModelSettings {
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
+}
+
 impl SessionContextWindow {
     pub fn new(window_id: String) -> Self {
         Self { window_id }
@@ -3059,6 +3070,9 @@ pub struct SessionMeta {
     /// Initial context-window identity for consumers that tail rollout JSONL before compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<SessionContextWindow>,
+    /// Initial model/effort pair for this thread. Missing only on legacy rollouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_settings: Option<SessionModelSettings>,
 }
 
 impl Default for SessionMeta {
@@ -3086,6 +3100,7 @@ impl Default for SessionMeta {
             history_mode: ThreadHistoryMode::default(),
             multi_agent_version: None,
             context_window: None,
+            model_settings: None,
         }
     }
 }
@@ -5803,6 +5818,30 @@ mod tests {
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn session_meta_model_settings_preserves_explicit_none_effort() -> Result<()> {
+        let legacy_serialized = serde_json::to_value(SessionMeta::default())?;
+        assert!(legacy_serialized.get("model_settings").is_none());
+
+        let session_meta = SessionMeta {
+            model_settings: Some(SessionModelSettings {
+                model: "gpt-test".to_string(),
+                reasoning_effort: None,
+            }),
+            ..SessionMeta::default()
+        };
+
+        let serialized = serde_json::to_value(&session_meta)?;
+        assert_eq!(serialized["model_settings"]["model"], json!("gpt-test"));
+        assert_eq!(
+            serialized["model_settings"]["reasoning_effort"],
+            Value::Null
+        );
+        let round_trip: SessionMeta = serde_json::from_value(serialized)?;
+        assert_eq!(round_trip.model_settings, session_meta.model_settings);
         Ok(())
     }
 

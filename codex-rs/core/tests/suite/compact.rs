@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_config::types::ServerModelValidation;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
@@ -475,6 +476,117 @@ fn format_labeled_requests_snapshot(
         sections,
         &context_snapshot_options(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_server_model_validation_rejects_late_compaction_mismatch_without_history_change()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const REQUESTED_MODEL: &str = "gpt-5.3-codex";
+    const CONFLICTING_MODEL: &str = "gpt-5.2";
+    const UNVALIDATED_SUMMARY: &str = "UNVALIDATED_COMPACTION_SUMMARY";
+
+    let server = start_mock_server().await;
+    let first_turn = sse_response(sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]))
+    .insert_header("OpenAI-Model", REQUESTED_MODEL);
+    let compact_turn = sse_response(sse(vec![
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": "r2",
+                "headers": { "OpenAI-Model": REQUESTED_MODEL }
+            }
+        }),
+        ev_assistant_message("m2", UNVALIDATED_SUMMARY),
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": "r2-late",
+                "headers": { "OpenAI-Model": CONFLICTING_MODEL }
+            }
+        }),
+        ev_completed("r2"),
+    ]))
+    .insert_header("OpenAI-Model", REQUESTED_MODEL);
+    let request_log = mount_response_sequence(&server, vec![first_turn, compact_turn]).await;
+
+    let mut builder = test_codex()
+        .with_model(REQUESTED_MODEL)
+        .with_config(|config| {
+            config.server_model_validation = ServerModelValidation::RequireMatch;
+            set_test_compact_prompt(config);
+        });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "history that must survive failed compaction".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.codex.flush_rollout().await?;
+    let before = test.codex.load_history(/*include_archived*/ false).await?;
+    let before_response_items = before
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    test.codex.submit(Op::Compact).await?;
+    let validation_error = loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Error(error) => break error,
+            EventMsg::AgentMessage(message) if message.message == UNVALIDATED_SUMMARY => {
+                panic!("unvalidated compaction summary escaped the validation buffer")
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        validation_error
+            .message
+            .contains("server model validation failed")
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.codex.flush_rollout().await?;
+    let after = test.codex.load_history(/*include_archived*/ false).await?;
+    let after_response_items = after
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after_response_items, before_response_items);
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "validation failure must not retry compaction"
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

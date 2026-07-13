@@ -78,6 +78,10 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     if !meta_line.meta.cwd.as_os_str().is_empty() {
         metadata.cwd = meta_line.meta.cwd.clone();
     }
+    if let Some(model_settings) = &meta_line.meta.model_settings {
+        metadata.model = Some(model_settings.model.clone());
+        metadata.reasoning_effort = model_settings.reasoning_effort.clone();
+    }
     if let Some(git) = meta_line.git.as_ref() {
         metadata.git_sha = git.commit_hash.as_ref().map(|sha| sha.0.clone());
         metadata.git_branch = git.branch.clone();
@@ -383,6 +387,7 @@ mod tests {
                     history_mode: Default::default(),
                     multi_agent_version: None,
                     context_window: None,
+                    model_settings: None,
                 },
                 git: None,
             }),
@@ -600,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_does_not_set_model_or_reasoning_effort() {
+    fn session_meta_sets_model_anchor_with_explicit_none_effort() {
         let mut metadata = metadata_for_test();
         metadata.history_mode = ThreadHistoryMode::Paginated;
         let thread_id = metadata.id;
@@ -630,13 +635,17 @@ mod tests {
                     history_mode: ThreadHistoryMode::Legacy,
                     multi_agent_version: None,
                     context_window: None,
+                    model_settings: Some(codex_protocol::protocol::SessionModelSettings {
+                        model: "gpt-anchor".to_string(),
+                        reasoning_effort: None,
+                    }),
                 },
                 git: None,
             }),
             "test-provider",
         );
 
-        assert_eq!(metadata.model, None);
+        assert_eq!(metadata.model.as_deref(), Some("gpt-anchor"));
         assert_eq!(metadata.reasoning_effort, None);
         assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
     }

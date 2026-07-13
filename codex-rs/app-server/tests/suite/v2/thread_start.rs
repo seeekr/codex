@@ -6,6 +6,7 @@ use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -962,6 +963,121 @@ model_reasoning_effort = "high"
 }
 
 #[tokio::test]
+async fn locked_thread_start_allows_fixed_purpose_realtime_and_rejects_substantive_overrides()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "model = \"mock-model\"",
+        r#"model = "mock-model"
+model_reasoning_effort = "high"
+model_settings_policy = "locked"
+approvals_reviewer = "auto_review"
+approvals_reviewer_policy = "locked""#,
+    );
+    std::fs::write(&config_path, config)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let same_request = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let same_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(same_request)),
+    )
+    .await??;
+    let same_response = to_response::<ThreadStartResponse>(same_response)?;
+    assert_eq!(same_response.model, "mock-model");
+    assert_eq!(same_response.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        same_response.approvals_reviewer,
+        ApprovalsReviewer::AutoReview
+    );
+
+    let realtime_request = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            config: Some(std::collections::HashMap::from([
+                (
+                    "experimental_realtime_ws_base_url".to_string(),
+                    json!("wss://harness.example/v1/realtime"),
+                ),
+                (
+                    "experimental_realtime_webrtc_call_base_url".to_string(),
+                    json!("https://harness.example/v1"),
+                ),
+                (
+                    "experimental_realtime_ws_model".to_string(),
+                    json!("gpt-realtime-harness"),
+                ),
+                ("realtime.version".to_string(), json!("v1")),
+                ("realtime.type".to_string(), json!("transcription")),
+                ("realtime.transport".to_string(), json!("webrtc")),
+            ])),
+            ..Default::default()
+        })
+        .await?;
+    let realtime_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(realtime_request)),
+    )
+    .await??;
+    let realtime_response = to_response::<ThreadStartResponse>(realtime_response)?;
+    assert_eq!(realtime_response.model, "mock-model");
+    assert_eq!(
+        realtime_response.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(
+        realtime_response.approvals_reviewer,
+        ApprovalsReviewer::AutoReview
+    );
+
+    let cases = [
+        ThreadStartParams {
+            model: Some("lower-model".to_string()),
+            ..Default::default()
+        },
+        ThreadStartParams {
+            config: Some(std::collections::HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                json!("low"),
+            )])),
+            ..Default::default()
+        },
+        ThreadStartParams {
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            ..Default::default()
+        },
+    ];
+    for params in cases {
+        let request_id = mcp.send_thread_start_request_with_auto_env(params).await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+        assert!(
+            error
+                .error
+                .message
+                .contains("protected settings are locked for this invocation"),
+            "unexpected locked start error: {}",
+            error.error.message
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_drops_unsupported_service_tier_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1397,6 +1513,63 @@ model_reasoning_effort = "high"
     let trusted_root_key = project_trust_key(trusted_root.as_path());
     assert!(config_toml.contains(&trusted_root_key));
     assert!(config_toml.contains("trust_level = \"trusted\""));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn locked_thread_start_validates_project_config_activated_by_trust_transition() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "model = \"mock-model\"",
+        r#"model = "mock-model"
+model_reasoning_effort = "high"
+model_settings_policy = "locked""#,
+    );
+    std::fs::write(&config_path, config)?;
+
+    let workspace = TempDir::new()?;
+    let project_config_dir = workspace.path().join(".codex");
+    std::fs::create_dir_all(&project_config_dir)?;
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        r#"
+model = "project-lower-model"
+model_reasoning_effort = "low"
+"#,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    // The initial untrusted load cannot see the project config. Workspace-write establishes
+    // trust, reloads it, and must validate that final effective config before creating a thread.
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            sandbox: Some(SandboxMode::WorkspaceWrite),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(
+        error.error.message.contains("model")
+            && error.error.message.contains("model_reasoning_effort"),
+        "unexpected post-trust validation error: {}",
+        error.error.message
+    );
 
     Ok(())
 }

@@ -127,6 +127,7 @@ mod tests {
                     source: SessionSource::Exec,
                     thread_source: None,
                     originator: "test_originator".to_string(),
+                    model_settings: None,
                     base_instructions: BaseInstructions::default(),
                     dynamic_tools: Vec::new(),
                     selected_capability_roots: Vec::new(),
@@ -196,6 +197,33 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([child_thread_id, grandchild_thread_id])
         );
+    }
+
+    #[tokio::test]
+    async fn create_thread_persists_optional_locked_model_settings_anchor() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::default();
+        let expected = codex_protocol::protocol::SessionModelSettings {
+            model: "locked-model".to_string(),
+            reasoning_effort: None,
+        };
+        let mut params = create_thread_params(thread_id, ThreadHistoryMode::Legacy);
+        params.model_settings = Some(expected.clone());
+
+        store
+            .create_thread(params)
+            .await
+            .expect("create locked thread");
+
+        let state = store.state.lock().await;
+        let Some(RolloutItem::SessionMeta(meta)) = state
+            .histories
+            .get(&thread_id)
+            .and_then(|history| history.first())
+        else {
+            panic!("expected canonical session meta");
+        };
+        assert_eq!(meta.meta.model_settings, Some(expected));
     }
 
     #[tokio::test]
@@ -322,6 +350,7 @@ mod tests {
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
+            model_settings: None,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
@@ -433,6 +462,7 @@ impl InMemoryThreadStore {
             agent_role: params.source.get_agent_role(),
             agent_path: params.source.get_agent_path().map(Into::into),
             originator: params.originator.clone(),
+            model_settings: params.model_settings.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
             model_provider: Some(params.metadata.model_provider.clone()),

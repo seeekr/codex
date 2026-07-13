@@ -192,6 +192,21 @@ fn merge_persisted_approvals_reviewer(
             });
 }
 
+fn map_thread_resume_error(error: CodexErr) -> codex_app_server_protocol::JSONRPCErrorError {
+    match error {
+        CodexErr::ModelSettingsPolicy(message) => invalid_request(message),
+        error => internal_error(format!("error resuming thread: {error}")),
+    }
+}
+
+fn validate_locked_thread_config(
+    base: &Config,
+    candidate: &Config,
+) -> Result<(), codex_app_server_protocol::JSONRPCErrorError> {
+    codex_core::config::validate_locked_settings_override(base, candidate)
+        .map_err(|error| invalid_request(error.to_string()))
+}
+
 fn normalize_thread_list_cwd_filters(
     cwd: Option<ThreadListCwdFilter>,
 ) -> Result<Option<Vec<PathBuf>>, JSONRPCErrorError> {
@@ -999,6 +1014,7 @@ impl ThreadRequestProcessor {
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
+        let base_config = Arc::clone(&self.config);
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
@@ -1006,6 +1022,7 @@ impl ThreadRequestProcessor {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
                 config_manager,
+                base_config,
                 request_id,
                 app_server_client_name,
                 app_server_client_version,
@@ -1083,6 +1100,7 @@ impl ThreadRequestProcessor {
     async fn thread_start_task(
         listener_task_context: ListenerTaskContext,
         config_manager: ConfigManager,
+        base_config: Arc<Config>,
         request_id: ConnectionRequestId,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
@@ -1107,6 +1125,7 @@ impl ThreadRequestProcessor {
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_err(|err| config_load_error(&err))?;
+        validate_locked_thread_config(base_config.as_ref(), &config)?;
 
         // The user may have requested WorkspaceWrite or DangerFullAccess via
         // the command line, though in the process of deriving the Config, it
@@ -1172,6 +1191,10 @@ impl ThreadRequestProcessor {
                 .await
                 .map_err(|err| config_load_error(&err))?;
         }
+        // Trust establishment can activate project-local configuration that was intentionally
+        // absent from the first load. Admit only the final effective config used to create the
+        // thread; otherwise a trust transition could bypass the process-level locks.
+        validate_locked_thread_config(base_config.as_ref(), &config)?;
 
         if let Ok(Some(err)) =
             codex_core::check_execpolicy_for_warnings(&config.config_layer_stack).await
@@ -2806,11 +2829,16 @@ impl ThreadRequestProcessor {
             }
         };
         if !has_explicit_model_resume_override
+            && self.config.model_settings_policy != codex_config::types::ModelSettingsPolicy::Locked
             && persisted_metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.reasoning_effort.is_none())
         {
             config.model_reasoning_effort = None;
+        }
+        if let Err(error) = validate_locked_thread_config(self.config.as_ref(), &config) {
+            self.outgoing.send_error(request_id, error).await;
+            return Ok(());
         }
 
         let response_history = thread_history.clone();
@@ -2982,7 +3010,7 @@ impl ThreadRequestProcessor {
                     .await;
             }
             Err(err) => {
-                let error = internal_error(format!("error resuming thread: {err}"));
+                let error = map_thread_resume_error(err);
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -2995,11 +3023,17 @@ impl ThreadRequestProcessor {
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
     ) -> Option<ThreadMetadata> {
-        merge_persisted_approvals_reviewer(
-            thread_history,
-            request_overrides.as_ref(),
-            typesafe_overrides,
-        );
+        let model_settings_locked =
+            self.config.model_settings_policy == codex_config::types::ModelSettingsPolicy::Locked;
+        let approvals_reviewer_locked = self.config.approvals_reviewer_policy
+            == codex_config::types::ApprovalsReviewerPolicy::Locked;
+        if !approvals_reviewer_locked {
+            merge_persisted_approvals_reviewer(
+                thread_history,
+                request_overrides.as_ref(),
+                typesafe_overrides,
+            );
+        }
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
@@ -3009,7 +3043,13 @@ impl ThreadRequestProcessor {
             .await
             .ok()
             .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
+        if !model_settings_locked {
+            merge_persisted_resume_metadata(
+                request_overrides,
+                typesafe_overrides,
+                &persisted_metadata,
+            );
+        }
         Some(persisted_metadata)
     }
 
@@ -3546,6 +3586,7 @@ impl ThreadRequestProcessor {
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
             .map_err(|err| config_load_error(&err))?;
+        validate_locked_thread_config(self.config.as_ref(), &config)?;
 
         let fallback_model_provider = config.model_provider_id.clone();
 

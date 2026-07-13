@@ -298,7 +298,12 @@ async fn run_compact_task_inner_impl(
                 return Err(e);
             }
             Err(e) => {
-                if retries < max_retries {
+                if matches!(&e, CodexErr::ServerModelValidation(_)) {
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    return Err(e);
+                } else if retries < max_retries {
                     retries += 1;
                     let delay = backoff(retries);
                     sess.notify_stream_error(

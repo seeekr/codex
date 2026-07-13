@@ -544,6 +544,10 @@ pub(crate) fn mcp_approvals_reviewer(
     server_name: &str,
     connector_id: Option<&str>,
 ) -> ApprovalsReviewer {
+    if config.approvals_reviewer_policy == codex_config::types::ApprovalsReviewerPolicy::Locked {
+        return config.approvals_reviewer;
+    }
+
     let app_reviewer = if server_name == CODEX_APPS_MCP_SERVER_NAME {
         apps_config_from_layer_stack(&config.config_layer_stack).and_then(|apps_config| {
             connector_id

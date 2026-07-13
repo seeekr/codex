@@ -10,6 +10,9 @@ use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
+use codex_config::types::ApprovalsReviewerPolicy;
+use codex_config::types::ModelSettingsPolicy;
+use codex_config::types::ServerModelValidation;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -106,6 +109,9 @@ impl StatusHistoryHandle {
 struct StatusHistoryCell {
     model_name: String,
     model_details: Vec<String>,
+    model_settings_locked: bool,
+    server_model_match_required: bool,
+    locked_approvals_reviewer: Option<String>,
     directory: PathBuf,
     permissions: String,
     agents_summary: Arc<RwLock<String>>,
@@ -355,6 +361,12 @@ impl StatusHistoryCell {
             Self {
                 model_name,
                 model_details,
+                model_settings_locked: config.model_settings_policy == ModelSettingsPolicy::Locked,
+                server_model_match_required: config.server_model_validation
+                    == ServerModelValidation::RequireMatch,
+                locked_approvals_reviewer: (config.approvals_reviewer_policy
+                    == ApprovalsReviewerPolicy::Locked)
+                    .then(|| config.approvals_reviewer.to_string()),
                 directory: config.cwd.to_path_buf(),
                 permissions,
                 collaboration_mode: collaboration_mode.map(ToString::to_string),
@@ -753,6 +765,15 @@ impl HistoryCell for StatusHistoryCell {
         if self.model_provider.is_some() {
             push_label(&mut labels, &mut seen, "Model provider");
         }
+        if self.model_settings_locked {
+            push_label(&mut labels, &mut seen, "Model settings");
+        }
+        if self.server_model_match_required {
+            push_label(&mut labels, &mut seen, "Server model");
+        }
+        if self.locked_approvals_reviewer.is_some() {
+            push_label(&mut labels, &mut seen, "Reviewer");
+        }
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
         }
@@ -825,6 +846,17 @@ impl HistoryCell for StatusHistoryCell {
         let directory_value = format_directory_display(&self.directory, Some(value_width));
 
         lines.push(formatter.line("Model", model_spans));
+        if self.model_settings_locked {
+            lines
+                .push(formatter.line("Model settings", vec![Span::from("locked for this thread")]));
+        }
+        if self.server_model_match_required {
+            lines.push(formatter.line("Server model", vec![Span::from("must match request")]));
+        }
+        if let Some(reviewer) = self.locked_approvals_reviewer.as_ref() {
+            lines
+                .push(formatter.line("Reviewer", vec![Span::from(format!("{reviewer} (locked)"))]));
+        }
         if let Some(model_provider) = self.model_provider.as_ref() {
             lines.push(formatter.line("Model provider", vec![Span::from(model_provider.clone())]));
         }

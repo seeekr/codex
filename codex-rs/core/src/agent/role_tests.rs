@@ -142,6 +142,61 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
 }
 
 #[tokio::test]
+async fn locked_custom_role_cannot_change_model_or_reasoning_effort() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.model = Some("gpt-locked".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Locked;
+    let before = config.clone();
+    let role_path = write_role_config(
+        &home,
+        "lower-role.toml",
+        "model = \"gpt-lower\"\nmodel_reasoning_effort = \"low\"",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let error = apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect_err("custom role must not lower a locked child");
+
+    assert!(error.contains("model"), "unexpected error: {error}");
+    assert_eq!(config.model, before.model);
+    assert_eq!(config.model_reasoning_effort, before.model_reasoning_effort);
+    assert_eq!(config.model_provider, before.model_provider);
+}
+
+#[tokio::test]
+async fn locked_embedded_awaiter_role_cannot_lower_reasoning_effort() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.model = Some("gpt-locked".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Locked;
+    let role = AgentRoleConfig {
+        description: None,
+        config_file: Some(PathBuf::from("awaiter.toml")),
+        nickname_candidates: None,
+    };
+
+    let error = apply_resolved_role_to_config(&mut config, "awaiter", &role)
+        .await
+        .expect_err("addressable built-in roles inherit the locked parent pair");
+
+    assert!(
+        error.contains("model_reasoning_effort"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[tokio::test]
 async fn apply_role_ignores_agent_metadata_fields_in_user_role_file() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(

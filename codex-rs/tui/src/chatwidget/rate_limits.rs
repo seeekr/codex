@@ -311,10 +311,12 @@ impl ChatWidget {
     }
 
     fn rate_limit_switch_prompt_hidden(&self) -> bool {
-        self.config
-            .notices
-            .hide_rate_limit_model_nudge
-            .unwrap_or(false)
+        self.model_settings_locked()
+            || self
+                .config
+                .notices
+                .hide_rate_limit_model_nudge
+                .unwrap_or(false)
     }
 
     pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {

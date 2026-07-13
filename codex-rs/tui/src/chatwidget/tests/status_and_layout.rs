@@ -1156,6 +1156,23 @@ async fn rate_limit_switch_prompt_respects_hidden_notice() {
 }
 
 #[tokio::test]
+async fn locked_model_settings_suppress_rate_limit_switch_prompt() {
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.model_settings_policy = ModelSettingsPolicy::Locked;
+    chat.has_chatgpt_account = true;
+
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+    chat.maybe_show_pending_rate_limit_prompt();
+
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Idle
+    ));
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+}
+
+#[tokio::test]
 async fn rate_limit_switch_prompt_defers_until_task_complete() {
     let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.has_chatgpt_account = true;

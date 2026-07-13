@@ -4,6 +4,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::validate_locked_settings_override;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::protocol::AskForApproval;
@@ -17,6 +18,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use toml::Value as TomlValue;
 
 /// Client-supplied configuration for a `codex` tool-call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -144,6 +146,9 @@ impl CodexToolCallParam {
     pub async fn into_config(
         self,
         arg0_paths: Arg0DispatchPaths,
+        base_config: &Config,
+        process_cli_overrides: &[(String, TomlValue)],
+        strict_config: bool,
     ) -> std::io::Result<(String, Config)> {
         let Self {
             prompt,
@@ -172,17 +177,28 @@ impl CodexToolCallParam {
             ..Default::default()
         };
 
-        let cli_overrides = cli_overrides
+        let call_cli_overrides = cli_overrides
             .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k, json_to_toml(v)))
-            .collect();
+            .collect::<Vec<_>>();
 
         let cfg = ConfigBuilder::default()
-            .cli_overrides(cli_overrides)
+            .codex_home(base_config.codex_home.to_path_buf())
+            .cli_overrides(
+                process_cli_overrides
+                    .iter()
+                    .cloned()
+                    .chain(call_cli_overrides)
+                    .collect(),
+            )
+            .strict_config(strict_config)
             .harness_overrides(overrides)
             .build()
             .await?;
+        validate_locked_settings_override(base_config, &cfg).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
 
         Ok((prompt, cfg))
     }
@@ -276,7 +292,49 @@ fn create_tool_input_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_config::types::ApprovalsReviewer;
+    use codex_config::types::ApprovalsReviewerPolicy;
+    use codex_config::types::ModelSettingsPolicy;
+    use codex_config::types::ServerModelValidation;
+    use codex_protocol::openai_models::ReasoningEffort;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    fn locked_process_overrides() -> Vec<(String, TomlValue)> {
+        [
+            ("model", "gpt-locked"),
+            ("model_reasoning_effort", "high"),
+            ("review_model", "gpt-locked"),
+            ("plan_mode_reasoning_effort", "high"),
+            ("model_settings_policy", "locked"),
+            ("server_model_validation", "require_match"),
+            ("approvals_reviewer", "auto_review"),
+            ("approvals_reviewer_policy", "locked"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), TomlValue::String(value.to_string())))
+        .collect()
+    }
+
+    async fn locked_process_config(
+        codex_home: &TempDir,
+        process_overrides: &[(String, TomlValue)],
+    ) -> Config {
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .cli_overrides(process_overrides.to_vec())
+            .build()
+            .await
+            .expect("build locked process config")
+    }
+
+    fn tool_call_with_config(config: HashMap<String, serde_json::Value>) -> CodexToolCallParam {
+        CodexToolCallParam {
+            prompt: "test".to_string(),
+            config: Some(config),
+            ..Default::default()
+        }
+    }
 
     /// We include a test to verify the exact JSON schema as "executable
     /// documentation" for the schema. When can track changes to this test as a
@@ -384,6 +442,144 @@ mod tests {
             err.to_string().contains("unknown field `profile`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_call_preserves_process_cli_locks_and_accepts_same_values() {
+        let codex_home = TempDir::new().expect("create codex home");
+        let process_overrides = locked_process_overrides();
+        let base = locked_process_config(&codex_home, &process_overrides).await;
+        let call = CodexToolCallParam {
+            prompt: "test".to_string(),
+            model: Some("gpt-locked".to_string()),
+            config: Some(HashMap::from([
+                (
+                    "model_reasoning_effort".to_string(),
+                    serde_json::json!("high"),
+                ),
+                (
+                    "approvals_reviewer".to_string(),
+                    serde_json::json!("auto_review"),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let (_, config) = call
+            .into_config(
+                Arg0DispatchPaths::default(),
+                &base,
+                &process_overrides,
+                /*strict_config*/ false,
+            )
+            .await
+            .expect("same locked settings should be accepted");
+
+        assert_eq!(config.model.as_deref(), Some("gpt-locked"));
+        assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(config.model_settings_policy, ModelSettingsPolicy::Locked);
+        assert_eq!(
+            config.server_model_validation,
+            ServerModelValidation::RequireMatch
+        );
+        assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
+        assert_eq!(
+            config.approvals_reviewer_policy,
+            ApprovalsReviewerPolicy::Locked
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_call_rejects_explicit_model_override_when_locked() {
+        let codex_home = TempDir::new().expect("create codex home");
+        let process_overrides = locked_process_overrides();
+        let base = locked_process_config(&codex_home, &process_overrides).await;
+        let call = CodexToolCallParam {
+            prompt: "test".to_string(),
+            model: Some("gpt-lower".to_string()),
+            ..Default::default()
+        };
+
+        let error = call
+            .into_config(
+                Arg0DispatchPaths::default(),
+                &base,
+                &process_overrides,
+                /*strict_config*/ false,
+            )
+            .await
+            .expect_err("changed model must be rejected");
+        assert!(error.to_string().contains("model"));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_rejects_config_map_changes_to_protected_settings() {
+        let codex_home = TempDir::new().expect("create codex home");
+        let process_overrides = locked_process_overrides();
+        let base = locked_process_config(&codex_home, &process_overrides).await;
+        let cases = [
+            (
+                "model_reasoning_effort",
+                serde_json::json!("low"),
+                "model_reasoning_effort",
+            ),
+            (
+                "model_provider",
+                serde_json::json!("ollama"),
+                "model_provider",
+            ),
+            (
+                "openai_base_url",
+                serde_json::json!("https://attacker.example/v1"),
+                "model_provider",
+            ),
+            (
+                "model_settings_policy",
+                serde_json::json!("mutable"),
+                "model_settings_policy",
+            ),
+            (
+                "server_model_validation",
+                serde_json::json!("warn"),
+                "server_model_validation",
+            ),
+            (
+                "review_model",
+                serde_json::json!("gpt-lower"),
+                "review_model",
+            ),
+            (
+                "plan_mode_reasoning_effort",
+                serde_json::json!("low"),
+                "plan_mode_reasoning_effort",
+            ),
+            (
+                "approvals_reviewer",
+                serde_json::json!("user"),
+                "approvals_reviewer",
+            ),
+            (
+                "approvals_reviewer_policy",
+                serde_json::json!("mutable"),
+                "approvals_reviewer_policy",
+            ),
+        ];
+
+        for (key, value, expected_field) in cases {
+            let error = tool_call_with_config(HashMap::from([(key.to_string(), value)]))
+                .into_config(
+                    Arg0DispatchPaths::default(),
+                    &base,
+                    &process_overrides,
+                    /*strict_config*/ false,
+                )
+                .await
+                .expect_err("protected config override must fail");
+            assert!(
+                error.to_string().contains(expected_field),
+                "{key} produced unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

@@ -286,10 +286,11 @@ impl ChatWidget {
         &self,
         preset: &ApprovalPreset,
         label: String,
-        approvals_reviewer: ApprovalsReviewer,
+        requested_approvals_reviewer: ApprovalsReviewer,
         profile_selection: Option<PermissionProfileSelection>,
         return_to_permissions: bool,
     ) -> Vec<SelectionAction> {
+        let approvals_reviewer = self.effective_approvals_reviewer(requested_approvals_reviewer);
         let apply_actions = || {
             profile_selection.clone().map_or_else(
                 || {
@@ -304,7 +305,7 @@ impl ChatWidget {
                 Self::permission_profile_selection_actions,
             )
         };
-        let requires_confirmation = approvals_reviewer == ApprovalsReviewer::User
+        let requires_confirmation = requested_approvals_reviewer == ApprovalsReviewer::User
             && preset.id == "full-access"
             && !self
                 .config
@@ -321,7 +322,7 @@ impl ChatWidget {
                 });
             })];
         }
-        if approvals_reviewer == ApprovalsReviewer::User && preset.id == "auto" {
+        if requested_approvals_reviewer == ApprovalsReviewer::User && preset.id == "auto" {
             #[cfg(target_os = "windows")]
             {
                 if crate::windows_sandbox::level_from_config(&self.config)
@@ -425,6 +426,7 @@ impl ChatWidget {
             Paragraph::new(vec![info_line]).wrap(Wrap { trim: false }),
         ));
         let header = ColumnRenderable::with(header_children);
+        let approvals_reviewer = self.effective_approvals_reviewer(ApprovalsReviewer::User);
 
         let mut accept_actions = profile_selection.clone().map_or_else(
             || {
@@ -433,7 +435,7 @@ impl ChatWidget {
                     preset.permission_profile.clone(),
                     preset.active_permission_profile.clone(),
                     selected_name.clone(),
-                    ApprovalsReviewer::User,
+                    approvals_reviewer,
                 )
             },
             Self::permission_profile_selection_actions,
@@ -449,7 +451,7 @@ impl ChatWidget {
                     preset.permission_profile,
                     preset.active_permission_profile,
                     selected_name,
-                    ApprovalsReviewer::User,
+                    approvals_reviewer,
                 )
             },
             Self::permission_profile_selection_actions,

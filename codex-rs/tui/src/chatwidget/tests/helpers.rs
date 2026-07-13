@@ -157,6 +157,19 @@ pub(super) async fn make_chatwidget_manual(
     .await
 }
 
+impl ChatWidget {
+    pub(crate) fn set_model_settings_policy_for_tests(&mut self, policy: ModelSettingsPolicy) {
+        self.config.model_settings_policy = policy;
+    }
+
+    pub(crate) fn set_approvals_reviewer_policy_for_tests(
+        &mut self,
+        policy: ApprovalsReviewerPolicy,
+    ) {
+        self.config.approvals_reviewer_policy = policy;
+    }
+}
+
 pub(super) async fn make_chatwidget_manual_with_auth(
     model_override: Option<&str>,
     has_chatgpt_account: bool,

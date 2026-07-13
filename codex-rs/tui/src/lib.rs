@@ -12,6 +12,7 @@ use crate::legacy_core::config::resolve_bootstrap_auth_keyring_backend_kind;
 use crate::legacy_core::config::resolve_bootstrap_auth_route_config;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
+use crate::legacy_core::config::validate_locked_settings_override;
 use crate::session_resume::ResolveCwdOutcome;
 use crate::session_resume::resolve_cwd_for_resume_or_fork;
 pub use crate::startup_error::LocalStateDbStartupError;
@@ -41,6 +42,8 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
+use codex_config::types::ApprovalsReviewerPolicy;
+use codex_config::types::ModelSettingsPolicy;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_login::AuthConfig;
@@ -264,6 +267,38 @@ pub(crate) enum AppServerTarget {
     Remote { endpoint: RemoteAppServerEndpoint },
 }
 
+const REMOTE_PROTECTED_SETTINGS_UNSUPPORTED: &str = "explicit remote app-server sessions cannot be used while model or approval-review settings are locked because the remote protocol does not transport and verify the protected-settings contract";
+
+fn protected_app_server_target(
+    config: &Config,
+    target: AppServerTarget,
+) -> std::io::Result<AppServerTarget> {
+    let protected_settings_locked = config.model_settings_policy == ModelSettingsPolicy::Locked
+        || config.approvals_reviewer_policy == ApprovalsReviewerPolicy::Locked;
+    if !protected_settings_locked {
+        return Ok(target);
+    }
+
+    match target {
+        AppServerTarget::Embedded => Ok(AppServerTarget::Embedded),
+        // An implicit daemon has no capability or launch-authority handshake. It can predate this
+        // feature or have been launched with different higher-precedence settings, so use the
+        // in-process server whose config is the one we just validated.
+        AppServerTarget::LocalDaemon { .. } => Ok(AppServerTarget::Embedded),
+        AppServerTarget::Remote { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            REMOTE_PROTECTED_SETTINGS_UNSUPPORTED,
+        )),
+    }
+}
+
+fn protected_app_server_authority_changed(started: &Config, candidate: &Config) -> bool {
+    // Check in both directions so activation, removal, and mutation of either lock domain all
+    // invalidate the Config that was frozen into the running app server.
+    validate_locked_settings_override(started, candidate).is_err()
+        || validate_locked_settings_override(candidate, started).is_err()
+}
+
 impl AppServerTarget {
     pub(crate) fn uses_remote_workspace(&self) -> bool {
         matches!(self, Self::Remote { .. })
@@ -456,6 +491,12 @@ async fn start_app_server(
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppServerClient> {
+    let effective_target = protected_app_server_target(&config, target.clone())?;
+    if &effective_target != target {
+        return Err(color_eyre::eyre::eyre!(
+            "locked protected settings require the embedded app server; the app-server target was not normalized before startup"
+        ));
+    }
     match target {
         AppServerTarget::Embedded => start_embedded_app_server(
             arg0_paths,
@@ -578,6 +619,93 @@ async fn shutdown_app_server_if_present(app_server: Option<AppServerSession>) {
     {
         warn!(%err, "Failed to shut down temporary embedded app server");
     }
+}
+
+async fn transition_app_server_session<S, Replace, ReplaceFuture>(
+    app_server_target: &mut AppServerTarget,
+    effective_target: AppServerTarget,
+    force_replace: bool,
+    app_server: &mut Option<S>,
+    replace: Replace,
+) -> color_eyre::Result<bool>
+where
+    Replace: FnOnce(Option<S>, AppServerTarget) -> ReplaceFuture,
+    ReplaceFuture: std::future::Future<Output = color_eyre::Result<S>>,
+{
+    if effective_target == *app_server_target && !force_replace {
+        return Ok(false);
+    }
+
+    if effective_target != AppServerTarget::Embedded {
+        return Err(color_eyre::eyre::eyre!(
+            "protected app-server authority replacement must use the embedded target"
+        ));
+    }
+    let previous = app_server.take();
+    *app_server_target = effective_target.clone();
+    *app_server = Some(replace(previous, effective_target).await?);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_app_server_target_after_config_reload(
+    config: &Config,
+    app_server_authority_config: &mut Config,
+    app_server_target: &mut AppServerTarget,
+    app_server: &mut Option<AppServerSession>,
+    arg0_paths: &Arg0DispatchPaths,
+    cli_kv_overrides: &[(String, toml::Value)],
+    loader_overrides: &LoaderOverrides,
+    strict_config: bool,
+    cloud_config_bundle: &CloudConfigBundleLoader,
+    feedback: &codex_feedback::CodexFeedback,
+    log_db: &mut Option<log_db::LogDbLayer>,
+    state_db: &mut Option<StateDbHandle>,
+    environment_manager: &Arc<EnvironmentManager>,
+    remote_cwd_override: &Option<PathBuf>,
+) -> color_eyre::Result<()> {
+    let effective_target = protected_app_server_target(config, app_server_target.clone())?;
+    let force_replace = effective_target == AppServerTarget::Embedded
+        && protected_app_server_authority_changed(app_server_authority_config, config);
+    let replaced = transition_app_server_session(
+        app_server_target,
+        effective_target,
+        force_replace,
+        app_server,
+        |previous, replacement_target| async move {
+            // An explicit remote target fails before this transition. For an implicit daemon,
+            // discard the unverified client before starting the in-process authority.
+            shutdown_app_server_if_present(previous).await;
+            // Re-open local state against the final config as well: a post-trust or resume-cwd
+            // reload may have changed the protected provider that the runtime uses as its default.
+            *state_db = init_state_db_for_app_server_target(config, &replacement_target).await?;
+            *log_db = state_db.clone().map(log_db::start);
+
+            let client = start_app_server(
+                &replacement_target,
+                arg0_paths.clone(),
+                config.clone(),
+                cli_kv_overrides.to_vec(),
+                loader_overrides.clone(),
+                strict_config,
+                cloud_config_bundle.clone(),
+                feedback.clone(),
+                log_db.clone(),
+                state_db.clone(),
+                Arc::clone(environment_manager),
+            )
+            .await?;
+            Ok(
+                AppServerSession::new(client, replacement_target.thread_params_mode())
+                    .with_remote_cwd_override(remote_cwd_override.clone()),
+            )
+        },
+    )
+    .await?;
+    if replaced {
+        *app_server_authority_config = config.clone();
+    }
+    Ok(())
 }
 
 fn session_target_from_app_server_thread(
@@ -913,7 +1041,7 @@ pub async fn run_main(
     } else {
         None
     };
-    let app_server_target = app_server_target_for_launch(
+    let mut app_server_target = app_server_target_for_launch(
         explicit_remote_endpoint,
         default_daemon,
         reuse_implicit_local_daemon,
@@ -1067,6 +1195,8 @@ pub async fn run_main(
         strict_config,
     )
     .await;
+
+    app_server_target = protected_app_server_target(&config, app_server_target)?;
 
     remove_legacy_tui_log_file(config.codex_home.as_path());
 
@@ -1270,7 +1400,7 @@ async fn run_ratatui_app(
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
-    app_server_target: AppServerTarget,
+    mut app_server_target: AppServerTarget,
     remote_cwd_override: Option<PathBuf>,
     initial_config: Config,
     manually_selected_oss_provider: Option<String>,
@@ -1278,8 +1408,8 @@ async fn run_ratatui_app(
     cli_kv_overrides: Vec<(String, toml::Value)>,
     mut cloud_config_bundle: CloudConfigBundleLoader,
     feedback: codex_feedback::CodexFeedback,
-    log_db: Option<log_db::LogDbLayer>,
-    state_db: Option<StateDbHandle>,
+    mut log_db: Option<log_db::LogDbLayer>,
+    mut state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
@@ -1331,6 +1461,7 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
+    let mut app_server_authority_config = initial_config.clone();
     let app_server_session = match start_app_server(
         &app_server_target,
         arg0_paths.clone(),
@@ -1455,6 +1586,24 @@ async fn run_ratatui_app(
     } else {
         initial_config
     };
+
+    reconcile_app_server_target_after_config_reload(
+        &config,
+        &mut app_server_authority_config,
+        &mut app_server_target,
+        &mut app_server,
+        &arg0_paths,
+        &cli_kv_overrides,
+        &loader_overrides,
+        strict_config,
+        &cloud_config_bundle,
+        &feedback,
+        &mut log_db,
+        &mut state_db,
+        &environment_manager,
+        &remote_cwd_override,
+    )
+    .await?;
 
     let mut missing_session_exit = |id_str: &str, action: &str| {
         error!("Error finding conversation path: {id_str}");
@@ -1667,6 +1816,24 @@ async fn run_ratatui_app(
         }
         _ => config,
     };
+
+    reconcile_app_server_target_after_config_reload(
+        &config,
+        &mut app_server_authority_config,
+        &mut app_server_target,
+        &mut app_server,
+        &arg0_paths,
+        &cli_kv_overrides,
+        &loader_overrides,
+        strict_config,
+        &cloud_config_bundle,
+        &feedback,
+        &mut log_db,
+        &mut state_db,
+        &environment_manager,
+        &remote_cwd_override,
+    )
+    .await?;
 
     // Configure syntax highlighting theme from the final config — onboarding
     // and resume/fork can both reload config with a different tui_theme, so
@@ -2302,6 +2469,133 @@ mod tests {
         );
         assert!(target.uses_remote_workspace());
         assert_eq!(target.thread_params_mode(), ThreadParamsMode::Remote);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protected_settings_require_an_embedded_app_server_authority() -> color_eyre::Result<()>
+    {
+        let temp_dir = TempDir::new()?;
+        let mutable = build_config(&temp_dir).await?;
+        let endpoint = RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
+        };
+        let local_daemon = AppServerTarget::LocalDaemon {
+            endpoint: endpoint.clone(),
+        };
+        let remote = AppServerTarget::Remote { endpoint };
+
+        assert_eq!(
+            protected_app_server_target(&mutable, AppServerTarget::Embedded)?,
+            AppServerTarget::Embedded
+        );
+        assert_eq!(
+            protected_app_server_target(&mutable, local_daemon.clone())?,
+            local_daemon
+        );
+        assert_eq!(
+            protected_app_server_target(&mutable, remote.clone())?,
+            remote
+        );
+
+        let mut model_locked = mutable.clone();
+        model_locked.model = Some("gpt-locked".to_string());
+        model_locked.model_settings_policy = ModelSettingsPolicy::Locked;
+        assert_eq!(
+            protected_app_server_target(&model_locked, local_daemon.clone())?,
+            AppServerTarget::Embedded
+        );
+        let error = protected_app_server_target(&model_locked, remote.clone())
+            .expect_err("a remote server cannot attest the local model lock");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), REMOTE_PROTECTED_SETTINGS_UNSUPPORTED);
+
+        let mut reviewer_locked = mutable;
+        reviewer_locked.approvals_reviewer_policy = ApprovalsReviewerPolicy::Locked;
+        assert_eq!(
+            protected_app_server_target(&reviewer_locked, AppServerTarget::Embedded)?,
+            AppServerTarget::Embedded
+        );
+        assert_eq!(
+            protected_app_server_target(&reviewer_locked, local_daemon)?,
+            AppServerTarget::Embedded
+        );
+        let error = protected_app_server_target(&reviewer_locked, remote)
+            .expect_err("a remote server cannot attest the local reviewer lock");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), REMOTE_PROTECTED_SETTINGS_UNSUPPORTED);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_locked_config_replaces_stale_app_server_authority() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mutable = build_config(&temp_dir).await?;
+        let mut locked = mutable.clone();
+        locked.model = Some("gpt-locked".to_string());
+        locked.model_settings_policy = ModelSettingsPolicy::Locked;
+        assert!(protected_app_server_authority_changed(&mutable, &locked));
+
+        // The app server may already be embedded when trust/login reveals the lock. Its frozen
+        // mutable Config still has to be replaced even though the transport target is unchanged.
+        let mut target = AppServerTarget::Embedded;
+        let mut app_server = Some(7_u8);
+        let replaced = transition_app_server_session(
+            &mut target,
+            AppServerTarget::Embedded,
+            /*force_replace*/ true,
+            &mut app_server,
+            |previous, replacement_target| async move {
+                assert_eq!(previous, Some(7));
+                assert_eq!(replacement_target, AppServerTarget::Embedded);
+                Ok(11)
+            },
+        )
+        .await?;
+        assert!(replaced);
+        assert_eq!(app_server, Some(11));
+
+        // Once the replacement's authority snapshot matches, another reload retains it.
+        assert!(!protected_app_server_authority_changed(&locked, &locked));
+        let replaced = transition_app_server_session(
+            &mut target,
+            AppServerTarget::Embedded,
+            /*force_replace*/ false,
+            &mut app_server,
+            |_previous, _replacement_target| async {
+                Err(color_eyre::eyre::eyre!(
+                    "unchanged authority must not invoke replacement"
+                ))
+            },
+        )
+        .await?;
+        assert!(!replaced);
+        assert_eq!(app_server, Some(11));
+
+        // The same primitive also closes the implicit-daemon authority boundary.
+        let endpoint = RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
+        };
+        let mut target = AppServerTarget::LocalDaemon { endpoint };
+        let effective_target = protected_app_server_target(&locked, target.clone())?;
+        let mut app_server = Some(20_u8);
+
+        let replaced = transition_app_server_session(
+            &mut target,
+            effective_target,
+            /*force_replace*/ false,
+            &mut app_server,
+            |previous, replacement_target| async move {
+                assert_eq!(previous, Some(20));
+                assert_eq!(replacement_target, AppServerTarget::Embedded);
+                Ok(21)
+            },
+        )
+        .await?;
+        assert!(replaced);
+        assert_eq!(target, AppServerTarget::Embedded);
+        assert_eq!(app_server, Some(21));
         Ok(())
     }
 

@@ -65,6 +65,14 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
     Ok(())
 }
 
+fn detached_review_config(parent_config: &Config) -> Config {
+    let mut config = parent_config.clone();
+    if let Some(review_model) = &config.review_model {
+        config.model = Some(review_model.clone());
+    }
+    config
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
     auth_manager: Arc<AuthManager>,
@@ -1216,10 +1224,9 @@ impl TurnRequestProcessor {
                 ))
             })?;
 
-        let mut config = self.config.as_ref().clone();
-        if let Some(review_model) = &config.review_model {
-            config.model = Some(review_model.clone());
-        }
+        let config = detached_review_config(parent_thread.config().await.as_ref());
+        let fallback_provider = config.model_provider_id.clone();
+        let fallback_cwd = config.cwd.clone();
 
         let NewThread {
             thread_id,
@@ -1256,7 +1263,6 @@ impl TurnRequestProcessor {
             "review thread",
         );
 
-        let fallback_provider = self.config.model_provider_id.as_str();
         match review_thread
             .read_thread(
                 /*include_archived*/ true, /*include_history*/ false,
@@ -1264,8 +1270,11 @@ impl TurnRequestProcessor {
             .await
         {
             Ok(stored_thread) => {
-                let (mut thread, _) =
-                    thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
+                let (mut thread, _) = thread_from_stored_thread(
+                    stored_thread,
+                    fallback_provider.as_str(),
+                    &fallback_cwd,
+                );
                 thread.session_id = review_thread.session_configured().session_id.to_string();
                 self.thread_watch_manager
                     .upsert_thread_silently(thread.clone())
@@ -1447,4 +1456,71 @@ fn xcode_26_4_mcp_elicitations_auto_deny(
     // TODO: Remove this compatibility hack once Xcode 26.4 ages out.
     client_name == Some("Xcode")
         && client_version.is_some_and(|version| version.starts_with("26.4"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_config::types::ApprovalsReviewer;
+    use codex_config::types::ApprovalsReviewerPolicy;
+    use codex_config::types::ModelSettingsPolicy;
+    use codex_config::types::ServerModelValidation;
+    use codex_core::config::ConfigBuilder;
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    #[tokio::test]
+    async fn detached_review_inherits_the_parent_thread_protected_settings() {
+        let codex_home = tempfile::tempdir().expect("create codex home");
+        let mut parent = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .build()
+            .await
+            .expect("build parent config");
+        parent.model = Some("thread-model".to_string());
+        parent.review_model = Some("thread-review-model".to_string());
+        parent.model_provider_id = "thread-provider".to_string();
+        parent.model_provider.name = "Thread provider".to_string();
+        parent.model_provider.base_url = Some("https://provider.example/v1".to_string());
+        parent.model_provider.requires_openai_auth = true;
+        parent.chatgpt_base_url = "https://auth.example/backend-api/codex".to_string();
+        parent.respect_system_proxy = true;
+        parent.model_reasoning_effort = Some(ReasoningEffort::High);
+        parent.plan_mode_reasoning_effort = Some(ReasoningEffort::Max);
+        parent.model_settings_policy = ModelSettingsPolicy::Locked;
+        parent.server_model_validation = ServerModelValidation::RequireMatch;
+        parent.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        parent.approvals_reviewer_policy = ApprovalsReviewerPolicy::Locked;
+
+        let review = detached_review_config(&parent);
+
+        assert_eq!(review.model.as_deref(), Some("thread-review-model"));
+        assert_eq!(review.review_model, parent.review_model);
+        assert_eq!(review.model_provider_id, "thread-provider");
+        assert_eq!(review.model_provider.name, "Thread provider");
+        assert_eq!(
+            review.model_provider.base_url.as_deref(),
+            Some("https://provider.example/v1")
+        );
+        assert!(review.model_provider.requires_openai_auth);
+        assert_eq!(review.model_provider, parent.model_provider);
+        assert_eq!(review.chatgpt_base_url, parent.chatgpt_base_url);
+        assert_eq!(review.respect_system_proxy, parent.respect_system_proxy);
+        assert_eq!(review.auth_route_config(), parent.auth_route_config());
+        assert_eq!(review.model_reasoning_effort, parent.model_reasoning_effort);
+        assert_eq!(
+            review.plan_mode_reasoning_effort,
+            parent.plan_mode_reasoning_effort
+        );
+        assert_eq!(review.model_settings_policy, ModelSettingsPolicy::Locked);
+        assert_eq!(
+            review.server_model_validation,
+            ServerModelValidation::RequireMatch
+        );
+        assert_eq!(review.approvals_reviewer, ApprovalsReviewer::AutoReview);
+        assert_eq!(
+            review.approvals_reviewer_policy,
+            ApprovalsReviewerPolicy::Locked
+        );
+    }
 }

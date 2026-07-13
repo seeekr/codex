@@ -109,6 +109,12 @@ pub enum CodexErr {
     /// Invalid request.
     #[error("{0}")]
     InvalidRequest(String),
+    /// A request attempted to violate the thread's configured model-settings policy.
+    #[error("{0}")]
+    ModelSettingsPolicy(String),
+    /// The provider did not attest the requested model for a completed response.
+    #[error("{0}")]
+    ServerModelValidation(String),
     /// Invalid image.
     #[error("Image poisoning")]
     InvalidImageRequest(),
@@ -184,6 +190,8 @@ impl CodexErr {
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
             | CodexErr::InvalidRequest(_)
+            | CodexErr::ModelSettingsPolicy(_)
+            | CodexErr::ServerModelValidation(_)
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
@@ -245,7 +253,8 @@ impl CodexErr {
             | CodexErr::InternalAgentDied => CodexErrorInfo::InternalServerError,
             CodexErr::UnsupportedOperation(_)
             | CodexErr::ThreadNotFound(_)
-            | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
+            | CodexErr::AgentLimitReached { .. }
+            | CodexErr::ModelSettingsPolicy(_) => CodexErrorInfo::BadRequest,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,
         }

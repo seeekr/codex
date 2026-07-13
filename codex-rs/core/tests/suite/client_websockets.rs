@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use codex_api::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use codex_api::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
+use codex_config::types::ServerModelValidation;
 use codex_core::CodexResponsesMetadata;
 use codex_core::ModelClient;
 use codex_core::ModelClientSession;
@@ -486,6 +487,255 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
         follow_up["stream_options"]["reasoning_summary_delivery"].as_str(),
         Some("sequential_cutoff")
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_strict_validation_does_not_accept_connection_model_diagnostic() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "must remain buffered"),
+            ev_completed("resp-1"),
+        ]],
+        response_headers: vec![("OpenAI-Model".to_string(), MODEL.to_string())],
+        accept_delay: None,
+        close_after_requests: true,
+    }])
+    .await;
+
+    let harness = websocket_harness_with_server_model_validation(
+        &server,
+        ServerModelValidation::RequireMatch,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("websocket stream should start");
+
+    let mut output_escaped = false;
+    let mut validation_error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(
+                ResponseEvent::OutputItemAdded(_)
+                | ResponseEvent::OutputItemDone(_)
+                | ResponseEvent::OutputTextDelta(_),
+            ) => output_escaped = true,
+            Ok(_) => {}
+            Err(error) => {
+                validation_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        !output_escaped,
+        "unvalidated server output escaped the buffer"
+    );
+    let error = validation_error.expect("missing response-scoped attestation should fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("completed response did not attest the requested model"),
+        "unexpected error: {error}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_strict_validation_accepts_response_scoped_model_attestation() {
+    skip_if_no_network!();
+
+    let mut created = ev_response_created("resp-1");
+    created["response"]["headers"] = json!({
+        "OpenAI-Model": MODEL.to_ascii_uppercase()
+    });
+    let server = start_websocket_server(vec![vec![vec![
+        created,
+        ev_assistant_message("msg-1", "validated"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness_with_server_model_validation(
+        &server,
+        ServerModelValidation::RequireMatch,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("websocket stream should start");
+
+    let mut validated_output = None;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event.expect("matching response-scoped attestation should pass") {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => {
+                validated_output = Some(content);
+            }
+            ResponseEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        validated_output,
+        Some(vec![ContentItem::OutputText {
+            text: "validated".to_string()
+        }])
+    );
+    assert!(completed, "validated websocket response should complete");
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_strict_validation_rejects_late_conflicting_attestation() {
+    skip_if_no_network!();
+
+    let mut created = ev_response_created("resp-1");
+    created["response"]["headers"] = json!({ "OpenAI-Model": MODEL });
+    let server = start_websocket_server(vec![vec![vec![
+        created,
+        ev_assistant_message("msg-1", "must remain buffered"),
+        json!({
+            "type": "response.metadata",
+            "sequence_number": 1,
+            "response_id": "resp-1",
+            "headers": { "OpenAI-Model": "gpt-conflicting-model" }
+        }),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness_with_server_model_validation(
+        &server,
+        ServerModelValidation::RequireMatch,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("websocket stream should start");
+
+    let mut output_escaped = false;
+    let mut validation_error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(
+                ResponseEvent::OutputItemAdded(_)
+                | ResponseEvent::OutputItemDone(_)
+                | ResponseEvent::OutputTextDelta(_),
+            ) => output_escaped = true,
+            Ok(_) => {}
+            Err(error) => {
+                validation_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        !output_escaped,
+        "output buffered before the conflict must not escape"
+    );
+    let error = validation_error.expect("late conflicting attestation should fail closed");
+    let codex_protocol::error::CodexErr::ServerModelValidation(message) = error else {
+        panic!("expected ServerModelValidation, got {error}");
+    };
+    assert!(message.contains(MODEL));
+    assert!(message.contains("gpt-conflicting-model"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_strict_validation_exempts_generate_false_warmup() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![vec![ev_response_created("warm-1"), ev_completed("warm-1")]],
+        response_headers: vec![("OpenAI-Model".to_string(), MODEL.to_string())],
+        accept_delay: None,
+        close_after_requests: true,
+    }])
+    .await;
+
+    let harness = websocket_harness_with_server_model_validation(
+        &server,
+        ServerModelValidation::RequireMatch,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let responses_metadata = prewarm_metadata(&harness, /*turn_id*/ None);
+
+    client_session
+        .prewarm_websocket(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+        )
+        .await
+        .expect("generate=false warmup should not require response-scoped model attestation");
+
+    let request = server
+        .single_connection()
+        .first()
+        .expect("missing warmup request")
+        .body_json();
+    assert_eq!(request["generate"].as_bool(), Some(false));
 
     server.shutdown().await;
 }
@@ -2259,15 +2509,47 @@ async fn websocket_harness_with_options(
     .await
 }
 
+async fn websocket_harness_with_server_model_validation(
+    server: &WebSocketTestServer,
+    server_model_validation: ServerModelValidation,
+) -> WebsocketTestHarness {
+    websocket_harness_with_provider_options_and_server_model_validation(
+        websocket_provider(server),
+        /*runtime_metrics_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*enabled_features*/ &[],
+        server_model_validation,
+    )
+    .await
+}
+
 async fn websocket_harness_with_provider_options(
     provider: ModelProviderInfo,
     runtime_metrics_enabled: bool,
     concurrent_reasoning_summaries_enabled: bool,
     enabled_features: &[Feature],
 ) -> WebsocketTestHarness {
+    websocket_harness_with_provider_options_and_server_model_validation(
+        provider,
+        runtime_metrics_enabled,
+        concurrent_reasoning_summaries_enabled,
+        enabled_features,
+        ServerModelValidation::Warn,
+    )
+    .await
+}
+
+async fn websocket_harness_with_provider_options_and_server_model_validation(
+    provider: ModelProviderInfo,
+    runtime_metrics_enabled: bool,
+    concurrent_reasoning_summaries_enabled: bool,
+    enabled_features: &[Feature],
+    server_model_validation: ServerModelValidation,
+) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model = Some(MODEL.to_string());
+    config.server_model_validation = server_model_validation;
     if runtime_metrics_enabled {
         config
             .features
@@ -2332,6 +2614,7 @@ async fn websocket_harness_with_provider_options(
         config
             .features
             .enabled(Feature::ConcurrentReasoningSummaries),
+        config.server_model_validation,
         /*attestation_provider*/ None,
         http_client_factory,
     );

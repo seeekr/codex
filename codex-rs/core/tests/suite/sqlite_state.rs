@@ -377,6 +377,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     history_mode: Default::default(),
                     multi_agent_version: None,
                     context_window: None,
+                    model_settings: None,
                 },
                 git: None,
             };

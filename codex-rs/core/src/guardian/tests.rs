@@ -1427,6 +1427,24 @@ async fn guardian_request_model_for_auto_review(
     String,
     codex_analytics::GuardianReviewAnalyticsResult,
 )> {
+    guardian_request_model_for_auto_review_with_policy(
+        auto_review_model_override,
+        catalog,
+        /*locked_parent*/ false,
+    )
+    .await
+}
+
+async fn guardian_request_model_for_auto_review_with_policy(
+    auto_review_model_override: Option<String>,
+    catalog: GuardianTestCatalog,
+    locked_parent: bool,
+) -> anyhow::Result<(
+    String,
+    String,
+    String,
+    codex_analytics::GuardianReviewAnalyticsResult,
+)> {
     let server = start_mock_server().await;
     let guardian_assessment = serde_json::json!({
         "outcome": "allow",
@@ -1443,6 +1461,12 @@ async fn guardian_request_model_for_auto_review(
     .await;
 
     let (mut session, mut turn) = guardian_test_session_and_turn(&server).await;
+    if locked_parent {
+        let turn = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+        let mut config = (*turn.config).clone();
+        config.model_settings_policy = codex_config::types::ModelSettingsPolicy::Locked;
+        turn.config = Arc::new(config);
+    }
     match catalog {
         GuardianTestCatalog::Bundled => {}
         GuardianTestCatalog::ParentOnly => {
@@ -1542,6 +1566,23 @@ async fn guardian_review_uses_model_catalog_override_when_preferred_review_model
         Some(OPENAI_PROVIDER_ID)
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_owns_a_different_model_pair_when_parent_is_locked() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let guardian_model = "guardian-review-model-override".to_string();
+    let (request_model, parent_model, _, _) = guardian_request_model_for_auto_review_with_policy(
+        Some(guardian_model.clone()),
+        GuardianTestCatalog::Bundled,
+        /*locked_parent*/ true,
+    )
+    .await?;
+
+    assert_eq!(request_model, guardian_model);
+    assert_ne!(request_model, parent_model);
     Ok(())
 }
 

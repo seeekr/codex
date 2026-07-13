@@ -14,6 +14,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionModelSettings;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
@@ -83,6 +84,9 @@ pub struct CreateThreadParams {
     pub thread_source: Option<ThreadSource>,
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub originator: String,
+    /// Initial model/effort pair established by a thread whose settings are locked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_settings: Option<SessionModelSettings>,
     /// Base instructions persisted in session metadata.
     pub base_instructions: BaseInstructions,
     /// Dynamic tools available to the thread at startup.

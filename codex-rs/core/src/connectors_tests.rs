@@ -8,6 +8,7 @@ use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_config::types::ApprovalsReviewer;
+use codex_config::types::ApprovalsReviewerPolicy;
 use codex_connectors::merge::plugin_connector_to_app_info;
 use codex_connectors::metadata::connector_install_url;
 use codex_connectors::metadata::sanitize_name;
@@ -445,6 +446,43 @@ approvals_reviewer = "user"
 
     assert_eq!(
         mcp_approvals_reviewer(&config, CODEX_APPS_MCP_SERVER_NAME, Some("calendar")),
+        ApprovalsReviewer::AutoReview
+    );
+}
+
+#[tokio::test]
+async fn locked_approvals_reviewer_ignores_app_and_default_overrides() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"
+approvals_reviewer = "auto_review"
+approvals_reviewer_policy = "locked"
+
+[apps._default]
+approvals_reviewer = "user"
+
+[apps.calendar]
+approvals_reviewer = "guardian_subagent"
+"#,
+    )
+    .expect("write config");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should build");
+
+    assert_eq!(
+        config.approvals_reviewer_policy,
+        ApprovalsReviewerPolicy::Locked
+    );
+    assert_eq!(
+        mcp_approvals_reviewer(&config, CODEX_APPS_MCP_SERVER_NAME, Some("calendar")),
+        ApprovalsReviewer::AutoReview
+    );
+    assert_eq!(
+        mcp_approvals_reviewer(&config, CODEX_APPS_MCP_SERVER_NAME, Some("drive")),
         ApprovalsReviewer::AutoReview
     );
 }

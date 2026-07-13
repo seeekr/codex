@@ -30,7 +30,10 @@ use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RateLimitWindow;
 use codex_app_server_protocol::SpendControlLimitSnapshot;
 use codex_config::LoaderOverrides;
+use codex_config::types::ApprovalsReviewerPolicy;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_config::types::ModelSettingsPolicy;
+use codex_config::types::ServerModelValidation;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
@@ -245,6 +248,42 @@ fn permissions_text_for(config: &Config) -> Option<String> {
                 .map(str::trim)
                 .map(ToString::to_string)
         })
+}
+
+#[tokio::test]
+async fn status_snapshot_shows_model_protection_policies() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_settings_policy = ModelSettingsPolicy::Locked;
+    config.server_model_validation = ServerModelValidation::RequireMatch;
+    config.approvals_reviewer = codex_config::types::ApprovalsReviewer::AutoReview;
+    config.approvals_reviewer_policy = ApprovalsReviewerPolicy::Locked;
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = get_model_offline_for_tests(config.model.as_deref());
+    let composite = new_status_output(
+        &config,
+        test_status_account_display().as_ref(),
+        /*token_info*/ None,
+        &TokenUsage::default(),
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+
+    let sanitized =
+        sanitize_directory(render_lines(&composite.display_lines(/*width*/ 80))).join("\n");
+    assert_snapshot!(sanitized);
 }
 
 #[tokio::test]

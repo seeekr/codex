@@ -2,8 +2,36 @@ use super::*;
 use crate::config_toml::ConfigToml;
 use crate::diagnostics::TextPosition;
 use crate::diagnostics::TextRange;
+use crate::types::ApprovalsReviewerPolicy;
+use crate::types::ModelSettingsPolicy;
+use crate::types::ServerModelValidation;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
+
+#[test]
+fn model_policy_settings_parse_from_config_toml() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+model_settings_policy = "locked"
+approvals_reviewer_policy = "locked"
+server_model_validation = "require_match"
+"#,
+    )
+    .expect("model policy settings should parse");
+
+    assert_eq!(
+        (
+            config.model_settings_policy,
+            config.approvals_reviewer_policy,
+            config.server_model_validation,
+        ),
+        (
+            Some(ModelSettingsPolicy::Locked),
+            Some(ApprovalsReviewerPolicy::Locked),
+            Some(ServerModelValidation::RequireMatch),
+        )
+    );
+}
 
 #[test]
 fn ignored_toml_field_errors_accept_non_file_source_names() {

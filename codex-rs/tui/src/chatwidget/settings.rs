@@ -118,6 +118,14 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_approvals_reviewer(&mut self, policy: ApprovalsReviewer) {
+        if self.approvals_reviewer_locked() && self.config.approvals_reviewer != policy {
+            tracing::warn!(
+                current = %self.config.approvals_reviewer,
+                requested = %policy,
+                "ignored approvals-reviewer update because reviewer routing is locked"
+            );
+            return;
+        }
         self.config.approvals_reviewer = policy;
         self.refresh_status_surfaces();
     }
@@ -378,6 +386,41 @@ impl ChatWidget {
 
     pub(super) fn is_session_configured(&self) -> bool {
         self.thread_id.is_some()
+    }
+
+    /// Returns whether this Codex invocation has immutable model settings.
+    pub(crate) fn model_settings_locked(&self) -> bool {
+        self.config.model_settings_policy == ModelSettingsPolicy::Locked
+    }
+
+    /// Returns whether this Codex invocation has immutable approval-reviewer routing.
+    pub(crate) fn approvals_reviewer_locked(&self) -> bool {
+        self.config.approvals_reviewer_policy == ApprovalsReviewerPolicy::Locked
+    }
+
+    pub(crate) fn effective_approvals_reviewer(
+        &self,
+        requested: ApprovalsReviewer,
+    ) -> ApprovalsReviewer {
+        if self.approvals_reviewer_locked() {
+            self.config.approvals_reviewer
+        } else {
+            requested
+        }
+    }
+
+    pub(crate) fn show_approvals_reviewer_locked_message(&mut self) {
+        self.add_info_message(
+            "Approval reviewer routing is locked for this Codex invocation.".to_string(),
+            /*hint*/ None,
+        );
+    }
+
+    pub(crate) fn show_model_settings_locked_message(&mut self) {
+        self.add_info_message(
+            "Model and reasoning settings are locked for this Codex invocation.".to_string(),
+            /*hint*/ None,
+        );
     }
 
     pub(super) fn collaboration_modes_enabled(&self) -> bool {
@@ -692,7 +735,10 @@ impl ChatWidget {
         let previous_mode = self.active_mode_kind();
         let previous_model = self.current_model().to_string();
         let previous_effort = self.effective_reasoning_effort();
-        if mask.mode == Some(ModeKind::Plan)
+        if self.model_settings_locked() {
+            mask.model = Some(previous_model.clone());
+            mask.reasoning_effort = Some(previous_effort.clone());
+        } else if mask.mode == Some(ModeKind::Plan)
             && let Some(effort) = self.config.plan_mode_reasoning_effort.clone()
         {
             mask.reasoning_effort = Some(Some(effort));

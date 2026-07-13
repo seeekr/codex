@@ -1,3 +1,28 @@
+mod model_settings_policy_error_tests {
+    use super::super::map_thread_resume_error;
+    use crate::error_code::INTERNAL_ERROR_CODE;
+    use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+    use codex_protocol::error::CodexErr;
+
+    #[test]
+    fn only_model_settings_policy_resume_errors_are_client_invalid_requests() {
+        let policy_error = map_thread_resume_error(CodexErr::ModelSettingsPolicy(
+            "locked model settings mismatch".to_string(),
+        ));
+        assert_eq!(policy_error.code, INVALID_REQUEST_ERROR_CODE);
+
+        let generic_invalid_request = map_thread_resume_error(CodexErr::InvalidRequest(
+            "unrelated invalid request".to_string(),
+        ));
+        assert_eq!(generic_invalid_request.code, INTERNAL_ERROR_CODE);
+        assert!(
+            generic_invalid_request
+                .message
+                .contains("error resuming thread")
+        );
+    }
+}
+
 mod thread_list_cwd_filter_tests {
     use super::super::normalize_thread_list_cwd_filters;
     use codex_app_server_protocol::ThreadListCwdFilter;

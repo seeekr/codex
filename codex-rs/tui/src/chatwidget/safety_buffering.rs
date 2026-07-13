@@ -119,7 +119,11 @@ impl ChatWidget {
             .filter(|(submitted_turn_id, _)| replay_kind.is_none() && submitted_turn_id == &turn_id)
             .map(|(_, turn)| turn.clone());
         let thread_id = self.thread_id;
-        let can_offer_retry = faster_model.is_some() && retry_turn.is_some() && thread_id.is_some();
+        let model_settings_locked = self.model_settings_locked();
+        let can_offer_retry = !model_settings_locked
+            && faster_model.is_some()
+            && retry_turn.is_some()
+            && thread_id.is_some();
         let previous_active = self
             .safety_buffering
             .active
@@ -147,6 +151,12 @@ impl ChatWidget {
             StatusDetailsCapitalization::Preserve,
             /*details_max_lines*/ 6,
         );
+
+        if model_settings_locked {
+            self.bottom_pane
+                .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+            return;
+        }
 
         if !should_show_prompt {
             return;

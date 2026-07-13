@@ -120,6 +120,8 @@ use codex_config::ConfigLayerStackOrdering;
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
+use codex_config::types::ApprovalsReviewerPolicy;
+use codex_config::types::ModelSettingsPolicy;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_connectors::AppInfo;

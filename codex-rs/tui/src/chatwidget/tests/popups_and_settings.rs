@@ -3088,6 +3088,42 @@ async fn model_selection_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn locked_model_selection_is_blocked_before_thread_configuration() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.config.model_settings_policy = ModelSettingsPolicy::Locked;
+    assert!(!chat.is_session_configured());
+
+    chat.open_model_popup();
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(
+        rendered.trim(),
+        @"• Model and reasoning settings are locked for this Codex invocation."
+    );
+}
+
+#[tokio::test]
+async fn locked_reasoning_selection_surfaces_do_not_open() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.model_settings_policy = ModelSettingsPolicy::Locked;
+    let preset = get_available_model(&chat, "gpt-5.4");
+
+    chat.open_reasoning_popup(preset.clone());
+    chat.open_advanced_reasoning_popup(preset.clone());
+    chat.open_all_models_popup(vec![preset]);
+    chat.open_plan_reasoning_scope_prompt("gpt-5.4".to_string(), Some(ReasoningEffortConfig::High));
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert_eq!(drain_insert_history(&mut rx).len(), 4);
+}
+
+#[tokio::test]
 async fn personality_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.thread_id = Some(ThreadId::new());

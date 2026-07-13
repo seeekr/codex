@@ -1,6 +1,7 @@
 use super::*;
 use assert_matches::assert_matches;
 use codex_config::types::ModelAvailabilityNuxConfig;
+use codex_config::types::ModelSettingsPolicy;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::unbounded_channel;
@@ -67,6 +68,22 @@ async fn model_migration_prompt_only_shows_for_deprecated_models() {
     ));
     assert!(!should_show_model_migration_prompt(
         "gpt-5.4", "gpt-5.4", &seen, &presets
+    ));
+}
+
+#[tokio::test]
+async fn locked_model_settings_hide_startup_model_migration() {
+    let codex_home = tempdir().expect("temp codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config");
+    config.model_settings_policy = ModelSettingsPolicy::Locked;
+
+    assert!(migration_prompt_hidden(
+        &config,
+        "hide_test_migration_prompt"
     ));
 }
 

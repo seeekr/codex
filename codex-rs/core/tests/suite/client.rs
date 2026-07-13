@@ -1338,6 +1338,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         config
             .features
             .enabled(Feature::ConcurrentReasoningSummaries),
+        config.server_model_validation,
         /*attestation_provider*/ None,
         config.http_client_factory(),
     );
@@ -3007,6 +3008,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         /*beta_features_header*/ None,
         /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        config.server_model_validation,
         /*attestation_provider*/ None,
         config.http_client_factory(),
     );

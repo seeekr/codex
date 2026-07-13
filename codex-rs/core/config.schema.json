@@ -190,6 +190,25 @@
       ],
       "type": "string"
     },
+    "ApprovalsReviewerPolicy": {
+      "description": "Controls whether derived addressable-work configs may change approval-review routing.",
+      "oneOf": [
+        {
+          "description": "Preserve the existing behavior: runtime and per-thread settings may change the reviewer.",
+          "enum": [
+            "mutable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Keep the invocation's effective reviewer across runtime and per-thread settings.",
+          "enum": [
+            "locked"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "AppsConfigToml": {
       "additionalProperties": {
         "$ref": "#/definitions/AppConfig"
@@ -1722,6 +1741,25 @@
       },
       "type": "object"
     },
+    "ModelSettingsPolicy": {
+      "description": "Controls whether derived addressable-work configs may change protected model execution settings.",
+      "oneOf": [
+        {
+          "description": "Preserve the existing behavior: runtime, thread, and ordinary subagent settings may select different substantive model execution settings.",
+          "enum": [
+            "mutable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Keep the effective model and provider route, nullable reasoning effort, review and plan overrides, and server-validation policy across runtime updates, externally created threads, and ordinary subagents. Requires an explicit non-empty model because a mutable catalog default is not a safe lock anchor.",
+          "enum": [
+            "locked"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "MultiAgentV2ConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -2782,6 +2820,25 @@
         }
       },
       "type": "object"
+    },
+    "ServerModelValidation": {
+      "description": "Controls validation of the model identity reported by the inference server.",
+      "oneOf": [
+        {
+          "description": "Preserve compatibility behavior: stream responses without requiring an identity and warn when a reported identity is invalid or does not match the request.",
+          "enum": [
+            "warn"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Buffer each response until completion and release it only after at least one matching model identity was reported and no conflicting or invalid identity was reported.",
+          "enum": [
+            "require_match"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "SessionPickerViewMode": {
       "description": "Preferred layout for the resume/fork session picker.",
@@ -4643,6 +4700,14 @@
       ],
       "description": "Configures who approval requests are routed to for review once they have been escalated. This does not disable separate safety checks such as ARC."
     },
+    "approvals_reviewer_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ApprovalsReviewerPolicy"
+        }
+      ],
+      "description": "Whether derived addressable-work configs may change approval-review routing."
+    },
     "apps": {
       "allOf": [
         {
@@ -5292,6 +5357,14 @@
     "model_reasoning_summary": {
       "$ref": "#/definitions/ReasoningSummary"
     },
+    "model_settings_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelSettingsPolicy"
+        }
+      ],
+      "description": "Whether derived addressable-work configs may change protected model execution settings."
+    },
     "model_supports_reasoning_summaries": {
       "description": "Override to force-enable reasoning summaries for the configured model.",
       "type": "boolean"
@@ -5441,6 +5514,14 @@
         }
       ],
       "description": "Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`."
+    },
+    "server_model_validation": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ServerModelValidation"
+        }
+      ],
+      "description": "How server-reported model identities are validated against each request."
     },
     "service_tier": {
       "description": "Optional explicit service tier request id for new turns (for example `default`, `priority`, or `flex`; legacy `fast` also works).",

@@ -158,6 +158,9 @@ pub(super) fn should_show_model_migration_prompt(
 }
 
 pub(super) fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> bool {
+    if config.model_settings_policy == ModelSettingsPolicy::Locked {
+        return true;
+    }
     match migration_config_key {
         HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => config
             .notices

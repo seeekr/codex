@@ -1,5 +1,6 @@
 use super::*;
 use crate::legacy_core::config::ConfigBuilder;
+use codex_config::types::ModelSettingsPolicy;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 
@@ -76,6 +77,26 @@ async fn explicit_reasoning_effort_skips_managed_model_and_reasoning_effort() {
         &mut actual,
         Some(&defaults()),
         &cli_kv_overrides,
+        &ConfigOverrides::default(),
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn locked_model_settings_skip_managed_pair_but_keep_service_tier_independent() {
+    let mut actual = test_config().await;
+    actual.model = Some("locked-model".to_string());
+    actual.model_reasoning_effort = Some(ReasoningEffort::Low);
+    actual.model_settings_policy = ModelSettingsPolicy::Locked;
+    actual.service_tier = Some("flex".to_string());
+    let mut expected = actual.clone();
+    expected.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+
+    apply_managed_new_thread_defaults(
+        &mut actual,
+        Some(&defaults()),
+        &[],
         &ConfigOverrides::default(),
     );
 
