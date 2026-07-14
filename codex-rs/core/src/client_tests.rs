@@ -743,6 +743,66 @@ async fn strict_response_stream_upstream_error_releases_no_buffered_effects() ->
 }
 
 #[tokio::test]
+async fn strict_response_stream_late_model_mismatch_releases_no_buffered_effects()
+-> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let attempt = started_inference_attempt(&temp)?;
+    let pending_turn_state = Arc::new(std::sync::OnceLock::new());
+    pending_turn_state
+        .set("pending-state".to_string())
+        .expect("pending state should be empty");
+    let committed_turn_state = Arc::new(std::sync::OnceLock::new());
+    let api_stream = futures::stream::iter([
+        Ok(ResponseEvent::ServerModel("requested-model".to_string())),
+        Ok(ResponseEvent::OutputItemDone(output_message(
+            "1",
+            "unvalidated answer",
+        ))),
+        Ok(ResponseEvent::ServerModel("other-model".to_string())),
+    ]);
+
+    let (mut stream, last_response) = super::map_response_events(
+        Some("request-before-validation".to_string()),
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+        test_model_provider(),
+        super::ResponseValidationContext::strict(
+            "requested-model".to_string(),
+            Arc::clone(&pending_turn_state),
+            Arc::clone(&committed_turn_state),
+        ),
+    );
+
+    let error = stream
+        .next()
+        .await
+        .expect("mapped stream should report the validation failure")
+        .expect_err("buffered output must not be replayed before a late mismatch");
+    assert!(matches!(
+        error,
+        codex_protocol::error::CodexErr::ServerModelValidation(_)
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(
+        last_response.await.is_err(),
+        "an unvalidated response must not produce resumable response state"
+    );
+
+    let rollout = replay_bundle(temp.path())?;
+    let inference = rollout
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference should be reduced");
+    assert_eq!(inference.execution.status, ExecutionStatus::Failed);
+    assert!(inference.response_item_ids.is_empty());
+    assert_eq!(committed_turn_state.get(), None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn strict_response_stream_eof_releases_no_buffered_effects() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let attempt = started_inference_attempt(&temp)?;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_config::types::ModelSettingsPolicy;
 use codex_config::types::ServerModelValidation;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -64,6 +65,28 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op {
             }),
             ..Default::default()
         },
+    }
+}
+
+// User-input lifecycle events are emitted locally before response validation. Only the
+// assistant/tool output authored by these fixtures would demonstrate a buffer escape.
+fn event_contains_buffered_fixture_output(event: &EventMsg) -> bool {
+    match event {
+        EventMsg::AgentMessage(_) | EventMsg::AgentMessageContentDelta(_) => true,
+        EventMsg::RawResponseItem(raw) => match &raw.item {
+            ResponseItem::FunctionCall { .. } => true,
+            ResponseItem::Message { role, .. } => role == "assistant",
+            _ => false,
+        },
+        EventMsg::ItemStarted(event) => matches!(
+            &event.item,
+            TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_)
+        ),
+        EventMsg::ItemCompleted(event) => matches!(
+            &event.item,
+            TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_)
+        ),
+        _ => false,
     }
 }
 
@@ -251,12 +274,8 @@ async fn required_server_model_match_rejects_late_mismatch_before_tool_execution
         let event = wait_for_event(&test.codex, |_| true).await;
         match event {
             EventMsg::Error(error) => break error,
-            EventMsg::AgentMessage(_)
-            | EventMsg::AgentMessageContentDelta(_)
-            | EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
-            | EventMsg::ItemCompleted(_) => {
-                panic!("buffered server output escaped before model validation failed")
+            event if event_contains_buffered_fixture_output(&event) => {
+                panic!("buffered server output escaped before model validation failed: {event:?}")
             }
             _ => {}
         }
@@ -303,17 +322,14 @@ async fn required_server_model_match_rejects_first_mismatch_before_output() -> R
         .await?;
 
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
             EventMsg::Error(error) => {
                 assert!(error.message.contains("server model validation failed"));
                 break;
             }
-            EventMsg::AgentMessage(_)
-            | EventMsg::AgentMessageContentDelta(_)
-            | EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
-            | EventMsg::ItemCompleted(_) => {
-                panic!("buffered server output escaped before model validation failed")
+            event if event_contains_buffered_fixture_output(&event) => {
+                panic!("buffered server output escaped before model validation failed: {event:?}")
             }
             _ => {}
         }

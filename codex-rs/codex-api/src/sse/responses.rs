@@ -1364,6 +1364,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_sse_preserves_late_conflicting_top_level_model_attestation() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.created",
+                "headers": {
+                    "openai-model": "requested"
+                },
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+            json!({
+                "type": "response.created",
+                "headers": {
+                    "openai-model": "other"
+                },
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 5);
+        assert_matches!(&events[0], ResponseEvent::ServerModel(model) if model == "requested");
+        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(&events[2], ResponseEvent::ServerModel(model) if model == "other");
+        assert_matches!(&events[3], ResponseEvent::Created);
+        assert_matches!(&events[4], ResponseEvent::Completed { response_id, .. } if response_id == "resp-1");
+    }
+
+    #[tokio::test]
     async fn process_sse_emits_model_verification_field() {
         let events = run_sse(vec![
             json!({
