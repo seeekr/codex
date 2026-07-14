@@ -9,6 +9,7 @@ use crate::connectors;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianMcpAnnotations;
 use crate::guardian::guardian_rejection_message;
+use crate::guardian::guardian_reviewer_unavailable_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
@@ -1171,6 +1172,11 @@ pub(crate) const MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION: &str = "Allow for this se
 // real "Decline" answer, so this lets guardian denials round-trip distinctly from user cancel.
 // This is not a user-facing option.
 pub(crate) const MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC: &str = "__codex_mcp_decline__";
+// Internal-only token that preserves retryable reviewer unavailability across the same delegated
+// RequestUserInput compatibility path. It must remain distinct from a policy/user decline so the
+// delegated agent receives retry guidance instead of treating quota exhaustion as disapproval.
+pub(crate) const MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC: &str =
+    "__codex_mcp_reviewer_unavailable__";
 const MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER: &str = "Allow and don't ask me again";
 const MCP_TOOL_APPROVAL_CANCEL: &str = "Cancel";
 
@@ -1465,6 +1471,9 @@ async fn mcp_tool_approval_decision_from_guardian(
         },
         ReviewDecision::TimedOut => McpToolApprovalDecision::Decline {
             message: Some(guardian_timeout_message()),
+        },
+        ReviewDecision::ReviewerUnavailable => McpToolApprovalDecision::Decline {
+            message: Some(guardian_reviewer_unavailable_message()),
         },
         ReviewDecision::Abort => McpToolApprovalDecision::Decline { message: None },
     }
@@ -1897,6 +1906,13 @@ fn parse_mcp_tool_approval_response(
         return McpToolApprovalDecision::Cancel;
     };
     if answers
+        .iter()
+        .any(|answer| answer == MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC)
+    {
+        McpToolApprovalDecision::Decline {
+            message: Some(guardian_reviewer_unavailable_message()),
+        }
+    } else if answers
         .iter()
         .any(|answer| answer == MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC)
     {

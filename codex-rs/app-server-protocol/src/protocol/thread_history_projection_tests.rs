@@ -6,7 +6,12 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::GuardianAssessmentAction;
+use codex_protocol::protocol::GuardianAssessmentDecisionSource;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TurnAbortReason;
@@ -17,8 +22,12 @@ use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 
 use super::*;
+use crate::protocol::v2::CommandExecutionStatus;
+use crate::protocol::v2::GuardianApprovalReviewStatus;
 use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::TurnError;
+use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 
 #[test]
 fn projects_turn_lifecycle_without_prior_builder_state() {
@@ -139,6 +148,75 @@ fn projects_completed_canonical_turn_items() {
             item: ThreadItem::from(agent_item),
         }]
     );
+}
+
+#[test]
+fn projects_persisted_reviewer_unavailable_reviews_without_losing_provenance() {
+    let rationale = "automatic reviewer temporarily unavailable; not a risk denial; retry with \
+        backoff";
+    let network_changes = project(RolloutItem::EventMsg(EventMsg::GuardianAssessment(
+        GuardianAssessmentEvent {
+            id: "review-network".to_string(),
+            target_item_id: None,
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: Some(20),
+            status: GuardianAssessmentStatus::ReviewerUnavailable,
+            risk_level: None,
+            user_authorization: None,
+            rationale: Some(rationale.to_string()),
+            decision_source: Some(GuardianAssessmentDecisionSource::Agent),
+            action: GuardianAssessmentAction::NetworkAccess {
+                target: "https://api.example.com:443".to_string(),
+                host: "api.example.com".to_string(),
+                protocol: NetworkApprovalProtocol::Https,
+                port: 443,
+            },
+        },
+    )));
+    assert_eq!(network_changes.changed_items.len(), 1);
+    let ThreadItem::GuardianApprovalReview(review) = &network_changes.changed_items[0].item else {
+        panic!("network review should project as a durable review item");
+    };
+    assert_eq!(
+        review.review.status,
+        GuardianApprovalReviewStatus::ReviewerUnavailable
+    );
+    assert_eq!(review.review.rationale.as_deref(), Some(rationale));
+
+    let command_changes = project(RolloutItem::EventMsg(EventMsg::GuardianAssessment(
+        GuardianAssessmentEvent {
+            id: "review-command".to_string(),
+            target_item_id: Some("command-1".to_string()),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: Some(20),
+            status: GuardianAssessmentStatus::ReviewerUnavailable,
+            risk_level: None,
+            user_authorization: None,
+            rationale: Some(rationale.to_string()),
+            decision_source: Some(GuardianAssessmentDecisionSource::Agent),
+            action: GuardianAssessmentAction::Command {
+                source: codex_protocol::protocol::GuardianCommandSource::Shell,
+                command: "curl https://api.example.com".to_string(),
+                cwd: test_path_buf("/tmp").abs(),
+            },
+        },
+    )));
+    assert_eq!(command_changes.changed_items.len(), 2);
+    assert!(matches!(
+        &command_changes.changed_items[0].item,
+        ThreadItem::CommandExecution {
+            status: CommandExecutionStatus::Failed,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &command_changes.changed_items[1].item,
+        ThreadItem::GuardianApprovalReview(review)
+            if review.review.status == GuardianApprovalReviewStatus::ReviewerUnavailable
+                && review.review.rationale.as_deref() == Some(rationale)
+    ));
 }
 
 #[test]

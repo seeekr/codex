@@ -517,6 +517,121 @@ async fn app_server_guardian_review_timed_out_renders_timed_out_request_snapshot
 }
 
 #[tokio::test]
+async fn app_server_guardian_reviewer_unavailable_renders_retry_not_denial() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    let command = "curl -sS https://example.com/retry-later";
+    let action = AppServerGuardianApprovalReviewAction::Command {
+        source: AppServerGuardianCommandSource::Shell,
+        command: command.to_string(),
+        cwd: test_path_buf("/tmp").abs(),
+    };
+
+    chat.handle_server_notification(
+        ServerNotification::ItemGuardianApprovalReviewStarted(
+            ItemGuardianApprovalReviewStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                started_at_ms: 0,
+                review_id: "guardian-unavailable-1".to_string(),
+                target_item_id: Some("guardian-target-1".to_string()),
+                review: GuardianApprovalReview {
+                    status: GuardianApprovalReviewStatus::InProgress,
+                    risk_level: None,
+                    user_authorization: None,
+                    rationale: None,
+                },
+                action: action.clone(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemGuardianApprovalReviewCompleted(
+            ItemGuardianApprovalReviewCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                started_at_ms: 0,
+                completed_at_ms: 1,
+                review_id: "guardian-unavailable-1".to_string(),
+                target_item_id: Some("guardian-target-1".to_string()),
+                decision_source: AppServerGuardianApprovalReviewDecisionSource::Agent,
+                review: GuardianApprovalReview {
+                    status: GuardianApprovalReviewStatus::ReviewerUnavailable,
+                    risk_level: None,
+                    user_authorization: None,
+                    rationale: Some(
+                        "Automatic reviewer quota exhausted; retry with backoff.".to_string(),
+                    ),
+                },
+                action,
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    let width: u16 = 120;
+    let ui_height: u16 = chat.desired_height(width);
+    let vt_height: u16 = ui_height.saturating_add(1).max(12);
+    let viewport = Rect::new(0, vt_height - ui_height - 1, width, ui_height);
+    let backend = VT100Backend::new(width, vt_height);
+    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    term.set_viewport_area(viewport);
+    for lines in drain_insert_history(&mut rx) {
+        crate::insert_history::insert_history_lines(&mut term, lines)
+            .expect("insert reviewer-unavailable history");
+    }
+    term.draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw reviewer-unavailable history");
+
+    let rendered = normalize_snapshot_paths(term.backend().vt100().screen().contents());
+    assert!(rendered.contains("Reviewer temporarily unavailable"));
+    assert!(rendered.contains("retry before codex runs"));
+    assert!(rendered.contains("curl -sS"));
+    assert!(rendered.contains("https://example.com/retry-later"));
+    assert!(!rendered.to_ascii_lowercase().contains("denied"));
+}
+
+#[tokio::test]
+async fn persisted_reviewer_unavailable_replay_renders_retry_not_denial() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.replay_thread_item(
+        AppServerThreadItem::GuardianApprovalReview(
+            codex_app_server_protocol::GuardianApprovalReviewItem {
+                id: "guardian-unavailable-replay".to_string(),
+                target_item_id: Some("network-call-1".to_string()),
+                started_at_ms: 1,
+                completed_at_ms: Some(2),
+                decision_source: Some(AppServerGuardianApprovalReviewDecisionSource::Agent),
+                review: GuardianApprovalReview {
+                    status: GuardianApprovalReviewStatus::ReviewerUnavailable,
+                    risk_level: None,
+                    user_authorization: None,
+                    rationale: Some("Reviewer quota exhausted; retry with backoff.".to_string()),
+                },
+                action: AppServerGuardianApprovalReviewAction::NetworkAccess {
+                    target: "https://example.com:443".to_string(),
+                    host: "example.com".to_string(),
+                    protocol: codex_app_server_protocol::NetworkApprovalProtocol::Https,
+                    port: 443,
+                },
+            },
+        ),
+        "turn-1".to_string(),
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(rendered.contains("Reviewer temporarily unavailable"));
+    assert!(rendered.contains("retry before codex accesses"));
+    assert!(rendered.contains("https://example.com:443"));
+    assert!(!rendered.to_ascii_lowercase().contains("denied"));
+}
+
+#[tokio::test]
 async fn guardian_parallel_reviews_render_aggregate_status_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();

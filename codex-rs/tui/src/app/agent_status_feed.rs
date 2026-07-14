@@ -146,6 +146,29 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         ThreadItem::FileChange { changes, .. } => {
             return bounded_summary(&format!("Updated {} file(s)", changes.len()));
         }
+        ThreadItem::GuardianApprovalReview(item) => {
+            let status = match item.review.status {
+                codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
+                    "Reviewing approval"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Approved => {
+                    "Approval review approved"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
+                    "Approval review denied"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => {
+                    "Approval review timed out"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::ReviewerUnavailable => {
+                    "Approval reviewer unavailable; retry"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
+                    "Approval review aborted"
+                }
+            };
+            return Some(status.to_string());
+        }
         ThreadItem::McpToolCall { server, tool, .. } => {
             return bounded_summary(&format!("MCP {server}/{tool}"));
         }

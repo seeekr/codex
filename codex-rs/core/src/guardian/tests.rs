@@ -63,6 +63,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::streaming_sse::StreamingSseChunk;
@@ -1192,6 +1193,20 @@ fn guardian_timeout_message_distinguishes_timeout_from_policy_denial() {
     let message = guardian_timeout_message();
     assert!(message.contains("did not finish before its deadline"));
     assert!(message.contains("retry once"));
+    assert!(!message.contains("unacceptable risk"));
+}
+
+#[test]
+fn guardian_reviewer_unavailable_message_requires_automated_retry_without_fallback() {
+    let message = guardian_reviewer_unavailable_message();
+    assert!(message.contains("temporarily unavailable"));
+    assert!(message.contains("quota was exhausted"));
+    assert!(message.contains("not a risk denial"));
+    assert!(message.contains("Retry with backoff"));
+    assert!(message.contains("do not treat this as disapproval"));
+    assert!(message.contains("switch reviewers"));
+    assert!(message.contains("change the reviewer model or reasoning effort"));
+    assert!(message.contains("human approval"));
     assert!(!message.contains("unacceptable risk"));
 }
 
@@ -2470,6 +2485,254 @@ async fn guardian_review_retries_transient_session_failure_then_approves() -> an
         Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
     ));
     assert_eq!(request_log.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_retries_quota_failure_then_approves() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let approval = serde_json::json!({
+        "risk_level": "low",
+        "user_authorization": "high",
+        "outcome": "allow",
+        "rationale": "quota retry succeeded",
+    })
+    .to_string();
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse_failed(
+                "resp-quota-failure",
+                "insufficient_quota",
+                "temporary reviewer quota exhaustion",
+            ),
+            sse(vec![
+                ev_response_created("resp-approved"),
+                ev_assistant_message("msg-approved", &approval),
+                ev_completed("resp-approved"),
+            ]),
+        ],
+    )
+    .await;
+    let (session, turn) = guardian_test_session_and_turn(&server).await;
+    seed_guardian_parent_history(&session, &turn).await;
+
+    let (outcome, metadata) = run_guardian_review_session_for_test(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        guardian_shell_request("shell-quota-retry"),
+        /*retry_reason*/ None,
+        guardian_output_schema(),
+        /*external_cancel*/ None,
+        /*max_attempts*/ 3,
+    )
+    .await;
+
+    let GuardianReviewOutcome::Completed(assessment) = outcome else {
+        panic!("expected guardian assessment");
+    };
+    assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
+    assert_eq!(assessment.rationale, "quota retry succeeded");
+    assert_eq!(metadata.attempt_count, 2);
+    assert_eq!(request_log.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_retries_pre_stream_http_quota_then_approves() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let approval = serde_json::json!({
+        "risk_level": "low",
+        "user_authorization": "high",
+        "outcome": "allow",
+        "rationale": "HTTP quota retry succeeded",
+    })
+    .to_string();
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            wiremock::ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "temporary reviewer quota exhaustion",
+                    "type": "invalid_request_error",
+                    "code": "insufficient_quota"
+                }
+            })),
+            sse_response(sse(vec![
+                ev_response_created("resp-approved-after-http-quota"),
+                ev_assistant_message("msg-approved-after-http-quota", &approval),
+                ev_completed("resp-approved-after-http-quota"),
+            ])),
+        ],
+    )
+    .await;
+    let (session, turn) = guardian_test_session_and_turn(&server).await;
+    seed_guardian_parent_history(&session, &turn).await;
+
+    let (outcome, metadata) = run_guardian_review_session_for_test(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        guardian_shell_request("shell-http-quota-retry"),
+        /*retry_reason*/ None,
+        guardian_output_schema(),
+        /*external_cancel*/ None,
+        /*max_attempts*/ 3,
+    )
+    .await;
+
+    let GuardianReviewOutcome::Completed(assessment) = outcome else {
+        panic!("expected guardian assessment");
+    };
+    assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
+    assert_eq!(assessment.rationale, "HTTP quota retry succeeded");
+    assert_eq!(metadata.attempt_count, 2);
+    assert_eq!(request_log.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_exhausted_quota_is_retryable_unavailability_not_denial()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let approval = serde_json::json!({
+        "risk_level": "low",
+        "user_authorization": "high",
+        "outcome": "allow",
+        "rationale": "later retry succeeded",
+    })
+    .to_string();
+    let mut responses = (1..=3)
+        .map(|attempt| {
+            sse_failed(
+                &format!("resp-quota-failure-{attempt}"),
+                "insufficient_quota",
+                "temporary reviewer quota exhaustion",
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(sse(vec![
+        ev_response_created("resp-approved-after-quota"),
+        ev_assistant_message("msg-approved-after-quota", &approval),
+        ev_completed("resp-approved-after-quota"),
+    ]));
+    let request_log = mount_sse_sequence(&server, responses).await;
+    let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+    seed_guardian_parent_history(&session, &turn).await;
+    {
+        let mut circuit_breaker = session
+            .services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await;
+        assert_eq!(
+            circuit_breaker.record_denial(&turn.sub_id),
+            GuardianRejectionCircuitBreakerAction::Continue
+        );
+        assert_eq!(
+            circuit_breaker.record_denial(&turn.sub_id),
+            GuardianRejectionCircuitBreakerAction::Continue
+        );
+    }
+
+    let request = guardian_shell_request("shell-exhausted-quota");
+
+    let decision = review_approval_request(
+        &session,
+        &turn,
+        "review-exhausted-quota".to_string(),
+        request.clone(),
+        /*retry_reason*/ None,
+    )
+    .await;
+
+    assert_eq!(decision, ReviewDecision::ReviewerUnavailable);
+    assert_eq!(request_log.requests().len(), 3);
+    assert!(
+        session
+            .services
+            .guardian_rejections
+            .lock()
+            .await
+            .get("review-exhausted-quota")
+            .is_none(),
+        "quota exhaustion must not be stored as a risk denial"
+    );
+    {
+        let mut circuit_breaker = session
+            .services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await;
+        assert_eq!(
+            circuit_breaker.record_denial(&turn.sub_id),
+            GuardianRejectionCircuitBreakerAction::Continue,
+            "reviewer unavailability must reset consecutive risk denials"
+        );
+    }
+    let mut statuses = Vec::new();
+    let mut rationales = Vec::new();
+    let mut warnings = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event.msg {
+            EventMsg::GuardianAssessment(event) => {
+                statuses.push(event.status);
+                if let Some(rationale) = event.rationale {
+                    rationales.push(rationale);
+                }
+            }
+            EventMsg::GuardianWarning(event) => warnings.push(event.message),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec![
+            GuardianAssessmentStatus::InProgress,
+            GuardianAssessmentStatus::ReviewerUnavailable,
+        ]
+    );
+    let canonical_unavailable = guardian_reviewer_unavailable_message();
+    assert_eq!(
+        warnings,
+        vec![canonical_unavailable.clone()],
+        "GuardianWarning must use the same stable retryable rationale as every consumer"
+    );
+    assert_eq!(
+        rationales,
+        vec![canonical_unavailable],
+        "persisted GuardianAssessment rationale must be canonical and provider-message independent"
+    );
+
+    let retry_decision = review_approval_request(
+        &session,
+        &turn,
+        "review-exhausted-quota-retry".to_string(),
+        request,
+        Some("automatic retry after reviewer quota backoff".to_string()),
+    )
+    .await;
+    assert_eq!(retry_decision, ReviewDecision::Approved);
+    assert_eq!(
+        request_log.requests().len(),
+        4,
+        "the later retry should perform one new review and approve the same action"
+    );
+    assert!(
+        session
+            .services
+            .guardian_rejections
+            .lock()
+            .await
+            .get("review-exhausted-quota-retry")
+            .is_none(),
+        "a successful retry must not retain a rejection"
+    );
     Ok(())
 }
 

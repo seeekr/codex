@@ -657,11 +657,15 @@ fn is_context_window_error(error: &Error) -> bool {
 }
 
 fn is_quota_exceeded_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("insufficient_quota")
+    matches_error_kind(error, "insufficient_quota")
 }
 
 fn is_usage_not_included(error: &Error) -> bool {
-    error.code.as_deref() == Some("usage_not_included")
+    matches_error_kind(error, "usage_not_included")
+}
+
+fn matches_error_kind(error: &Error, expected: &str) -> bool {
+    error.r#type.as_deref() == Some(expected) || error.code.as_deref() == Some(expected)
 }
 
 fn is_cyber_policy_error(error: &Error) -> bool {
@@ -1062,6 +1066,28 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         assert_matches!(events[0], Err(ApiError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn type_only_quota_exceeded_error_is_fatal() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_quota_type","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"type":"insufficient_quota","message":"You exceeded your current quota."},"incomplete_details":null}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(events[0], Err(ApiError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn type_only_usage_not_included_error_is_permanent() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_usage_not_included_type","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"type":"usage_not_included","message":"Usage is not included."},"incomplete_details":null}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(events[0], Err(ApiError::UsageNotIncluded));
     }
 
     #[tokio::test]

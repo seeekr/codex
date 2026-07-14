@@ -113,6 +113,18 @@ fn server_overloaded_maps_to_protocol() {
 }
 
 #[test]
+fn usage_not_included_remains_distinct_from_retryable_usage_limits() {
+    assert_eq!(
+        CodexErr::UsageNotIncluded.to_codex_protocol_error(),
+        CodexErrorInfo::UsageNotIncluded
+    );
+    assert_eq!(
+        CodexErr::QuotaExceeded.to_codex_protocol_error(),
+        CodexErrorInfo::UsageLimitExceeded
+    );
+}
+
+#[test]
 fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
     let output = ExecToolCallOutput {
         exit_code: 77,

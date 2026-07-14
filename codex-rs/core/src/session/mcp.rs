@@ -818,6 +818,9 @@ fn mcp_elicitation_response_from_guardian_decision_parts(
         ReviewDecision::TimedOut => {
             mcp_elicitation_decline_with_message(crate::guardian::guardian_timeout_message())
         }
+        ReviewDecision::ReviewerUnavailable => mcp_elicitation_decline_with_message(
+            crate::guardian::guardian_reviewer_unavailable_message(),
+        ),
         ReviewDecision::Abort => ElicitationResponse {
             action: ElicitationAction::Cancel,
             content: None,

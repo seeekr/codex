@@ -168,6 +168,27 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
                 .dim()
                 .into(),
         ],
+        ThreadItem::GuardianApprovalReview(item) => {
+            let status = match item.review.status {
+                codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
+                    "in progress"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Approved => "approved",
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => "denied",
+                codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => "timed out",
+                codex_app_server_protocol::GuardianApprovalReviewStatus::ReviewerUnavailable => {
+                    "reviewer unavailable; retry"
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => "aborted",
+            };
+            let mut lines = vec![format!("approval review: {status}").dim().into()];
+            if let Some(rationale) = item.review.rationale.as_deref()
+                && !rationale.trim().is_empty()
+            {
+                lines.push(vec!["  ".dim(), rationale.to_string().dim()].into());
+            }
+            lines
+        }
         ThreadItem::McpToolCall {
             server,
             tool,

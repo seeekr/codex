@@ -3,6 +3,7 @@ use crate::protocol::item_builders::build_command_execution_end_item;
 use crate::protocol::item_builders::build_file_change_approval_request_item;
 use crate::protocol::item_builders::build_file_change_begin_item;
 use crate::protocol::item_builders::build_file_change_end_item;
+use crate::protocol::item_builders::build_guardian_approval_review_item;
 use crate::protocol::item_builders::build_item_from_guardian_event;
 use crate::protocol::item_builders::review_output_text;
 use crate::protocol::v2::CollabAgentState;
@@ -663,21 +664,32 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_guardian_assessment(&mut self, payload: &GuardianAssessmentEvent) {
-        let status = match payload.status {
-            GuardianAssessmentStatus::InProgress => CommandExecutionStatus::InProgress,
+        let command_status = match payload.status {
+            GuardianAssessmentStatus::InProgress => Some(CommandExecutionStatus::InProgress),
             GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
-                CommandExecutionStatus::Declined
+                Some(CommandExecutionStatus::Declined)
             }
-            GuardianAssessmentStatus::TimedOut => CommandExecutionStatus::Failed,
-            GuardianAssessmentStatus::Approved => return,
+            GuardianAssessmentStatus::TimedOut | GuardianAssessmentStatus::ReviewerUnavailable => {
+                Some(CommandExecutionStatus::Failed)
+            }
+            GuardianAssessmentStatus::Approved => None,
         };
-        let Some(item) = build_item_from_guardian_event(payload, status) else {
-            return;
-        };
+
+        if let Some(item) =
+            command_status.and_then(|status| build_item_from_guardian_event(payload, status))
+        {
+            if payload.turn_id.is_empty() {
+                self.upsert_item_in_current_turn(item);
+            } else {
+                self.upsert_item_in_turn_id(&payload.turn_id, item);
+            }
+        }
+
+        let review_item = build_guardian_approval_review_item(payload);
         if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
+            self.upsert_item_in_current_turn(review_item);
         } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
+            self.upsert_item_in_turn_id(&payload.turn_id, review_item);
         }
     }
 
@@ -1585,6 +1597,8 @@ impl From<&PendingTurn> for Turn {
 mod tests {
     use super::*;
     use crate::protocol::v2::CommandExecutionSource;
+    use crate::protocol::v2::GuardianApprovalReviewAction;
+    use crate::protocol::v2::GuardianApprovalReviewStatus;
     use codex_extension_items::ExtensionItem as CoreExtensionItem;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
@@ -3064,7 +3078,19 @@ mod tests {
             .collect::<Vec<_>>();
         let turns = build_turns_from_rollout_items(&items);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(turns[0].items.len(), 3);
+        let ThreadItem::GuardianApprovalReview(review_item) = &turns[0].items[2] else {
+            panic!("guardian review lifecycle should be persisted");
+        };
+        assert_eq!(review_item.id, "review-guardian-exec");
+        assert_eq!(
+            review_item.review.status,
+            GuardianApprovalReviewStatus::Denied
+        );
+        assert_eq!(
+            review_item.review.rationale.as_deref(),
+            Some("Would delete user data.")
+        );
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
@@ -3130,7 +3156,14 @@ mod tests {
             .collect::<Vec<_>>();
         let turns = build_turns_from_rollout_items(&items);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(turns[0].items.len(), 3);
+        let ThreadItem::GuardianApprovalReview(review_item) = &turns[0].items[2] else {
+            panic!("guardian review lifecycle should be persisted");
+        };
+        assert_eq!(
+            review_item.review.status,
+            GuardianApprovalReviewStatus::InProgress
+        );
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
@@ -3146,6 +3179,71 @@ mod tests {
                 aggregated_output: None,
                 exit_code: None,
                 duration_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_reviewer_unavailable_network_review_with_retryable_rationale() {
+        let rationale = "Automatic approval review is temporarily unavailable because its quota \
+            was exhausted. This is not a risk denial; retry this approval with backoff.";
+        let events = vec![
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                id: "review-network-quota".into(),
+                target_item_id: None,
+                turn_id: "turn-1".into(),
+                started_at_ms: 3_000,
+                completed_at_ms: Some(3_050),
+                status: GuardianAssessmentStatus::ReviewerUnavailable,
+                risk_level: None,
+                user_authorization: None,
+                rationale: Some(rationale.into()),
+                decision_source: Some(
+                    codex_protocol::protocol::GuardianAssessmentDecisionSource::Agent,
+                ),
+                action: serde_json::from_value(serde_json::json!({
+                    "type": "network_access",
+                    "target": "https://api.example.com:443",
+                    "host": "api.example.com",
+                    "protocol": "https",
+                    "port": 443,
+                }))
+                .expect("guardian network action"),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+        let ThreadItem::GuardianApprovalReview(review_item) = &turns[0].items[0] else {
+            panic!("non-command guardian review should be persisted");
+        };
+        assert_eq!(review_item.id, "review-network-quota");
+        assert_eq!(review_item.target_item_id, None);
+        assert_eq!(review_item.completed_at_ms, Some(3_050));
+        assert_eq!(
+            review_item.review.status,
+            GuardianApprovalReviewStatus::ReviewerUnavailable
+        );
+        assert_eq!(review_item.review.rationale.as_deref(), Some(rationale));
+        assert_eq!(
+            review_item.action,
+            GuardianApprovalReviewAction::NetworkAccess {
+                target: "https://api.example.com:443".into(),
+                host: "api.example.com".into(),
+                protocol: crate::protocol::v2::NetworkApprovalProtocol::Https,
+                port: 443,
             }
         );
     }

@@ -254,6 +254,68 @@ fn map_api_error_ignores_unparseable_rate_limit_reached_type_headers() {
 }
 
 #[test]
+fn map_api_error_maps_http_429_insufficient_quota_code_to_quota_exceeded() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "You exceeded your current quota.",
+            "type": "invalid_request_error",
+            "code": "insufficient_quota"
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::QuotaExceeded));
+}
+
+#[test]
+fn map_api_error_maps_wrapped_websocket_429_insufficient_quota_to_quota_exceeded() {
+    let body = serde_json::json!({
+        "type": "error",
+        "status": 429,
+        "error": {
+            "message": "You exceeded your current quota.",
+            "type": "insufficient_quota",
+            "code": "insufficient_quota"
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: Some("ws://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::QuotaExceeded));
+}
+
+#[test]
+fn map_api_error_maps_http_429_usage_not_included_code() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Usage is not included.",
+            "type": "invalid_request_error",
+            "code": "usage_not_included"
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::UsageNotIncluded));
+}
+
+#[test]
 fn map_api_error_extracts_identity_auth_details_from_headers() {
     let mut headers = HeaderMap::new();
     headers.insert(REQUEST_ID_HEADER, http::HeaderValue::from_static("req-401"));

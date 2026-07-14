@@ -139,6 +139,7 @@ fn decision_tag(decision: GuardianReviewDecision) -> &'static str {
         GuardianReviewDecision::Approved => "approved",
         GuardianReviewDecision::Denied => "denied",
         GuardianReviewDecision::Aborted => "aborted",
+        GuardianReviewDecision::ReviewerUnavailable => "reviewer_unavailable",
     }
 }
 
@@ -148,6 +149,7 @@ fn terminal_status_tag(status: GuardianReviewTerminalStatus) -> &'static str {
         GuardianReviewTerminalStatus::Denied => "denied",
         GuardianReviewTerminalStatus::Aborted => "aborted",
         GuardianReviewTerminalStatus::TimedOut => "timed_out",
+        GuardianReviewTerminalStatus::ReviewerUnavailable => "reviewer_unavailable",
         GuardianReviewTerminalStatus::FailedClosed => "failed_closed",
     }
 }
@@ -156,6 +158,7 @@ fn failure_reason_tag(reason: Option<GuardianReviewFailureReason>) -> &'static s
     match reason {
         Some(GuardianReviewFailureReason::Timeout) => "timeout",
         Some(GuardianReviewFailureReason::Cancelled) => "cancelled",
+        Some(GuardianReviewFailureReason::QuotaExceeded) => "quota_exceeded",
         Some(GuardianReviewFailureReason::PromptBuildError) => "prompt_build_error",
         Some(GuardianReviewFailureReason::SessionError) => "session_error",
         Some(GuardianReviewFailureReason::ParseError) => "parse_error",
@@ -414,5 +417,31 @@ mod tests {
             histogram_sums(&snapshot, GUARDIAN_REVIEW_TTFT_DURATION_METRIC),
             BTreeMap::from([("sample".to_string(), 123)])
         );
+    }
+
+    #[test]
+    fn reviewer_unavailable_quota_metrics_are_not_tagged_as_denials() {
+        let tags = guardian_review_metric_tags(
+            &GuardianReviewAnalyticsResult {
+                decision: GuardianReviewDecision::ReviewerUnavailable,
+                terminal_status: GuardianReviewTerminalStatus::ReviewerUnavailable,
+                failure_reason: Some(GuardianReviewFailureReason::QuotaExceeded),
+                ..GuardianReviewAnalyticsResult::without_session()
+            },
+            GuardianApprovalRequestSource::MainTurn,
+            &GuardianReviewedAction::Shell {
+                sandbox_permissions: codex_protocol::models::SandboxPermissions::RequireEscalated,
+                additional_permissions: None,
+            },
+        )
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(tags["decision"], "reviewer_unavailable");
+        assert_eq!(tags["terminal_status"], "reviewer_unavailable");
+        assert_eq!(tags["failure_reason"], "quota_exceeded");
+        assert_ne!(tags["decision"], "denied");
+        assert_ne!(tags["terminal_status"], "failed_closed");
     }
 }

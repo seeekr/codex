@@ -2047,6 +2047,31 @@ fn synthetic_decline_request_user_input_response_stays_decline() {
 }
 
 #[test]
+fn synthetic_reviewer_unavailable_response_preserves_retry_guidance() {
+    let response = parse_mcp_tool_approval_response(
+        Some(RequestUserInputResponse {
+            answers: HashMap::from([(
+                "approval".to_string(),
+                RequestUserInputAnswer {
+                    answers: vec![MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC.to_string()],
+                },
+            )]),
+        }),
+        "approval",
+    );
+
+    let McpToolApprovalDecision::Decline {
+        message: Some(message),
+    } = response
+    else {
+        panic!("reviewer unavailability must remain a decline with retry guidance");
+    };
+    assert!(message.contains("temporarily unavailable"));
+    assert!(message.contains("not a risk denial"));
+    assert!(message.contains("Retry with backoff"));
+}
+
+#[test]
 fn accepted_elicitation_response_uses_always_persist_meta() {
     let response = parse_mcp_tool_approval_elicitation_response(
         Some(ElicitationResponse {

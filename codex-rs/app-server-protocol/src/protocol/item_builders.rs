@@ -16,6 +16,7 @@ use crate::protocol::v2::CommandExecutionSource;
 use crate::protocol::v2::CommandExecutionStatus;
 use crate::protocol::v2::FileUpdateChange;
 use crate::protocol::v2::GuardianApprovalReview;
+use crate::protocol::v2::GuardianApprovalReviewItem;
 use crate::protocol::v2::GuardianApprovalReviewStatus;
 use crate::protocol::v2::ItemGuardianApprovalReviewCompletedNotification;
 use crate::protocol::v2::ItemGuardianApprovalReviewStartedNotification;
@@ -252,17 +253,8 @@ pub fn build_item_from_guardian_event(
     }
 }
 
-pub fn guardian_auto_approval_review_notification(
-    conversation_id: &ThreadId,
-    event_turn_id: &str,
-    assessment: &GuardianAssessmentEvent,
-) -> ServerNotification {
-    let turn_id = if assessment.turn_id.is_empty() {
-        event_turn_id.to_string()
-    } else {
-        assessment.turn_id.clone()
-    };
-    let review = GuardianApprovalReview {
+fn guardian_approval_review(assessment: &GuardianAssessmentEvent) -> GuardianApprovalReview {
+    GuardianApprovalReview {
         status: match assessment.status {
             codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
                 GuardianApprovalReviewStatus::InProgress
@@ -276,6 +268,9 @@ pub fn guardian_auto_approval_review_notification(
             codex_protocol::protocol::GuardianAssessmentStatus::TimedOut => {
                 GuardianApprovalReviewStatus::TimedOut
             }
+            codex_protocol::protocol::GuardianAssessmentStatus::ReviewerUnavailable => {
+                GuardianApprovalReviewStatus::ReviewerUnavailable
+            }
             codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
                 GuardianApprovalReviewStatus::Aborted
             }
@@ -283,7 +278,32 @@ pub fn guardian_auto_approval_review_notification(
         risk_level: assessment.risk_level.map(Into::into),
         user_authorization: assessment.user_authorization.map(Into::into),
         rationale: assessment.rationale.clone(),
+    }
+}
+
+pub fn build_guardian_approval_review_item(assessment: &GuardianAssessmentEvent) -> ThreadItem {
+    ThreadItem::GuardianApprovalReview(GuardianApprovalReviewItem {
+        id: assessment.id.clone(),
+        target_item_id: assessment.target_item_id.clone(),
+        started_at_ms: assessment.started_at_ms,
+        completed_at_ms: assessment.completed_at_ms,
+        decision_source: assessment.decision_source.map(Into::into),
+        review: guardian_approval_review(assessment),
+        action: assessment.action.clone().into(),
+    })
+}
+
+pub fn guardian_auto_approval_review_notification(
+    conversation_id: &ThreadId,
+    event_turn_id: &str,
+    assessment: &GuardianAssessmentEvent,
+) -> ServerNotification {
+    let turn_id = if assessment.turn_id.is_empty() {
+        event_turn_id.to_string()
+    } else {
+        assessment.turn_id.clone()
     };
+    let review = guardian_approval_review(assessment);
     let action = assessment.action.clone().into();
     match assessment.status {
         codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
@@ -302,6 +322,7 @@ pub fn guardian_auto_approval_review_notification(
         codex_protocol::protocol::GuardianAssessmentStatus::Approved
         | codex_protocol::protocol::GuardianAssessmentStatus::Denied
         | codex_protocol::protocol::GuardianAssessmentStatus::TimedOut
+        | codex_protocol::protocol::GuardianAssessmentStatus::ReviewerUnavailable
         | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
             ServerNotification::ItemGuardianApprovalReviewCompleted(
                 ItemGuardianApprovalReviewCompletedNotification {

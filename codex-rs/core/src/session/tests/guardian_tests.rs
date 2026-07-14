@@ -30,6 +30,7 @@ use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_protocol::request_permissions::RequestPermissionsReviewFailure;
 use core_test_support::PathExt;
 use core_test_support::TempDirExt;
 use core_test_support::codex_linux_sandbox_exe_or_skip;
@@ -38,7 +39,9 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
@@ -152,6 +155,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
             permissions: requested_permissions.clone(),
             scope: PermissionGrantScope::Turn,
             strict_auto_review: false,
+            review_failure: None,
         })
     );
     assert_eq!(
@@ -165,6 +169,96 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     assert_eq!(guardian_request.path(), "/v1/responses");
     assert!(guardian_request.body_contains_text("request_permissions"));
     assert!(guardian_request.body_contains_text("need network"));
+}
+
+#[tokio::test]
+async fn request_permissions_quota_exhaustion_returns_retryable_reviewer_failure() {
+    let server = start_mock_server().await;
+    let guardian_request_log = mount_sse_sequence(
+        &server,
+        (1..=3)
+            .map(|attempt| {
+                sse_failed(
+                    &format!("resp-request-permissions-quota-{attempt}"),
+                    "insufficient_quota",
+                    "temporary reviewer quota exhaustion",
+                )
+            })
+            .collect(),
+    )
+    .await;
+
+    let (mut session, mut turn_context_raw) = make_session_and_context().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    turn_context_raw
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("test setup should allow updating approval policy");
+    let mut config = (*turn_context_raw.config).clone();
+    config
+        .features
+        .enable(Feature::GuardianApproval)
+        .expect("test setup should allow enabling guardian approvals");
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    let config = Arc::new(config);
+    let models_manager = models_manager_with_provider(
+        config.codex_home.to_path_buf(),
+        Arc::clone(&session.services.auth_manager),
+        config.model_provider.clone(),
+    );
+    session.services.models_manager = models_manager;
+    turn_context_raw.config = Arc::clone(&config);
+    turn_context_raw.provider = create_model_provider(
+        config.model_provider.clone(),
+        turn_context_raw.auth_manager.clone(),
+    );
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context_raw);
+
+    let requested_permissions = RequestPermissionProfile {
+        network: Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        ..RequestPermissionProfile::default()
+    };
+    let environment = turn_context
+        .environments
+        .primary()
+        .expect("primary environment")
+        .selection();
+    let response = session
+        .request_permissions_for_environment(
+            &turn_context,
+            "perm-call-quota".to_string(),
+            RequestPermissionsArgs {
+                environment_id: None,
+                reason: Some("need network".to_string()),
+                permissions: requested_permissions,
+            },
+            environment,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reviewer unavailability should return a typed response");
+
+    assert_eq!(response.permissions, RequestPermissionProfile::default());
+    let Some(RequestPermissionsReviewFailure::ReviewerUnavailable { message }) =
+        response.review_failure
+    else {
+        panic!("quota exhaustion must remain reviewer unavailability");
+    };
+    assert!(message.contains("temporarily unavailable"));
+    assert!(message.contains("not a risk denial"));
+    assert!(message.contains("Retry with backoff"));
+    assert_eq!(guardian_request_log.requests().len(), 3);
+    assert_eq!(
+        session
+            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
+            .await,
+        None,
+        "reviewer unavailability must never grant requested permissions"
+    );
 }
 
 #[tokio::test]
@@ -402,6 +496,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
                 },
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: true,
+                review_failure: None,
             },
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             Some(&originating_turn_state),

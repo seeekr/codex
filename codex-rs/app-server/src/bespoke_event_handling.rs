@@ -298,6 +298,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 codex_protocol::protocol::GuardianAssessmentStatus::TimedOut => {
                     Some(CommandExecutionStatus::Failed)
                 }
+                codex_protocol::protocol::GuardianAssessmentStatus::ReviewerUnavailable => {
+                    Some(CommandExecutionStatus::Failed)
+                }
                 codex_protocol::protocol::GuardianAssessmentStatus::InProgress
                 | codex_protocol::protocol::GuardianAssessmentStatus::Approved => None,
             };
@@ -562,7 +565,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             let available_decisions = ev
                 .effective_available_decisions()
                 .into_iter()
-                .map(CommandExecutionApprovalDecision::from)
+                .filter_map(CommandExecutionApprovalDecision::from_core_user_choice)
                 .collect::<Vec<_>>();
             let ExecApprovalRequestEvent {
                 call_id,
@@ -1801,6 +1804,7 @@ fn request_permissions_response_from_client_result(
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             }));
         }
         Err(err) => {
@@ -1809,6 +1813,7 @@ fn request_permissions_response_from_client_result(
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             }));
         }
     };
@@ -1834,6 +1839,7 @@ fn request_permissions_response_from_client_result(
             permissions: Default::default(),
             scope: CorePermissionGrantScope::Turn,
             strict_auto_review: false,
+            review_failure: None,
         }));
     }
     let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.try_into()?;
@@ -1846,6 +1852,7 @@ fn request_permissions_response_from_client_result(
         permissions,
         scope: response.scope.to_core(),
         strict_auto_review,
+        review_failure: None,
     }))
 }
 
@@ -2240,6 +2247,11 @@ mod tests {
             GuardianAssessmentStatus::TimedOut => {
                 (None, None, Some("review timed out".to_string()))
             }
+            GuardianAssessmentStatus::ReviewerUnavailable => (
+                None,
+                None,
+                Some("approval reviewer temporarily unavailable".to_string()),
+            ),
             GuardianAssessmentStatus::Aborted => (None, None, None),
         };
         GuardianAssessmentEvent {
@@ -2769,6 +2781,80 @@ mod tests {
             other => bail!("unexpected message: {other:?}"),
         }
 
+        guardian_context
+            .apply_guardian_assessment_event(guardian_command_assessment(
+                "cmd-guardian-reviewer-unavailable",
+                "turn-guardian-reviewer-unavailable",
+                GuardianAssessmentStatus::InProgress,
+            ))
+            .await;
+        let eighth = recv_broadcast_message(&mut rx).await?;
+        match eighth {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) => {
+                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
+                    bail!("expected command execution item");
+                };
+                assert_eq!(id, "cmd-guardian-reviewer-unavailable");
+                assert_eq!(status, CommandExecutionStatus::InProgress);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        let ninth = recv_broadcast_message(&mut rx).await?;
+        match ninth {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::ItemGuardianApprovalReviewStarted(payload),
+            ) => {
+                assert_eq!(
+                    payload.review_id,
+                    "review-cmd-guardian-reviewer-unavailable"
+                );
+                assert_eq!(
+                    payload.review.status,
+                    GuardianApprovalReviewStatus::InProgress
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        guardian_context
+            .apply_guardian_assessment_event(guardian_command_assessment(
+                "cmd-guardian-reviewer-unavailable",
+                "turn-guardian-reviewer-unavailable",
+                GuardianAssessmentStatus::ReviewerUnavailable,
+            ))
+            .await;
+        let tenth = recv_broadcast_message(&mut rx).await?;
+        match tenth {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::ItemGuardianApprovalReviewCompleted(payload),
+            ) => {
+                assert_eq!(
+                    payload.review_id,
+                    "review-cmd-guardian-reviewer-unavailable"
+                );
+                assert_eq!(
+                    payload.review.status,
+                    GuardianApprovalReviewStatus::ReviewerUnavailable
+                );
+                assert_eq!(
+                    payload.review.rationale.as_deref(),
+                    Some("approval reviewer temporarily unavailable")
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        let eleventh = recv_broadcast_message(&mut rx).await?;
+        match eleventh {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
+                    bail!("expected command execution completion");
+                };
+                assert_eq!(id, "cmd-guardian-reviewer-unavailable");
+                assert_eq!(status, CommandExecutionStatus::Failed);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
         let mut missing_target = guardian_command_assessment(
             "cmd-guardian-missing-target",
             "turn-guardian-missing-target",
@@ -2778,8 +2864,8 @@ mod tests {
         guardian_context
             .apply_guardian_assessment_event(missing_target)
             .await;
-        let eighth = recv_broadcast_message(&mut rx).await?;
-        match eighth {
+        let twelfth = recv_broadcast_message(&mut rx).await?;
+        match twelfth {
             OutgoingMessage::AppServerNotification(
                 ServerNotification::ItemGuardianApprovalReviewStarted(payload),
             ) => {
@@ -2942,6 +3028,7 @@ mod tests {
                     permissions: expected_permissions,
                     scope: CorePermissionGrantScope::Turn,
                     strict_auto_review: false,
+                    review_failure: None,
                 }
             );
         }
@@ -2966,6 +3053,7 @@ mod tests {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
                 strict_auto_review: false,
+                review_failure: None,
             }
         );
     }
@@ -2994,6 +3082,7 @@ mod tests {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             }
         );
     }

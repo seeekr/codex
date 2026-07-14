@@ -1,6 +1,7 @@
 use super::*;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX;
+use crate::mcp_tool_call::MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC;
 use async_channel::bounded;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -24,6 +25,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_protocol::request_permissions::RequestPermissionsReviewFailure;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -208,7 +210,7 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 }
 
 #[tokio::test]
-async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
+async fn handle_request_permissions_preserves_reviewer_unavailable_failure_and_call_id() {
     let (parent_session, mut parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     *parent_session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
@@ -228,14 +230,12 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
 
     let call_id = "tool-call-1".to_string();
     let expected_response = RequestPermissionsResponse {
-        permissions: RequestPermissionProfile {
-            network: Some(NetworkPermissions {
-                enabled: Some(true),
-            }),
-            ..RequestPermissionProfile::default()
-        },
+        permissions: RequestPermissionProfile::default(),
         scope: PermissionGrantScope::Turn,
         strict_auto_review: false,
+        review_failure: Some(RequestPermissionsReviewFailure::ReviewerUnavailable {
+            message: "automatic reviewer temporarily unavailable; retry with backoff".to_string(),
+        }),
     };
     #[allow(deprecated)]
     let delegated_cwd = parent_ctx.cwd.join("delegated-cwd");
@@ -479,6 +479,30 @@ async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
                 },
             )]),
         })
+    );
+}
+
+#[test]
+fn delegated_mcp_reviewer_unavailable_builds_retryable_compatibility_response() {
+    let question = RequestUserInputQuestion {
+        id: format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_call-1"),
+        header: "Approve app tool call?".to_string(),
+        question: "Allow this app tool?".to_string(),
+        is_other: false,
+        is_secret: false,
+        options: None,
+    };
+
+    assert_eq!(
+        delegated_mcp_approval_response(&question, ReviewDecision::ReviewerUnavailable),
+        RequestUserInputResponse {
+            answers: HashMap::from([(
+                question.id,
+                RequestUserInputAnswer {
+                    answers: vec![MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC.to_string()],
+                },
+            )]),
+        }
     );
 }
 

@@ -599,6 +599,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
         })
         .await?;
@@ -1251,6 +1252,7 @@ async fn remote_request_permissions_grant_unblocks_later_remote_exec() -> Result
         permissions: expected_permissions.clone(),
         scope: PermissionGrantScope::Turn,
         strict_auto_review: false,
+        review_failure: None,
     };
     let command = format!(
         "printf 'remote-request-permissions-ok' > {relative_target_path} && cat {relative_target_path}"

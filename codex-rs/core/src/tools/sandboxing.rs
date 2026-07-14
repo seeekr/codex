@@ -384,6 +384,9 @@ pub(crate) struct ToolCtx {
 #[derive(Debug)]
 pub(crate) enum ToolError {
     Rejected(String),
+    /// Automatic approval could not run because the reviewer was temporarily unavailable.
+    /// This is an operational failure, never a user or policy decline.
+    ReviewerUnavailable(String),
     Codex(CodexErr),
 }
 

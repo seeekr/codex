@@ -949,6 +949,7 @@ fn sample_effective_permissions_approval_response(
         permissions,
         scope,
         strict_auto_review: false,
+        review_failure: None,
     }
 }
 
@@ -2257,6 +2258,30 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
     assert_eq!(
         payload[0]["event_params"]["guardian_model_provider_id"],
         "openai"
+    );
+}
+
+#[test]
+fn reviewer_unavailable_quota_analytics_values_are_stable() {
+    assert_eq!(
+        serde_json::to_value(GuardianReviewDecision::ReviewerUnavailable)
+            .expect("serialize guardian review decision"),
+        json!("reviewer_unavailable")
+    );
+    assert_eq!(
+        serde_json::to_value(GuardianReviewTerminalStatus::ReviewerUnavailable)
+            .expect("serialize guardian terminal status"),
+        json!("reviewer_unavailable")
+    );
+    assert_eq!(
+        serde_json::to_value(GuardianReviewFailureReason::QuotaExceeded)
+            .expect("serialize guardian failure reason"),
+        json!("quota_exceeded")
+    );
+    assert_eq!(
+        serde_json::to_value(FinalApprovalOutcome::GuardianReviewerUnavailable)
+            .expect("serialize final approval outcome"),
+        json!("guardian_reviewer_unavailable")
     );
 }
 

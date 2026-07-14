@@ -137,6 +137,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_protocol::request_permissions::RequestPermissionsReviewFailure;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
@@ -2388,6 +2389,7 @@ impl Session {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
                     strict_auto_review: false,
+                    review_failure: None,
                 });
             }
             AskForApproval::Granular(granular_config)
@@ -2397,6 +2399,7 @@ impl Session {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
                     strict_auto_review: false,
+                    review_failure: None,
                 });
             }
             AskForApproval::OnRequest
@@ -2415,6 +2418,7 @@ impl Session {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             });
         };
 
@@ -2452,12 +2456,14 @@ impl Session {
                         permissions: requested_permissions.clone(),
                         scope: PermissionGrantScope::Turn,
                         strict_auto_review: false,
+                        review_failure: None,
                     }
                 }
                 ReviewDecision::ApprovedForSession => RequestPermissionsResponse {
                     permissions: requested_permissions.clone(),
                     scope: PermissionGrantScope::Session,
                     strict_auto_review: false,
+                    review_failure: None,
                 },
                 ReviewDecision::NetworkPolicyAmendment {
                     network_policy_amendment,
@@ -2466,18 +2472,29 @@ impl Session {
                         permissions: requested_permissions.clone(),
                         scope: PermissionGrantScope::Turn,
                         strict_auto_review: false,
+                        review_failure: None,
                     },
                     NetworkPolicyRuleAction::Deny => RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
                         strict_auto_review: false,
+                        review_failure: None,
                     },
+                },
+                ReviewDecision::ReviewerUnavailable => RequestPermissionsResponse {
+                    permissions: RequestPermissionProfile::default(),
+                    scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
+                    review_failure: Some(RequestPermissionsReviewFailure::ReviewerUnavailable {
+                        message: crate::guardian::guardian_reviewer_unavailable_message(),
+                    }),
                 },
                 ReviewDecision::Abort | ReviewDecision::Denied | ReviewDecision::TimedOut => {
                     RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
                         strict_auto_review: false,
+                        review_failure: None,
                     }
                 }
             };
@@ -2563,6 +2580,7 @@ impl Session {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             });
         };
         let mut environment = turn_environment.selection();
@@ -2687,6 +2705,7 @@ impl Session {
                             permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
                             strict_auto_review: false,
+                            review_failure: None,
                         }
                     }
                 };
@@ -2709,11 +2728,20 @@ impl Session {
         response: RequestPermissionsResponse,
         cwd: &Path,
     ) -> RequestPermissionsResponse {
+        if response.review_failure.is_some() {
+            return RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+                review_failure: response.review_failure,
+            };
+        }
         if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
             return RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             };
         }
 
@@ -2730,6 +2758,7 @@ impl Session {
             .into(),
             scope: response.scope,
             strict_auto_review: response.strict_auto_review,
+            review_failure: None,
         }
     }
 

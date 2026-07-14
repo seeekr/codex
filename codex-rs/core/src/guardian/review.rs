@@ -62,6 +62,13 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
     "You may retry once, or ask the user for guidance or explicit approval.",
 );
 
+const GUARDIAN_REVIEWER_UNAVAILABLE_INSTRUCTIONS: &str = concat!(
+    "The automatic permission approval reviewer is temporarily unavailable because its quota ",
+    "was exhausted. This is not a risk denial. Retry with backoff; do not treat this as ",
+    "disapproval, switch reviewers, change the reviewer model or reasoning effort, or ask for ",
+    "human approval solely because of this failure.",
+);
+
 const GUARDIAN_REVIEW_MAX_ATTEMPTS: i64 = 3;
 
 pub(crate) fn new_guardian_review_id() -> String {
@@ -91,6 +98,10 @@ pub(crate) async fn guardian_rejection_message(session: &Session, review_id: &st
 
 pub(crate) fn guardian_timeout_message() -> String {
     GUARDIAN_TIMEOUT_INSTRUCTIONS.to_string()
+}
+
+pub(crate) fn guardian_reviewer_unavailable_message() -> String {
+    GUARDIAN_REVIEWER_UNAVAILABLE_INSTRUCTIONS.to_string()
 }
 
 #[derive(Debug)]
@@ -150,6 +161,16 @@ impl GuardianReviewError {
             Self::Timeout => GuardianReviewFailureReason::Timeout,
             Self::Cancelled => GuardianReviewFailureReason::Cancelled,
         }
+    }
+
+    fn is_quota_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Session {
+                error_info: Some(CodexErrorInfo::UsageLimitExceeded),
+                ..
+            }
+        )
     }
 }
 
@@ -405,6 +426,58 @@ async fn run_guardian_review(
             (assessment, count_denial_for_circuit_breaker)
         }
         GuardianReviewOutcome::Error(error) => match error {
+            error @ GuardianReviewError::Session { .. } if error.is_quota_failure() => {
+                let provider_message = match &error {
+                    GuardianReviewError::Session { message, .. } => message,
+                    _ => unreachable!("quota failures are guardian session errors"),
+                };
+                tracing::warn!(
+                    provider_error = %provider_message,
+                    "automatic approval reviewer quota exhausted"
+                );
+                let rationale = guardian_reviewer_unavailable_message();
+                track_guardian_review(
+                    session.as_ref(),
+                    &review_tracking,
+                    approval_request_source,
+                    &reviewed_action,
+                    GuardianReviewAnalyticsResult {
+                        decision: GuardianReviewDecision::ReviewerUnavailable,
+                        terminal_status: GuardianReviewTerminalStatus::ReviewerUnavailable,
+                        failure_reason: Some(GuardianReviewFailureReason::QuotaExceeded),
+                        ..analytics_result
+                    },
+                    completed_at_ms.try_into().unwrap_or_default(),
+                );
+                session
+                    .send_event(
+                        turn.as_ref(),
+                        EventMsg::GuardianWarning(WarningEvent {
+                            message: rationale.clone(),
+                        }),
+                    )
+                    .await;
+                session
+                    .send_event(
+                        turn.as_ref(),
+                        EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                            id: review_id,
+                            target_item_id,
+                            turn_id: assessment_turn_id.clone(),
+                            started_at_ms,
+                            completed_at_ms: Some(completed_at_ms),
+                            status: GuardianAssessmentStatus::ReviewerUnavailable,
+                            risk_level: None,
+                            user_authorization: None,
+                            rationale: Some(rationale),
+                            decision_source: Some(GuardianAssessmentDecisionSource::Agent),
+                            action: terminal_action,
+                        }),
+                    )
+                    .await;
+                record_guardian_non_denial(&session, &assessment_turn_id).await;
+                return ReviewDecision::ReviewerUnavailable;
+            }
             GuardianReviewError::Timeout => {
                 let rationale =
                     "Automatic approval review timed out while evaluating the requested approval."
@@ -931,6 +1004,7 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
             GuardianReviewError::Session {
                 error_info: Some(
                     CodexErrorInfo::ServerOverloaded
+                        | CodexErrorInfo::UsageLimitExceeded
                         | CodexErrorInfo::HttpConnectionFailed { .. }
                         | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
                         | CodexErrorInfo::InternalServerError
@@ -977,7 +1051,7 @@ mod review_tests {
     }
 
     #[test]
-    fn guardian_review_retry_only_retries_transient_session_and_parse_errors() {
+    fn guardian_review_retry_only_retries_transient_session_quota_and_parse_errors() {
         let assessment = GuardianAssessment {
             risk_level: GuardianRiskLevel::High,
             user_authorization: GuardianUserAuthorization::Unknown,
@@ -986,6 +1060,7 @@ mod review_tests {
         };
         let transient_error_info = [
             CodexErrorInfo::ServerOverloaded,
+            CodexErrorInfo::UsageLimitExceeded,
             CodexErrorInfo::HttpConnectionFailed {
                 http_status_code: Some(502),
             },
@@ -1027,6 +1102,13 @@ mod review_tests {
                 GuardianReviewOutcome::Error(GuardianReviewError::session_with_error_info(
                     anyhow::anyhow!("bad request"),
                     CodexErrorInfo::BadRequest,
+                )),
+                false,
+            ),
+            (
+                GuardianReviewOutcome::Error(GuardianReviewError::session_with_error_info(
+                    anyhow::anyhow!("usage not included"),
+                    CodexErrorInfo::UsageNotIncluded,
                 )),
                 false,
             ),

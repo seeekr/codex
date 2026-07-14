@@ -33,6 +33,7 @@ pub(crate) enum ReviewDecision {
     },
     Denied,
     TimedOut,
+    ReviewerUnavailable,
     Abort,
 }
 
@@ -226,6 +227,34 @@ pub fn new_approval_decision_cell(
                 ],
             ),
         },
+        ReviewerUnavailable => match subject {
+            ApprovalDecisionSubject::Command(command) => {
+                let summary = if let Some(snippet) = non_empty_exec_snippet(&command) {
+                    vec![
+                        "Reviewer ".into(),
+                        "temporarily unavailable".bold(),
+                        "; retry before codex runs ".into(),
+                        Span::from(snippet).dim(),
+                    ]
+                } else {
+                    vec![
+                        "Reviewer ".into(),
+                        "temporarily unavailable".bold(),
+                        "; retry this request".into(),
+                    ]
+                };
+                ("! ".yellow(), summary)
+            }
+            ApprovalDecisionSubject::NetworkAccess { target } => (
+                "! ".yellow(),
+                vec![
+                    "Reviewer ".into(),
+                    "temporarily unavailable".bold(),
+                    "; retry before codex accesses ".into(),
+                    Span::from(target).dim(),
+                ],
+            ),
+        },
         Abort => match subject {
             ApprovalDecisionSubject::Command(command) => {
                 let summary = if let Some(snippet) = non_empty_exec_snippet(&command) {
@@ -350,6 +379,37 @@ pub fn new_guardian_timed_out_action_request(summary: String) -> Box<dyn History
         Span::from(summary).dim(),
     ]);
     Box::new(PrefixedWrappedHistoryCell::new(line, "✗ ".red(), "  "))
+}
+
+pub fn new_guardian_reviewer_unavailable_patch_request(files: Vec<String>) -> Box<dyn HistoryCell> {
+    let mut summary = vec![
+        "Reviewer ".into(),
+        "temporarily unavailable".bold(),
+        "; retry before codex applies ".into(),
+    ];
+    if files.len() == 1 {
+        summary.push("a patch touching ".into());
+        summary.push(Span::from(files[0].clone()).dim());
+    } else {
+        summary.push("a patch touching ".into());
+        summary.push(Span::from(files.len().to_string()).dim());
+        summary.push(" files".into());
+    }
+    Box::new(PrefixedWrappedHistoryCell::new(
+        Line::from(summary),
+        "! ".yellow(),
+        "  ",
+    ))
+}
+
+pub fn new_guardian_reviewer_unavailable_action_request(summary: String) -> Box<dyn HistoryCell> {
+    let line = Line::from(vec![
+        "Reviewer ".into(),
+        "temporarily unavailable".bold(),
+        "; retry before ".into(),
+        Span::from(summary).dim(),
+    ]);
+    Box::new(PrefixedWrappedHistoryCell::new(line, "! ".yellow(), "  "))
 }
 
 /// Cyan history cell line showing the current review status.

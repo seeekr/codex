@@ -6359,6 +6359,7 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
                 },
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
         )
         .await;
@@ -6394,6 +6395,7 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
                 permissions: requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             Some(&originating_turn_state),
@@ -6441,6 +6443,7 @@ async fn request_permission_grants_are_environment_keyed() {
                 permissions: requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
             "remote",
             Some(&originating_turn_state),
@@ -6462,6 +6465,7 @@ async fn request_permission_grants_are_environment_keyed() {
                 permissions: requested_permissions.clone(),
                 scope: PermissionGrantScope::Session,
                 strict_auto_review: false,
+                review_failure: None,
             },
             "remote",
             /*originating_turn_state*/ None,
@@ -6494,6 +6498,7 @@ async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
                 permissions: requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: true,
+                review_failure: None,
             },
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             Some(&originating_turn_state),
@@ -6523,6 +6528,7 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             permissions: requested_permissions,
             scope: PermissionGrantScope::Session,
             strict_auto_review: true,
+            review_failure: None,
         },
         std::path::Path::new("/tmp"),
     );
@@ -6533,8 +6539,39 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             permissions: RequestPermissionProfile::default(),
             scope: PermissionGrantScope::Turn,
             strict_auto_review: false,
+            review_failure: None,
         }
     );
+}
+
+#[test]
+fn reviewer_unavailable_response_cannot_grant_permissions() {
+    let requested_permissions = RequestPermissionProfile {
+        network: Some(codex_protocol::models::NetworkPermissions {
+            enabled: Some(true),
+        }),
+        ..RequestPermissionProfile::default()
+    };
+    let failure =
+        codex_protocol::request_permissions::RequestPermissionsReviewFailure::ReviewerUnavailable {
+            message: "automatic reviewer temporarily unavailable; retry with backoff".to_string(),
+        };
+
+    let response = Session::normalize_request_permissions_response(
+        requested_permissions.clone(),
+        codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: requested_permissions,
+            scope: PermissionGrantScope::Session,
+            strict_auto_review: true,
+            review_failure: Some(failure.clone()),
+        },
+        std::path::Path::new("/tmp"),
+    );
+
+    assert_eq!(response.permissions, RequestPermissionProfile::default());
+    assert_eq!(response.scope, PermissionGrantScope::Turn);
+    assert!(!response.strict_auto_review);
+    assert_eq!(response.review_failure, Some(failure));
 }
 
 #[tokio::test]
@@ -6565,6 +6602,7 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
         },
         scope: PermissionGrantScope::Turn,
         strict_auto_review: false,
+        review_failure: None,
     };
 
     let handle = tokio::spawn({
@@ -6728,6 +6766,7 @@ async fn request_permissions_tool_resolves_relative_paths_against_selected_envir
                 permissions: request.permissions,
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
         )
         .await;
@@ -6852,6 +6891,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
                 permissions: request.permissions,
                 scope: PermissionGrantScope::Session,
                 strict_auto_review: false,
+                review_failure: None,
             },
         )
         .await;
@@ -6867,6 +6907,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
         permissions: expected_permissions.clone(),
         scope: PermissionGrantScope::Session,
         strict_auto_review: false,
+        review_failure: None,
     };
 
     let response = tokio::time::timeout(StdDuration::from_secs(1), handle)
@@ -6933,6 +6974,7 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             }
         )
     );

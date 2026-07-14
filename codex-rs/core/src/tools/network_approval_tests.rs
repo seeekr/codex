@@ -234,6 +234,84 @@ async fn pending_waiters_receive_owner_decision() {
     assert_eq!(decision, PendingApprovalDecision::AllowOnce);
 }
 
+#[tokio::test]
+async fn deduped_reviewer_unavailability_cancels_owner_and_waiter_with_typed_outcomes() {
+    let service = Arc::new(NetworkApprovalService::default());
+    let owner_token =
+        register_call_with_default_shell_trigger(service.as_ref(), "registration-owner").await;
+    let waiter_token =
+        register_call_with_default_shell_trigger(service.as_ref(), "registration-waiter").await;
+    let owner_call = service
+        .resolve_active_call_by_execution_id("registration-owner")
+        .await
+        .expect("owner call should remain active");
+    let waiter_call = service
+        .resolve_active_call_by_execution_id("registration-waiter")
+        .await
+        .expect("waiting call should remain active");
+    let key = HostApprovalKey {
+        environment_id: "local".to_string(),
+        host: "example.com".to_string(),
+        protocol: "https",
+        port: 443,
+    };
+    let (owner_pending, owner_created) = service.get_or_create_pending_approval(key.clone()).await;
+    let (waiter_pending, waiter_created) = service.get_or_create_pending_approval(key).await;
+    assert!(owner_created);
+    assert!(!waiter_created);
+
+    let waiter = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            service
+                .wait_for_pending_approval(waiter_pending.as_ref(), Some(&waiter_call))
+                .await
+        })
+    };
+    let message = guardian_reviewer_unavailable_message();
+    service
+        .resolve_pending_approval(
+            owner_pending.as_ref(),
+            Some(&owner_call),
+            PendingApprovalDecision::Deny(NetworkApprovalOutcome::ReviewerUnavailable(
+                message.clone(),
+            )),
+        )
+        .await;
+
+    let waiter_decision = waiter.await.expect("waiting approval should resolve");
+    assert_eq!(
+        waiter_decision,
+        PendingApprovalDecision::Deny(NetworkApprovalOutcome::ReviewerUnavailable(message.clone()))
+    );
+    assert!(matches!(
+        waiter_decision.to_network_decision(),
+        NetworkDecision::Deny {
+            decision: codex_network_proxy::NetworkPolicyDecision::Ask,
+            ..
+        }
+    ));
+    assert!(owner_token.is_cancelled());
+    assert!(waiter_token.is_cancelled());
+
+    // HTTP/SOCKS record the blocked `ask` result after the decider returns. The observer must
+    // ignore it instead of overwriting the retryable outcome with a higher-precedence policy
+    // denial.
+    for registration_id in ["registration-owner", "registration-waiter"] {
+        let mut blocked = denied_blocked_request_for_execution("example.com", registration_id);
+        blocked.decision = Some("ask".to_string());
+        service.record_blocked_request(blocked).await;
+    }
+
+    for registration_id in ["registration-owner", "registration-waiter"] {
+        let error = service
+            .finish_call(registration_id)
+            .await
+            .expect_err("reviewer unavailability must fail the network call closed");
+        assert!(matches!(error, ToolError::ReviewerUnavailable(actual) if actual == message));
+    }
+}
+
 #[test]
 fn allow_once_and_allow_for_session_both_allow_network() {
     assert_eq!(
@@ -402,6 +480,42 @@ async fn blocked_request_policy_does_not_override_user_denial_outcome() {
         service.take_call_outcome("registration-1").await,
         Some(NetworkApprovalOutcome::DeniedByUser)
     );
+}
+
+#[tokio::test]
+async fn policy_denial_takes_precedence_over_reviewer_unavailability_in_both_orders() {
+    for reviewer_unavailable_first in [false, true] {
+        let service = NetworkApprovalService::default();
+        register_call_with_default_shell_trigger(&service, "registration-1").await;
+        let reviewer_unavailable = NetworkApprovalOutcome::ReviewerUnavailable(
+            "automatic reviewer temporarily unavailable".to_string(),
+        );
+        let policy_denial =
+            NetworkApprovalOutcome::DeniedByPolicy("network denied by policy".to_string());
+
+        if reviewer_unavailable_first {
+            service
+                .record_call_outcome("registration-1", reviewer_unavailable)
+                .await;
+            service
+                .record_call_outcome("registration-1", policy_denial)
+                .await;
+        } else {
+            service
+                .record_call_outcome("registration-1", policy_denial)
+                .await;
+            service
+                .record_call_outcome("registration-1", reviewer_unavailable)
+                .await;
+        }
+
+        assert_eq!(
+            service.take_call_outcome("registration-1").await,
+            Some(NetworkApprovalOutcome::DeniedByPolicy(
+                "network denied by policy".to_string()
+            ))
+        );
+    }
 }
 
 #[tokio::test]

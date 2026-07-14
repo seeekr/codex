@@ -193,6 +193,7 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
                 permissions: permissions_request.permissions,
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: true,
+                review_failure: None,
             },
         })
         .await?;

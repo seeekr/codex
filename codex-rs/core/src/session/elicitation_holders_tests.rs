@@ -137,6 +137,7 @@ async fn permission_request_holds_an_elicitation_until_response() {
                 permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
         )
         .await;

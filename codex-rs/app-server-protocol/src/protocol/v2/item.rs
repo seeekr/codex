@@ -77,24 +77,28 @@ pub enum CommandExecutionApprovalDecision {
     Cancel,
 }
 
-impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
-    fn from(value: CoreReviewDecision) -> Self {
+impl CommandExecutionApprovalDecision {
+    /// Converts only decisions that are valid user-selectable choices.
+    ///
+    /// Reviewer infrastructure outcomes are deliberately omitted so clients
+    /// cannot render them as user denials or submit them as user choices.
+    pub fn from_core_user_choice(value: CoreReviewDecision) -> Option<Self> {
         match value {
-            CoreReviewDecision::Approved => Self::Accept,
+            CoreReviewDecision::Approved => Some(Self::Accept),
             CoreReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment,
-            } => Self::AcceptWithExecpolicyAmendment {
+            } => Some(Self::AcceptWithExecpolicyAmendment {
                 execpolicy_amendment: proposed_execpolicy_amendment.into(),
-            },
-            CoreReviewDecision::ApprovedForSession => Self::AcceptForSession,
+            }),
+            CoreReviewDecision::ApprovedForSession => Some(Self::AcceptForSession),
             CoreReviewDecision::NetworkPolicyAmendment {
                 network_policy_amendment,
-            } => Self::ApplyNetworkPolicyAmendment {
+            } => Some(Self::ApplyNetworkPolicyAmendment {
                 network_policy_amendment: network_policy_amendment.into(),
-            },
-            CoreReviewDecision::Abort => Self::Cancel,
-            CoreReviewDecision::Denied => Self::Decline,
-            CoreReviewDecision::TimedOut => Self::Decline,
+            }),
+            CoreReviewDecision::Abort => Some(Self::Cancel),
+            CoreReviewDecision::Denied => Some(Self::Decline),
+            CoreReviewDecision::TimedOut | CoreReviewDecision::ReviewerUnavailable => None,
         }
     }
 }
@@ -289,6 +293,9 @@ pub enum ThreadItem {
         #[ts(type = "number | null")]
         duration_ms: Option<i64>,
     },
+    /// Persisted approval auto-review lifecycle. Unlike the temporary live
+    /// notifications, this item survives thread/read and thread/resume.
+    GuardianApprovalReview(GuardianApprovalReviewItem),
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     FileChange {
@@ -434,6 +441,7 @@ impl ThreadItem {
             | ThreadItem::EnteredReviewMode { id, .. }
             | ThreadItem::ExitedReviewMode { id, .. }
             | ThreadItem::ContextCompaction { id, .. } => id,
+            ThreadItem::GuardianApprovalReview(item) => &item.id,
             ThreadItem::WebSearch(item) => &item.id,
             ThreadItem::ImageGeneration(item) => &item.id,
         }
@@ -449,6 +457,7 @@ pub enum GuardianApprovalReviewStatus {
     Approved,
     Denied,
     TimedOut,
+    ReviewerUnavailable,
     Aborted,
 }
 
@@ -523,6 +532,28 @@ pub struct GuardianApprovalReview {
     pub risk_level: Option<GuardianRiskLevel>,
     pub user_authorization: Option<GuardianUserAuthorization>,
     pub rationale: Option<String>,
+}
+
+/// [UNSTABLE] Persisted approval auto-review item reconstructed from rollout
+/// events. This preserves reviewer-unavailable provenance across resume/read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GuardianApprovalReviewItem {
+    /// Stable identifier for this review lifecycle.
+    pub id: String,
+    /// Identifier for the reviewed item or tool call when one exists.
+    pub target_item_id: Option<String>,
+    /// Unix timestamp (in milliseconds) when this review started.
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
+    /// Unix timestamp (in milliseconds) when this review completed.
+    #[ts(type = "number | null")]
+    pub completed_at_ms: Option<i64>,
+    /// Source that produced the terminal decision; absent while in progress.
+    pub decision_source: Option<AutoReviewDecisionSource>,
+    pub review: GuardianApprovalReview,
+    pub action: GuardianApprovalReviewAction,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

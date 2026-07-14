@@ -7,9 +7,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 
+use crate::protocol::item_builders::build_guardian_approval_review_item;
+use crate::protocol::item_builders::build_item_from_guardian_event;
 use crate::protocol::thread_history::ThreadHistoryChangeSet;
 use crate::protocol::thread_history::ThreadHistoryItemChange;
 use crate::protocol::thread_history::ThreadHistoryTurnChange;
+use crate::protocol::v2::CommandExecutionStatus;
 use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::TurnError;
 use crate::protocol::v2::TurnStatus;
@@ -63,6 +66,45 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
                     completed_at: event.completed_at,
                     duration_ms: event.duration_ms,
                 }],
+                ..Default::default()
+            }
+        }
+        RolloutItem::EventMsg(EventMsg::GuardianAssessment(event)) => {
+            if event.turn_id.is_empty() {
+                return ThreadHistoryChangeSet::default();
+            }
+            let mut changed_items = vec![ThreadHistoryItemChange {
+                turn_id: event.turn_id.clone(),
+                item: build_guardian_approval_review_item(event),
+            }];
+            let command_status = match event.status {
+                codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
+                    Some(CommandExecutionStatus::InProgress)
+                }
+                codex_protocol::protocol::GuardianAssessmentStatus::Denied
+                | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
+                    Some(CommandExecutionStatus::Declined)
+                }
+                codex_protocol::protocol::GuardianAssessmentStatus::TimedOut
+                | codex_protocol::protocol::GuardianAssessmentStatus::ReviewerUnavailable => {
+                    Some(CommandExecutionStatus::Failed)
+                }
+                codex_protocol::protocol::GuardianAssessmentStatus::Approved => None,
+            };
+            if let Some(command_item) =
+                command_status.and_then(|status| build_item_from_guardian_event(event, status))
+            {
+                // Match the live app-server lifecycle: command item first, review item second.
+                changed_items.insert(
+                    0,
+                    ThreadHistoryItemChange {
+                        turn_id: event.turn_id.clone(),
+                        item: command_item,
+                    },
+                );
+            }
+            ThreadHistoryChangeSet {
+                changed_items,
                 ..Default::default()
             }
         }

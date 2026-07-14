@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::guardian::guardian_rejection_message;
+use crate::guardian::guardian_reviewer_unavailable_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
@@ -169,6 +170,12 @@ struct ApprovalResolution {
 
 impl ApprovalResolution {
     fn into_tool_result(self) -> Result<ReviewDecision, ToolError> {
+        if self.decision == ReviewDecision::ReviewerUnavailable {
+            return Err(ToolError::ReviewerUnavailable(
+                self.rejection
+                    .unwrap_or_else(guardian_reviewer_unavailable_message),
+            ));
+        }
         if let Some(rejection) = self.rejection {
             Err(ToolError::Rejected(rejection))
         } else {
@@ -275,6 +282,7 @@ async fn normalize_guardian(
             network_policy_amendment,
         } if network_policy_amendment.action == NetworkPolicyRuleAction::Allow => None,
         ReviewDecision::TimedOut => Some(guardian_timeout_message()),
+        ReviewDecision::ReviewerUnavailable => Some(guardian_reviewer_unavailable_message()),
         ReviewDecision::NetworkPolicyAmendment { .. }
         | ReviewDecision::Denied
         | ReviewDecision::Abort => {
@@ -289,6 +297,11 @@ async fn normalize_guardian(
 }
 
 fn normalize_user_rejection(mut resolution: ApprovalResolution) -> ApprovalResolution {
+    if resolution.decision == ReviewDecision::ReviewerUnavailable {
+        resolution.rejection = Some(guardian_reviewer_unavailable_message());
+        resolution.source = ApprovalResolutionSource::Guardian;
+        return resolution;
+    }
     if resolution.source == ApprovalResolutionSource::User {
         resolution.rejection = match &resolution.decision {
             ReviewDecision::Approved
@@ -301,6 +314,9 @@ fn normalize_user_rejection(mut resolution: ApprovalResolution) -> ApprovalResol
             | ReviewDecision::Denied
             | ReviewDecision::Abort => Some("rejected by user".to_string()),
             ReviewDecision::TimedOut => Some("approval request timed out".to_string()),
+            ReviewDecision::ReviewerUnavailable => unreachable!(
+                "reviewer unavailability is normalized to its automated reviewer source"
+            ),
         };
     }
     resolution

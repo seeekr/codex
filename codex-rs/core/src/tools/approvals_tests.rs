@@ -20,3 +20,21 @@ fn guardian_cwd_rejects_foreign_remote_path() {
 
     assert!(guardian_cwd(codex_exec_server::REMOTE_ENVIRONMENT_ID, cwd).is_err());
 }
+
+#[test]
+fn delegated_reviewer_unavailability_keeps_retry_guidance_and_automated_source() {
+    let resolution = normalize_user_rejection(ApprovalResolution {
+        decision: ReviewDecision::ReviewerUnavailable,
+        rejection: None,
+        source: ApprovalResolutionSource::User,
+    });
+
+    assert_eq!(resolution.source, ApprovalResolutionSource::Guardian);
+    let message = resolution
+        .rejection
+        .expect("reviewer unavailability must include retry guidance");
+    assert!(message.contains("temporarily unavailable"));
+    assert!(message.contains("not a risk denial"));
+    assert!(message.contains("Retry with backoff"));
+    assert!(message.contains("do not treat this as disapproval"));
+}

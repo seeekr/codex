@@ -402,6 +402,11 @@ impl ToolEmitter {
                 let result = Err(FunctionCallError::RespondToModel(message));
                 (event, result)
             }
+            Err(ToolError::ReviewerUnavailable(message)) => {
+                let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
+                let result = Err(FunctionCallError::RespondToModel(message));
+                (event, result)
+            }
             Err(ToolError::Rejected(msg)) => {
                 // Normalize common rejection messages for exec tools so tests and
                 // users see a clear, consistent phrase.
@@ -723,6 +728,56 @@ mod tests {
             PatchApplyStatus::Declined,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_unavailable_shell_and_patch_complete_as_failed_not_declined() {
+        let message = "automatic reviewer temporarily unavailable; retry with backoff";
+
+        for emitter in [
+            ToolEmitter::Shell {
+                command: vec!["printf".to_string(), "hi".to_string()],
+                cwd: PathUri::from_host_native_path(tempdir().expect("tempdir").path())
+                    .expect("absolute cwd"),
+                source: ExecCommandSource::Agent,
+                parsed_cmd: Vec::new(),
+            },
+            ToolEmitter::ApplyPatch {
+                changes: HashMap::new(),
+                auto_approved: false,
+                environment_id: None,
+            },
+        ] {
+            let (session, turn, rx_event) =
+                make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+            emitter
+                .finish(
+                    ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+                    Err(ToolError::ReviewerUnavailable(message.to_string())),
+                    /*applied_patch_delta*/ None,
+                )
+                .await
+                .expect_err("reviewer unavailability must fail the tool");
+
+            let completed = rx_event.recv().await.expect("item completed event");
+            match completed.msg {
+                EventMsg::ItemCompleted(event) => match event.item {
+                    TurnItem::CommandExecution(item) => {
+                        assert_eq!(
+                            item.status,
+                            codex_protocol::items::CommandExecutionStatus::Failed
+                        );
+                        assert_eq!(item.stderr.as_deref(), Some(message));
+                    }
+                    TurnItem::FileChange(item) => {
+                        assert_eq!(item.status, Some(PatchApplyStatus::Failed));
+                        assert_eq!(item.stderr.as_deref(), Some(message));
+                    }
+                    other => panic!("unexpected completed item: {other:?}"),
+                },
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

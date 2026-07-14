@@ -188,6 +188,7 @@ pub enum GuardianReviewDecision {
     Approved,
     Denied,
     Aborted,
+    ReviewerUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -197,6 +198,7 @@ pub enum GuardianReviewTerminalStatus {
     Denied,
     Aborted,
     TimedOut,
+    ReviewerUnavailable,
     FailedClosed,
 }
 
@@ -205,6 +207,7 @@ pub enum GuardianReviewTerminalStatus {
 pub enum GuardianReviewFailureReason {
     Timeout,
     Cancelled,
+    QuotaExceeded,
     PromptBuildError,
     SessionError,
     ParseError,
@@ -487,6 +490,7 @@ pub(crate) enum FinalApprovalOutcome {
     PolicyForbidden,
     GuardianApproved,
     GuardianDenied,
+    GuardianReviewerUnavailable,
     GuardianAborted,
     UserApproved,
     UserApprovedForSession,
@@ -581,6 +585,7 @@ pub(crate) enum ReviewStatus {
     Denied,
     Aborted,
     TimedOut,
+    ReviewerUnavailable,
 }
 
 #[allow(dead_code)]

@@ -233,9 +233,10 @@ impl CodexErr {
         match self {
             CodexErr::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
             CodexErr::SessionBudgetExceeded => CodexErrorInfo::SessionBudgetExceeded,
-            CodexErr::UsageLimitReached(_)
-            | CodexErr::QuotaExceeded
-            | CodexErr::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
+            CodexErr::UsageLimitReached(_) | CodexErr::QuotaExceeded => {
+                CodexErrorInfo::UsageLimitExceeded
+            }
+            CodexErr::UsageNotIncluded => CodexErrorInfo::UsageNotIncluded,
             CodexErr::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
             CodexErr::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {

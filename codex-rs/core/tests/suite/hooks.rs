@@ -2137,6 +2137,7 @@ async fn permission_request_hook_allow_bypasses_strict_auto_review() -> Result<(
                 permissions: request.permissions,
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: true,
+                review_failure: None,
             },
         })
         .await?;

@@ -263,6 +263,20 @@ fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
     );
     assert_eq!(
         mcp_elicitation_response_from_guardian_decision_parts(
+            ReviewDecision::ReviewerUnavailable,
+            /*denial_message*/ None,
+        ),
+        ElicitationResponse {
+            action: ElicitationAction::Decline,
+            content: None,
+            meta: Some(json!({
+                "approvals_reviewer": ApprovalsReviewer::AutoReview,
+                "message": crate::guardian::guardian_reviewer_unavailable_message(),
+            })),
+        }
+    );
+    assert_eq!(
+        mcp_elicitation_response_from_guardian_decision_parts(
             ReviewDecision::Abort,
             /*denial_message*/ None,
         ),

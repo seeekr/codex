@@ -40,6 +40,7 @@ use crate::guardian::spawn_approval_request_review;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
+use crate::mcp_tool_call::MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
@@ -764,6 +765,13 @@ async fn maybe_auto_review_mcp_request_user_input(
         Some(&review_cancel),
     )
     .await;
+    Some(delegated_mcp_approval_response(question, decision))
+}
+
+fn delegated_mcp_approval_response(
+    question: &codex_protocol::request_user_input::RequestUserInputQuestion,
+    decision: ReviewDecision,
+) -> RequestUserInputResponse {
     let selected_label = match decision {
         ReviewDecision::ApprovedForSession => question
             .options
@@ -778,18 +786,21 @@ async fn maybe_auto_review_mcp_request_user_input(
         ReviewDecision::Approved
         | ReviewDecision::ApprovedExecpolicyAmendment { .. }
         | ReviewDecision::NetworkPolicyAmendment { .. } => MCP_TOOL_APPROVAL_ACCEPT.to_string(),
+        ReviewDecision::ReviewerUnavailable => {
+            MCP_TOOL_APPROVAL_REVIEWER_UNAVAILABLE_SYNTHETIC.to_string()
+        }
         ReviewDecision::Denied | ReviewDecision::TimedOut | ReviewDecision::Abort => {
             MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()
         }
     };
-    Some(RequestUserInputResponse {
+    RequestUserInputResponse {
         answers: HashMap::from([(
             question.id.clone(),
             codex_protocol::request_user_input::RequestUserInputAnswer {
                 answers: vec![selected_label],
             },
         )]),
-    })
+    }
 }
 
 async fn handle_request_permissions(
@@ -869,6 +880,7 @@ where
                 permissions: Default::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             };
             parent_session
                 .notify_request_permissions_response(call_id, empty.clone())
@@ -879,6 +891,7 @@ where
             permissions: Default::default(),
             scope: PermissionGrantScope::Turn,
             strict_auto_review: false,
+            review_failure: None,
         }),
     }
 }

@@ -169,6 +169,7 @@ impl ChatWidget {
             ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
                 self.on_guardian_review_notification(
                     notification.review_id,
+                    notification.target_item_id,
                     notification.turn_id,
                     notification.started_at_ms,
                     notification.review,
@@ -179,6 +180,7 @@ impl ChatWidget {
             ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => {
                 self.on_guardian_review_notification(
                     notification.review_id,
+                    notification.target_item_id,
                     notification.turn_id,
                     notification.started_at_ms,
                     notification.review,

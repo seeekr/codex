@@ -139,7 +139,9 @@ pub(super) fn app_server_rate_limit_error_kind(
 ) -> Option<RateLimitErrorKind> {
     match info {
         AppServerCodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
-        AppServerCodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
+        AppServerCodexErrorInfo::UsageLimitExceeded | AppServerCodexErrorInfo::UsageNotIncluded => {
+            Some(RateLimitErrorKind::UsageLimit)
+        }
         AppServerCodexErrorInfo::ResponseTooManyFailedAttempts {
             http_status_code: Some(429),
         } => Some(RateLimitErrorKind::Generic),

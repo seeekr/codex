@@ -4095,6 +4095,13 @@
           "type": "string"
         },
         {
+          "description": "Automatic approval review could not run because its fixed-purpose reviewer was temporarily unavailable. The request remains safe to retry, but must not execute without a later approval.",
+          "enum": [
+            "reviewer_unavailable"
+          ],
+          "type": "string"
+        },
+        {
           "description": "User has denied this command and the agent should not do anything until the user's next command.",
           "enum": [
             "abort"
@@ -7098,6 +7105,7 @@
               "contextWindowExceeded",
               "sessionBudgetExceeded",
               "usageLimitExceeded",
+              "usageNotIncluded",
               "serverOverloaded",
               "cyberPolicy",
               "internalServerError",
@@ -10710,6 +10718,7 @@
           "approved",
           "denied",
           "timedOut",
+          "reviewerUnavailable",
           "aborted"
         ],
         "type": "string"
@@ -18232,6 +18241,68 @@
               "type"
             ],
             "title": "CommandExecutionThreadItem",
+            "type": "object"
+          },
+          {
+            "description": "Persisted approval auto-review lifecycle. Unlike the temporary live notifications, this item survives thread/read and thread/resume.",
+            "properties": {
+              "action": {
+                "$ref": "#/definitions/v2/GuardianApprovalReviewAction"
+              },
+              "completedAtMs": {
+                "description": "Unix timestamp (in milliseconds) when this review completed.",
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "decisionSource": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/AutoReviewDecisionSource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Source that produced the terminal decision; absent while in progress."
+              },
+              "id": {
+                "description": "Stable identifier for this review lifecycle.",
+                "type": "string"
+              },
+              "review": {
+                "$ref": "#/definitions/v2/GuardianApprovalReview"
+              },
+              "startedAtMs": {
+                "description": "Unix timestamp (in milliseconds) when this review started.",
+                "format": "int64",
+                "type": "integer"
+              },
+              "targetItemId": {
+                "description": "Identifier for the reviewed item or tool call when one exists.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "guardianApprovalReview"
+                ],
+                "title": "GuardianApprovalReviewThreadItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "action",
+              "id",
+              "review",
+              "startedAtMs",
+              "type"
+            ],
+            "title": "GuardianApprovalReviewThreadItem",
             "type": "object"
           },
           {

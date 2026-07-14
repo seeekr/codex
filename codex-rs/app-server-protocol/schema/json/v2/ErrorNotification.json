@@ -9,6 +9,7 @@
             "contextWindowExceeded",
             "sessionBudgetExceeded",
             "usageLimitExceeded",
+            "usageNotIncluded",
             "serverOverloaded",
             "cyberPolicy",
             "internalServerError",

@@ -134,6 +134,18 @@ impl ChatWidget {
                 ..
             } => self.on_command_execution_started(item),
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
+            ThreadItem::GuardianApprovalReview(item) => {
+                let completion = item.completed_at_ms.zip(item.decision_source);
+                self.on_guardian_review_notification(
+                    item.id,
+                    item.target_item_id,
+                    turn_id.clone(),
+                    item.started_at_ms,
+                    item.review,
+                    completion,
+                    item.action,
+                );
+            }
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
                 ..

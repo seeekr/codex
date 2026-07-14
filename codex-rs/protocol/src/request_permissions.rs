@@ -61,6 +61,16 @@ pub struct RequestPermissionsArgs {
     pub permissions: RequestPermissionProfile,
 }
 
+/// A fixed-purpose automatic reviewer failure that prevented a permission
+/// decision. This is intentionally separate from an empty permission grant:
+/// callers must not interpret reviewer infrastructure failure as a risk or
+/// user denial.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestPermissionsReviewFailure {
+    ReviewerUnavailable { message: String },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestPermissionsResponse {
     pub permissions: RequestPermissionProfile,
@@ -69,6 +79,9 @@ pub struct RequestPermissionsResponse {
     /// Review subsequent commands in this turn unless a permission hook resolves the request.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict_auto_review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_failure: Option<RequestPermissionsReviewFailure>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -96,4 +109,52 @@ pub struct RequestPermissionsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub cwd: Option<AbsolutePathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn reviewer_unavailable_failure_round_trips_with_retry_guidance() {
+        let value = serde_json::to_value(RequestPermissionsResponse {
+            permissions: RequestPermissionProfile::default(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+            review_failure: Some(RequestPermissionsReviewFailure::ReviewerUnavailable {
+                message: "temporarily unavailable; retry with backoff".to_string(),
+            }),
+        })
+        .expect("serialize request permissions response");
+
+        assert_eq!(
+            value["review_failure"],
+            json!({
+                "kind": "reviewer_unavailable",
+                "message": "temporarily unavailable; retry with backoff",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RequestPermissionsResponse>(value)
+                .expect("deserialize request permissions response")
+                .review_failure,
+            Some(RequestPermissionsReviewFailure::ReviewerUnavailable {
+                message: "temporarily unavailable; retry with backoff".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_response_without_review_failure_remains_compatible() {
+        let response = serde_json::from_value::<RequestPermissionsResponse>(json!({
+            "permissions": {},
+            "scope": "turn",
+        }))
+        .expect("deserialize legacy request permissions response");
+
+        assert_eq!(response.review_failure, None);
+        assert!(!response.strict_auto_review);
+    }
 }

@@ -254,6 +254,7 @@ await tools.request_permissions({
                 permissions: Default::default(),
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
+                review_failure: None,
             },
         })
         .await?;

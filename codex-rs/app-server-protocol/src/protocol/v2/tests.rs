@@ -41,6 +41,7 @@ use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::user_input::UserInput as CoreUserInput;
@@ -94,6 +95,24 @@ fn thread_sources_round_trip_as_scalar_labels() {
         let core_source: codex_protocol::protocol::ThreadSource = source.clone().into();
         assert_eq!(ThreadSource::from(core_source), source);
     }
+}
+
+#[test]
+fn approval_choices_exclude_reviewer_infrastructure_outcomes() {
+    assert_eq!(
+        CommandExecutionApprovalDecision::from_core_user_choice(CoreReviewDecision::Denied),
+        Some(CommandExecutionApprovalDecision::Decline)
+    );
+    assert_eq!(
+        CommandExecutionApprovalDecision::from_core_user_choice(CoreReviewDecision::TimedOut),
+        None
+    );
+    assert_eq!(
+        CommandExecutionApprovalDecision::from_core_user_choice(
+            CoreReviewDecision::ReviewerUnavailable
+        ),
+        None
+    );
 }
 
 #[test]
@@ -2393,6 +2412,43 @@ fn automatic_approval_review_deserializes_aborted_status() {
             user_authorization: None,
             rationale: None,
         }
+    );
+}
+
+#[test]
+fn persisted_reviewer_unavailable_review_round_trips_retryable_provenance() {
+    let item = ThreadItem::GuardianApprovalReview(GuardianApprovalReviewItem {
+        id: "review-quota".to_string(),
+        target_item_id: None,
+        started_at_ms: 1_000,
+        completed_at_ms: Some(1_042),
+        decision_source: Some(AutoReviewDecisionSource::Agent),
+        review: GuardianApprovalReview {
+            status: GuardianApprovalReviewStatus::ReviewerUnavailable,
+            risk_level: None,
+            user_authorization: None,
+            rationale: Some(
+                "Reviewer quota exhausted; not a risk denial; retry with backoff.".to_string(),
+            ),
+        },
+        action: GuardianApprovalReviewAction::NetworkAccess {
+            target: "https://api.example.com:443".to_string(),
+            host: "api.example.com".to_string(),
+            protocol: NetworkApprovalProtocol::Https,
+            port: 443,
+        },
+    });
+
+    let value = serde_json::to_value(&item).expect("serialize persisted guardian review");
+    assert_eq!(value["type"], "guardianApprovalReview");
+    assert_eq!(value["review"]["status"], "reviewerUnavailable");
+    assert_eq!(
+        value["review"]["rationale"],
+        "Reviewer quota exhausted; not a risk denial; retry with backoff."
+    );
+    assert_eq!(
+        serde_json::from_value::<ThreadItem>(value).expect("deserialize persisted guardian review"),
+        item
     );
 }
 

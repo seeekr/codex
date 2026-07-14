@@ -303,7 +303,9 @@ where
             };
 
             let reason = match input.error {
-                CodexErrorInfo::UsageLimitExceeded => ActiveGoalStopReason::UsageLimit,
+                CodexErrorInfo::UsageLimitExceeded | CodexErrorInfo::UsageNotIncluded => {
+                    ActiveGoalStopReason::UsageLimit
+                }
                 // The turn has ended because the error was non-retryable or its
                 // retries were exhausted. Block the goal to prevent automatic
                 // continuation from looping and consuming tokens, as can happen

@@ -409,6 +409,7 @@ impl TurnToolCounts {
             | ThreadItem::AgentMessage { .. }
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
+            | ThreadItem::GuardianApprovalReview(_)
             | ThreadItem::ImageView { .. }
             | ThreadItem::Sleep { .. }
             | ThreadItem::EnteredReviewMode { .. }
@@ -1745,6 +1746,7 @@ fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
         | ThreadItem::AgentMessage { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
+        | ThreadItem::GuardianApprovalReview(_)
         | ThreadItem::SubAgentActivity { .. }
         | ThreadItem::ImageView { .. }
         | ThreadItem::Sleep { .. }
@@ -2262,6 +2264,9 @@ fn guardian_review_result(
         GuardianApprovalReviewStatus::TimedOut => {
             Some((ReviewStatus::TimedOut, ReviewResolution::None))
         }
+        GuardianApprovalReviewStatus::ReviewerUnavailable => {
+            Some((ReviewStatus::ReviewerUnavailable, ReviewResolution::None))
+        }
         GuardianApprovalReviewStatus::Aborted => {
             Some((ReviewStatus::Aborted, ReviewResolution::None))
         }
@@ -2364,6 +2369,9 @@ fn final_approval_outcome(
     match (reviewer, status, resolution) {
         (Reviewer::Guardian, ReviewStatus::Approved, _) => FinalApprovalOutcome::GuardianApproved,
         (Reviewer::Guardian, ReviewStatus::Denied, _) => FinalApprovalOutcome::GuardianDenied,
+        (Reviewer::Guardian, ReviewStatus::ReviewerUnavailable, _) => {
+            FinalApprovalOutcome::GuardianReviewerUnavailable
+        }
         (Reviewer::Guardian, _, _) => FinalApprovalOutcome::GuardianAborted,
         (Reviewer::User, ReviewStatus::Approved, ReviewResolution::SessionApproval) => {
             FinalApprovalOutcome::UserApprovedForSession
@@ -2840,6 +2848,18 @@ mod tests {
         assert!(matches!(
             guardian_review_result(GuardianApprovalReviewStatus::TimedOut),
             Some((ReviewStatus::TimedOut, ReviewResolution::None))
+        ));
+        assert!(matches!(
+            guardian_review_result(GuardianApprovalReviewStatus::ReviewerUnavailable),
+            Some((ReviewStatus::ReviewerUnavailable, ReviewResolution::None))
+        ));
+        assert!(matches!(
+            final_approval_outcome(
+                Reviewer::Guardian,
+                ReviewStatus::ReviewerUnavailable,
+                ReviewResolution::None,
+            ),
+            FinalApprovalOutcome::GuardianReviewerUnavailable
         ));
     }
 }

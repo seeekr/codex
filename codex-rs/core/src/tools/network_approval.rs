@@ -1,6 +1,7 @@
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::guardian::guardian_rejection_message;
+use crate::guardian::guardian_reviewer_unavailable_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
@@ -161,17 +162,28 @@ fn protocol_key_label(protocol: NetworkApprovalProtocol) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingApprovalDecision {
     AllowOnce,
     AllowForSession,
-    Deny,
+    Deny(NetworkApprovalOutcome),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NetworkApprovalOutcome {
     DeniedByUser,
     DeniedByPolicy(String),
+    ReviewerUnavailable(String),
+}
+
+impl NetworkApprovalOutcome {
+    fn precedence(&self) -> u8 {
+        match self {
+            Self::DeniedByUser => 3,
+            Self::DeniedByPolicy(_) => 2,
+            Self::ReviewerUnavailable(_) => 1,
+        }
+    }
 }
 
 fn network_approval_outcome_to_result(
@@ -182,6 +194,9 @@ fn network_approval_outcome_to_result(
             Err(ToolError::Rejected("rejected by user".to_string()))
         }
         Some(NetworkApprovalOutcome::DeniedByPolicy(message)) => Err(ToolError::Rejected(message)),
+        Some(NetworkApprovalOutcome::ReviewerUnavailable(message)) => {
+            Err(ToolError::ReviewerUnavailable(message))
+        }
         None => Ok(()),
     }
 }
@@ -196,10 +211,25 @@ fn permission_profile_allows_network_approval_flow(permission_profile: &Permissi
 }
 
 impl PendingApprovalDecision {
-    fn to_network_decision(self) -> NetworkDecision {
+    fn denial_outcome(&self) -> Option<&NetworkApprovalOutcome> {
+        match self {
+            Self::AllowOnce | Self::AllowForSession => None,
+            Self::Deny(outcome) => Some(outcome),
+        }
+    }
+
+    fn to_network_decision(&self) -> NetworkDecision {
         match self {
             Self::AllowOnce | Self::AllowForSession => NetworkDecision::Allow,
-            Self::Deny => NetworkDecision::deny("not_allowed"),
+            // The proxy still blocks an `ask` result, but its blocked-request observer does not
+            // reclassify it as a policy denial. That preserves the already-recorded retryable
+            // reviewer-unavailable outcome through HTTP and SOCKS proxy completion.
+            Self::Deny(NetworkApprovalOutcome::ReviewerUnavailable(_)) => {
+                NetworkDecision::ask("not_allowed")
+            }
+            Self::Deny(
+                NetworkApprovalOutcome::DeniedByUser | NetworkApprovalOutcome::DeniedByPolicy(_),
+            ) => NetworkDecision::deny("not_allowed"),
         }
     }
 }
@@ -220,7 +250,7 @@ impl PendingHostApproval {
     async fn wait_for_decision(&self) -> PendingApprovalDecision {
         loop {
             let notified = self.notify.notified();
-            if let Some(decision) = *self.decision.lock().await {
+            if let Some(decision) = self.decision.lock().await.clone() {
                 return decision;
             }
             notified.await;
@@ -434,10 +464,11 @@ impl NetworkApprovalService {
         let Some(call) = calls.active_calls.get(registration_id).cloned() else {
             return;
         };
-        if matches!(
-            calls.call_outcomes.get(registration_id),
-            Some(NetworkApprovalOutcome::DeniedByUser)
-        ) {
+        if calls
+            .call_outcomes
+            .get(registration_id)
+            .is_some_and(|current| current.precedence() >= outcome.precedence())
+        {
             return;
         }
         calls
@@ -446,6 +477,38 @@ impl NetworkApprovalService {
 
         drop(calls);
         call.cancellation_token.cancel();
+    }
+
+    async fn wait_for_pending_approval(
+        &self,
+        pending: &PendingHostApproval,
+        waiting_call: Option<&Arc<ActiveNetworkApprovalCall>>,
+    ) -> PendingApprovalDecision {
+        let decision = pending.wait_for_decision().await;
+        if let (Some(waiting_call), Some(outcome)) =
+            (waiting_call, decision.denial_outcome().cloned())
+        {
+            self.record_call_outcome(&waiting_call.registration_id, outcome)
+                .await;
+        }
+        decision
+    }
+
+    async fn resolve_pending_approval(
+        &self,
+        pending: &PendingHostApproval,
+        owner_call: Option<&Arc<ActiveNetworkApprovalCall>>,
+        decision: PendingApprovalDecision,
+    ) {
+        // Publish before canceling the owner call. Recording a denial cancels the command token;
+        // if that cancellation drops this approval future, every deduplicated waiter must already
+        // have a terminal decision to observe.
+        pending.set_decision(decision.clone()).await;
+        if let (Some(owner_call), Some(outcome)) = (owner_call, decision.denial_outcome().cloned())
+        {
+            self.record_call_outcome(&owner_call.registration_id, outcome)
+                .await;
+        }
     }
 
     async fn remove_call(&self, registration_id: &str) -> Option<NetworkApprovalOutcome> {
@@ -543,7 +606,10 @@ impl NetworkApprovalService {
 
         let (pending, is_owner) = self.get_or_create_pending_approval(key.clone()).await;
         if !is_owner {
-            return pending.wait_for_decision().await.to_network_decision();
+            return self
+                .wait_for_pending_approval(pending.as_ref(), owner_call.as_ref())
+                .await
+                .to_network_decision();
         }
 
         let target = Self::format_network_target(key.protocol, request.host.as_str(), key.port);
@@ -552,39 +618,39 @@ impl NetworkApprovalService {
         let prompt_reason = format!("{} is not in the allowed_domains", request.host);
 
         let Some(turn_context) = turn_context else {
-            pending.set_decision(PendingApprovalDecision::Deny).await;
+            self.resolve_pending_approval(
+                pending.as_ref(),
+                owner_call.as_ref(),
+                PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByPolicy(
+                    policy_denial_message,
+                )),
+            )
+            .await;
             self.pending_host_approvals.lock().await.remove(&key);
-            if let Some(owner_call) = owner_call.as_ref() {
-                self.record_call_outcome(
-                    &owner_call.registration_id,
-                    NetworkApprovalOutcome::DeniedByPolicy(policy_denial_message),
-                )
-                .await;
-            }
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         };
         if !permission_profile_allows_network_approval_flow(&turn_context.permission_profile()) {
-            pending.set_decision(PendingApprovalDecision::Deny).await;
+            self.resolve_pending_approval(
+                pending.as_ref(),
+                owner_call.as_ref(),
+                PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByPolicy(
+                    policy_denial_message,
+                )),
+            )
+            .await;
             self.pending_host_approvals.lock().await.remove(&key);
-            if let Some(owner_call) = owner_call.as_ref() {
-                self.record_call_outcome(
-                    &owner_call.registration_id,
-                    NetworkApprovalOutcome::DeniedByPolicy(policy_denial_message),
-                )
-                .await;
-            }
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         }
         if !allows_network_approval_flow(turn_context.approval_policy.value()) {
-            pending.set_decision(PendingApprovalDecision::Deny).await;
+            self.resolve_pending_approval(
+                pending.as_ref(),
+                owner_call.as_ref(),
+                PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByPolicy(
+                    policy_denial_message,
+                )),
+            )
+            .await;
             self.pending_host_approvals.lock().await.remove(&key);
-            if let Some(owner_call) = owner_call.as_ref() {
-                self.record_call_outcome(
-                    &owner_call.registration_id,
-                    NetworkApprovalOutcome::DeniedByPolicy(policy_denial_message),
-                )
-                .await;
-            }
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         }
 
@@ -615,14 +681,14 @@ impl NetworkApprovalService {
                     return NetworkDecision::Allow;
                 }
                 PermissionRequestDecision::Deny { message } => {
-                    if let Some(owner_call) = owner_call.as_ref() {
-                        self.record_call_outcome(
-                            &owner_call.registration_id,
-                            NetworkApprovalOutcome::DeniedByPolicy(message),
-                        )
-                        .await;
-                    }
-                    pending.set_decision(PendingApprovalDecision::Deny).await;
+                    self.resolve_pending_approval(
+                        pending.as_ref(),
+                        owner_call.as_ref(),
+                        PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByPolicy(
+                            message,
+                        )),
+                    )
+                    .await;
                     let mut pending_approvals = self.pending_host_approvals.lock().await;
                     pending_approvals.remove(&key);
                     return NetworkDecision::deny(REASON_NOT_ALLOWED);
@@ -750,49 +816,27 @@ impl NetworkApprovalService {
                                 .await;
                         }
                     }
-                    if let Some(owner_call) = owner_call.as_ref() {
-                        self.record_call_outcome(
-                            &owner_call.registration_id,
-                            NetworkApprovalOutcome::DeniedByUser,
-                        )
-                        .await;
-                    }
                     cache_session_deny = true;
-                    PendingApprovalDecision::Deny
+                    PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByUser)
                 }
             },
             ReviewDecision::Denied | ReviewDecision::Abort => {
                 if let Some(review_id) = guardian_review_id.as_deref() {
-                    if let Some(owner_call) = owner_call.as_ref() {
-                        let message = guardian_rejection_message(session.as_ref(), review_id).await;
-                        self.record_call_outcome(
-                            &owner_call.registration_id,
-                            NetworkApprovalOutcome::DeniedByPolicy(message),
-                        )
-                        .await;
-                    }
-                } else if let Some(owner_call) = owner_call.as_ref() {
-                    self.record_call_outcome(
-                        &owner_call.registration_id,
-                        NetworkApprovalOutcome::DeniedByUser,
-                    )
-                    .await;
+                    let message = guardian_rejection_message(session.as_ref(), review_id).await;
+                    PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByPolicy(message))
+                } else {
+                    PendingApprovalDecision::Deny(NetworkApprovalOutcome::DeniedByUser)
                 }
-                PendingApprovalDecision::Deny
             }
-            ReviewDecision::TimedOut => {
-                if let Some(owner_call) = owner_call.as_ref() {
-                    self.record_call_outcome(
-                        &owner_call.registration_id,
-                        NetworkApprovalOutcome::DeniedByPolicy(guardian_timeout_message()),
-                    )
-                    .await;
-                }
-                PendingApprovalDecision::Deny
-            }
+            ReviewDecision::TimedOut => PendingApprovalDecision::Deny(
+                NetworkApprovalOutcome::DeniedByPolicy(guardian_timeout_message()),
+            ),
+            ReviewDecision::ReviewerUnavailable => PendingApprovalDecision::Deny(
+                NetworkApprovalOutcome::ReviewerUnavailable(guardian_reviewer_unavailable_message()),
+            ),
         };
 
-        if matches!(resolved, PendingApprovalDecision::AllowForSession) {
+        if matches!(&resolved, PendingApprovalDecision::AllowForSession) {
             {
                 let mut denied_hosts = self.session_denied_hosts.lock().await;
                 denied_hosts.remove(&key);
@@ -810,11 +854,13 @@ impl NetworkApprovalService {
             denied_hosts.insert(key.clone());
         }
 
-        pending.set_decision(resolved).await;
+        let network_decision = resolved.to_network_decision();
+        self.resolve_pending_approval(pending.as_ref(), owner_call.as_ref(), resolved)
+            .await;
         let mut pending_approvals = self.pending_host_approvals.lock().await;
         pending_approvals.remove(&key);
 
-        resolved.to_network_decision()
+        network_decision
     }
 }
 

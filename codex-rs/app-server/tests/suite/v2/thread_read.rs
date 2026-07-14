@@ -9,6 +9,7 @@ use codex_app_server::in_process;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::GuardianApprovalReviewStatus;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
@@ -36,6 +37,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
+use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -54,6 +56,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
@@ -68,6 +72,7 @@ use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -203,6 +208,139 @@ async fn thread_read_can_include_turns() -> Result<()> {
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn thread_read_and_resume_preserve_retryable_reviewer_unavailability() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "review this network request",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rationale = "The automatic permission approval reviewer is temporarily unavailable \
+        because its quota was exhausted. This is not a risk denial. Retry with backoff; do not \
+        treat this as disapproval, switch reviewers, change the reviewer model or reasoning \
+        effort, or ask for human approval solely because of this failure.";
+    let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let mut rollout = OpenOptions::new().append(true).open(path)?;
+    writeln!(
+        &mut rollout,
+        "{}",
+        json!({
+            "timestamp": "2025-01-05T12:00:01Z",
+            "type": "event_msg",
+            "payload": EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                trace_id: None,
+                started_at: Some(1_000),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        })
+    )?;
+    writeln!(
+        &mut rollout,
+        "{}",
+        json!({
+            "timestamp": "2025-01-05T12:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "guardian_assessment",
+                "id": "review-quota",
+                "turn_id": "turn-1",
+                "started_at_ms": 1_000,
+                "completed_at_ms": 1_042,
+                "status": "reviewer_unavailable",
+                "rationale": rationale,
+                "decision_source": "agent",
+                "action": {
+                    "type": "network_access",
+                    "target": "https://api.example.com:443",
+                    "host": "api.example.com",
+                    "protocol": "https",
+                    "port": 443,
+                },
+            },
+        })
+    )?;
+    writeln!(
+        &mut rollout,
+        "{}",
+        json!({
+            "timestamp": "2025-01-05T12:00:02Z",
+            "type": "event_msg",
+            "payload": EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: Some(1_000),
+                completed_at: Some(1_002),
+                duration_ms: Some(2_000),
+                time_to_first_token_ms: None,
+            }),
+        })
+    )?;
+
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, app.initialize()).await??;
+
+    let read_id = app
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread } = to_response::<ThreadReadResponse>(read_response)?;
+    assert_reviewer_unavailable_review(&thread.turns, rationale);
+
+    let resume_id = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_response)?;
+    assert_reviewer_unavailable_review(&thread.turns, rationale);
+
+    Ok(())
+}
+
+fn assert_reviewer_unavailable_review(turns: &[Turn], rationale: &str) {
+    let review = turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find_map(|item| match item {
+            ThreadItem::GuardianApprovalReview(review) if review.id == "review-quota" => {
+                Some(review)
+            }
+            _ => None,
+        })
+        .expect("persisted reviewer-unavailable item");
+    assert_eq!(
+        review.review.status,
+        GuardianApprovalReviewStatus::ReviewerUnavailable
+    );
+    assert_eq!(review.review.rationale.as_deref(), Some(rationale));
 }
 
 #[tokio::test]

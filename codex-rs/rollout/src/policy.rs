@@ -99,6 +99,15 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnComplete(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
+        // Persist terminal automatic-review outcomes in both history formats so thread/read and
+        // thread/resume retain denial-versus-reviewer-unavailable provenance. The in-progress
+        // event remains transient; the terminal snapshot carries the full lifecycle identity,
+        // action, timestamps, status, and rationale.
+        EventMsg::GuardianAssessment(event) => !matches!(
+            event.status,
+            codex_protocol::protocol::GuardianAssessmentStatus::InProgress
+        ),
+
         // Only persist these legacy events when the thread's history mode is Legacy.
         // New, paginated rollouts persist ItemCompleted events with TurnItems.
         EventMsg::UserMessage(_)
@@ -116,7 +125,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
 
         // Transient, non-durable events.
         EventMsg::Error(_)
-        | EventMsg::GuardianAssessment(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ViewImageToolCall(_)
         | EventMsg::CollabAgentSpawnEnd(_)
@@ -172,5 +180,57 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabResumeBegin(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::GuardianAssessmentAction;
+    use codex_protocol::protocol::GuardianAssessmentEvent;
+    use codex_protocol::protocol::GuardianAssessmentStatus;
+    use codex_protocol::protocol::NetworkApprovalProtocol;
+
+    fn guardian_event(status: GuardianAssessmentStatus) -> EventMsg {
+        EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+            id: "review-1".to_string(),
+            target_item_id: None,
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: (!matches!(status, GuardianAssessmentStatus::InProgress)).then_some(2),
+            status,
+            risk_level: None,
+            user_authorization: None,
+            rationale: None,
+            decision_source: None,
+            action: GuardianAssessmentAction::NetworkAccess {
+                target: "https://api.example.com:443".to_string(),
+                host: "api.example.com".to_string(),
+                protocol: NetworkApprovalProtocol::Https,
+                port: 443,
+            },
+        })
+    }
+
+    #[test]
+    fn terminal_guardian_reviews_persist_in_both_history_modes() {
+        for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            assert!(!should_persist_event_msg(
+                &guardian_event(GuardianAssessmentStatus::InProgress),
+                mode,
+            ));
+            for status in [
+                GuardianAssessmentStatus::Approved,
+                GuardianAssessmentStatus::Denied,
+                GuardianAssessmentStatus::TimedOut,
+                GuardianAssessmentStatus::ReviewerUnavailable,
+                GuardianAssessmentStatus::Aborted,
+            ] {
+                assert!(
+                    should_persist_event_msg(&guardian_event(status), mode),
+                    "terminal Guardian status {status:?} should persist in {mode:?} history"
+                );
+            }
+        }
     }
 }

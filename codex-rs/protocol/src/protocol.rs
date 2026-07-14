@@ -1741,6 +1741,7 @@ pub enum CodexErrorInfo {
     ContextWindowExceeded,
     SessionBudgetExceeded,
     UsageLimitExceeded,
+    UsageNotIncluded,
     ServerOverloaded,
     CyberPolicy,
     HttpConnectionFailed {
@@ -1779,6 +1780,7 @@ impl CodexErrorInfo {
             Self::ContextWindowExceeded
             | Self::SessionBudgetExceeded
             | Self::UsageLimitExceeded
+            | Self::UsageNotIncluded
             | Self::ServerOverloaded
             | Self::CyberPolicy
             | Self::HttpConnectionFailed { .. }
@@ -4077,6 +4079,11 @@ pub enum ReviewDecision {
     /// Automatic approval review timed out before reaching a decision.
     TimedOut,
 
+    /// Automatic approval review could not run because its fixed-purpose
+    /// reviewer was temporarily unavailable. The request remains safe to
+    /// retry, but must not execute without a later approval.
+    ReviewerUnavailable,
+
     /// User has denied this command and the agent should not do anything until
     /// the user's next command.
     Abort,
@@ -4098,6 +4105,7 @@ impl ReviewDecision {
             },
             ReviewDecision::Denied => "denied",
             ReviewDecision::TimedOut => "timed_out",
+            ReviewDecision::ReviewerUnavailable => "reviewer_unavailable",
             ReviewDecision::Abort => "abort",
         }
     }

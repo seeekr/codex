@@ -502,6 +502,7 @@
         "approved",
         "denied",
         "timedOut",
+        "reviewerUnavailable",
         "aborted"
       ],
       "type": "string"

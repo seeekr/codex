@@ -66,6 +66,7 @@ impl ChatWidget {
     pub(super) fn on_guardian_review_notification(
         &mut self,
         id: String,
+        target_item_id: Option<String>,
         turn_id: String,
         started_at_ms: i64,
         review: codex_app_server_protocol::GuardianApprovalReview,
@@ -92,7 +93,7 @@ impl ChatWidget {
 
         self.on_guardian_assessment(GuardianAssessmentEvent {
             id,
-            target_item_id: None,
+            target_item_id,
             turn_id,
             started_at_ms,
             completed_at_ms,
@@ -108,6 +109,9 @@ impl ChatWidget {
                 }
                 codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => {
                     GuardianAssessmentStatus::TimedOut
+                }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::ReviewerUnavailable => {
+                    GuardianAssessmentStatus::ReviewerUnavailable
                 }
                 codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
                     GuardianAssessmentStatus::Aborted
