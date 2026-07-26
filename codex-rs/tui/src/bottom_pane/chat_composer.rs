@@ -251,6 +251,8 @@ use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::textarea::ComposerLeaseError;
+use crate::bottom_pane::textarea::ComposerLeaseId;
 use crate::bottom_pane::textarea::TextArea;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
@@ -406,6 +408,9 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: EditorKeymap,
     vim_normal_keymap: VimNormalKeymap,
+    /// Owned transport text must render without turning draft fragments into session-logged popup
+    /// queries. Ordinary composer input clears this deferral before synchronizing popups.
+    popup_sync_deferred_for_owned_text: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -573,6 +578,7 @@ impl ChatComposer {
             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
+            popup_sync_deferred_for_owned_text: false,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -887,6 +893,7 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        self.popup_sync_deferred_for_owned_text = false;
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = sanitize_user_text(&pasted);
         let char_count = pasted.chars().count();
@@ -1150,6 +1157,10 @@ impl ChatComposer {
         self.draft.pending_pastes.clone()
     }
 
+    pub(crate) fn has_pending_pastes(&self) -> bool {
+        !self.draft.pending_pastes.is_empty()
+    }
+
     pub(crate) fn set_pending_pastes(&mut self, pending_pastes: Vec<(String, String)>) {
         let text = self.current_text();
         self.draft.pending_pastes = pending_pastes
@@ -1243,6 +1254,7 @@ impl ChatComposer {
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
     ) {
+        self.popup_sync_deferred_for_owned_text = false;
         // Clear any existing content, placeholders, and attachments first.
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
@@ -1265,7 +1277,6 @@ impl ChatComposer {
         self.draft.textarea.cursor() + if self.draft.is_bash_mode { 1 } else { 0 }
     }
 
-    #[cfg(test)]
     pub(crate) fn cursor(&self) -> usize {
         self.current_cursor()
     }
@@ -1631,9 +1642,56 @@ impl ChatComposer {
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
+        self.popup_sync_deferred_for_owned_text = false;
         self.draft.textarea.insert_str(text);
         self.sync_bash_mode_from_text();
         self.sync_popups();
+    }
+
+    /// Insert text through the native ownership-aware editor without routing it as key input.
+    ///
+    /// Popup synchronization is intentionally deferred until the next ordinary composer event.
+    /// It can emit file-search app events containing draft fragments, while the composer-control
+    /// transport promises that its transcript-bearing payload never enters the session log.
+    pub(crate) fn insert_owned_text(
+        &mut self,
+        text: &str,
+    ) -> Result<ComposerLeaseId, ComposerLeaseError> {
+        let lease = self.draft.textarea.insert_owned_text(text)?;
+        self.popup_sync_deferred_for_owned_text = true;
+        Ok(lease)
+    }
+
+    pub(crate) fn verify_owned_text(
+        &self,
+        lease: ComposerLeaseId,
+        expected: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.draft.textarea.verify_owned_text(lease, expected)
+    }
+
+    pub(crate) fn keep_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+    ) -> Result<(), ComposerLeaseError> {
+        self.draft.textarea.keep_owned_text(lease)
+    }
+
+    /// Replace producer-owned text without synthesizing keys or a submit action.
+    ///
+    /// As with insertion, popup synchronization is deferred to keep payload-derived text off the
+    /// session-logged app-event channel.
+    pub(crate) fn replace_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.draft
+            .textarea
+            .replace_owned_text(lease, expected, replacement)?;
+        self.popup_sync_deferred_for_owned_text = true;
+        Ok(())
     }
 
     /// Handle a key event coming from the main UI.
@@ -1645,6 +1703,7 @@ impl ChatComposer {
         if matches!(key_event.kind, KeyEventKind::Release) {
             return (InputResult::None, false);
         }
+        self.popup_sync_deferred_for_owned_text = false;
 
         if self.history_search.is_some() {
             return self.handle_history_search_key(key_event);
@@ -3546,6 +3605,9 @@ impl ChatComposer {
     }
 
     pub(crate) fn sync_popups(&mut self) {
+        if self.popup_sync_deferred_for_owned_text {
+            return;
+        }
         self.sync_slash_command_elements();
         if self.history_search.is_some() {
             if self.popups.current_file_query.is_some() {
@@ -4565,6 +4627,28 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn owned_text_redraw_sync_does_not_emit_draft_fragments() {
+        let (mut composer, mut rx) = new_test_composer();
+        composer
+            .insert_owned_text("@private")
+            .expect("owned insertion");
+
+        // `BottomPane::pre_draw_tick` invokes this on every frame.
+        composer.sync_popups();
+        assert!(
+            rx.try_recv().is_err(),
+            "redrawing owned text must not emit a session-logged popup query"
+        );
+
+        // The next ordinary composer edit restores the native popup behavior.
+        composer.insert_str("x");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::StartFileSearch(query)) if query == "privatex"
+        ));
     }
 
     #[test]

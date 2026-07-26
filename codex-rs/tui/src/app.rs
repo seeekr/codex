@@ -1142,6 +1142,10 @@ See the Codex keymap documentation for supported actions and examples."
             );
         }
 
+        // Publish the socket only once startup work is complete and the serialized UI loop is
+        // ready to answer within the transport deadline.
+        let (mut composer_control_rx, _composer_control_server) = crate::composer_control::start();
+        let mut composer_control_state = crate::composer_control::NativeComposerControlState::new();
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
@@ -1177,6 +1181,15 @@ See the Codex keymap documentation for supported actions and examples."
                             Err(err) => break Err(err),
                         }
                     }
+                    Some(request) = composer_control_rx.recv() => {
+                        let app_overlay_active = app.overlay.is_some();
+                        composer_control_state.handle_ui_request(
+                            request,
+                            &mut app.chat_widget,
+                            app_overlay_active,
+                        );
+                        AppRunControl::Continue
+                    }
                     active = async {
                         if let Some(rx) = app.active_thread_rx.as_mut() {
                             rx.recv().await
@@ -1198,6 +1211,7 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     event = tui_events.next() => {
                         if let Some(event) = event {
+                            composer_control_state.note_tui_event(&event);
                             match app.handle_tui_event(tui, &mut app_server, event).await {
                                 Ok(control) => control,
                                 Err(err) => break Err(err),

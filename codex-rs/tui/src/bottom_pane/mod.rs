@@ -145,6 +145,8 @@ mod scroll_state;
 mod selection_popup_common;
 mod selection_tabs;
 mod textarea;
+pub(crate) use textarea::ComposerLeaseError;
+pub(crate) use textarea::ComposerLeaseId;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use hooks_browser_view::HooksBrowserView;
@@ -827,9 +829,44 @@ impl BottomPane {
         self.composer.current_text()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_cursor(&self) -> usize {
         self.composer.cursor()
+    }
+
+    pub(crate) fn insert_composer_owned_text(
+        &mut self,
+        text: &str,
+    ) -> Result<ComposerLeaseId, ComposerLeaseError> {
+        let lease = self.composer.insert_owned_text(text)?;
+        self.request_redraw();
+        Ok(lease)
+    }
+
+    pub(crate) fn verify_composer_owned_text(
+        &self,
+        lease: ComposerLeaseId,
+        expected: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.composer.verify_owned_text(lease, expected)
+    }
+
+    pub(crate) fn keep_composer_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+    ) -> Result<(), ComposerLeaseError> {
+        self.composer.keep_owned_text(lease)
+    }
+
+    pub(crate) fn replace_composer_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.composer
+            .replace_owned_text(lease, expected, replacement)?;
+        self.request_redraw();
+        Ok(())
     }
 
     pub(crate) fn composer_draft_snapshot(&self) -> chat_composer::ComposerDraftSnapshot {
@@ -861,6 +898,10 @@ impl BottomPane {
 
     pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
         self.composer.pending_pastes()
+    }
+
+    pub(crate) fn composer_has_pending_pastes(&self) -> bool {
+        self.composer.has_pending_pastes()
     }
 
     pub(crate) fn apply_external_edit(&mut self, text: String) {
