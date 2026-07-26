@@ -31,6 +31,7 @@ use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 use std::cell::Ref;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use textwrap::Options;
 use unicode_segmentation::UnicodeSegmentation;
@@ -88,6 +89,108 @@ pub(crate) struct TextElementSnapshot {
     pub(crate) text: String,
 }
 
+/// Opaque ownership handle for text inserted into the composer by an external producer.
+///
+/// The handle remains valid while edits stay outside its byte range. Any edit that intersects the
+/// owned text revokes it, so a later producer correction cannot overwrite user-authored changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
+pub(crate) struct ComposerLeaseId(u64);
+
+#[allow(dead_code)]
+impl ComposerLeaseId {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ComposerLeaseError {
+    EmptyText,
+    LeaseUnavailable,
+    ExpectedTextMismatch,
+    CursorConflicts,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ComposerLeases {
+    next_id: u64,
+    ranges: BTreeMap<ComposerLeaseId, Range<usize>>,
+}
+
+#[allow(dead_code)]
+impl ComposerLeases {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            ranges: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, range: Range<usize>) -> ComposerLeaseId {
+        let id = ComposerLeaseId(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("composer lease id space exhausted");
+        self.ranges.insert(id, range);
+        id
+    }
+
+    fn range(&self, id: ComposerLeaseId) -> Option<Range<usize>> {
+        self.ranges.get(&id).cloned()
+    }
+
+    fn retire(&mut self, id: ComposerLeaseId) -> bool {
+        self.ranges.remove(&id).is_some()
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    /// Rebase leases around an ordinary editor mutation and revoke every intersecting lease.
+    ///
+    /// Insertion before a lease shifts it right, while insertion at its end stays outside it. An
+    /// insertion at the start revokes the lease: the new bytes may be a user-supplied missing
+    /// prefix, and preserving the old claim could make a later full-span correction duplicate that
+    /// prefix. Insertion strictly inside the lease is likewise a conflicting edit.
+    fn apply_edit(&mut self, edited: Range<usize>, inserted_len: usize) {
+        let removed_len = edited.end.saturating_sub(edited.start);
+        if removed_len == 0 && inserted_len == 0 {
+            return;
+        }
+        let delta = inserted_len as isize - removed_len as isize;
+        let is_insertion = removed_len == 0;
+
+        self.ranges.retain(|_, owned| {
+            if is_insertion {
+                if edited.start < owned.start {
+                    owned.start = owned.start.saturating_add_signed(delta);
+                    owned.end = owned.end.saturating_add_signed(delta);
+                    return true;
+                }
+                if edited.start >= owned.end {
+                    return true;
+                }
+                return false;
+            }
+
+            if edited.end <= owned.start {
+                owned.start = owned.start.saturating_add_signed(delta);
+                owned.end = owned.end.saturating_add_signed(delta);
+                return true;
+            }
+            if edited.start >= owned.end {
+                return true;
+            }
+            false
+        });
+    }
+}
+
 /// `TextArea` is the editable buffer behind the TUI composer.
 ///
 /// It owns the raw UTF-8 text, placeholder-like text elements that must move atomically with
@@ -104,6 +207,7 @@ pub(crate) struct TextArea {
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
     next_element_id: u64,
+    composer_leases: ComposerLeases,
     kill_buffer: String,
     kill_buffer_kind: KillBufferKind,
     vim_enabled: bool,
@@ -145,6 +249,7 @@ impl TextArea {
             preferred_col: None,
             elements: Vec::new(),
             next_element_id: 1,
+            composer_leases: ComposerLeases::new(),
             kill_buffer: String::new(),
             kill_buffer_kind: KillBufferKind::Characterwise,
             vim_enabled: false,
@@ -192,6 +297,7 @@ impl TextArea {
     fn set_text_inner(&mut self, text: &str, elements: Option<&[UserTextElement]>) {
         // Stage 1: replace the raw text and keep the cursor in a safe byte range.
         self.text = text.to_string();
+        self.composer_leases.clear();
         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
         // Stage 2: rebuild element ranges from scratch against the new text.
         self.elements.clear();
@@ -346,6 +452,7 @@ impl TextArea {
     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
         let pos = self.clamp_pos_for_insertion(pos);
         self.text.insert_str(pos, text);
+        self.composer_leases.apply_edit(pos..pos, text.len());
         self.wrap_cache.replace(None);
         if pos <= self.cursor_pos {
             self.cursor_pos += text.len();
@@ -371,6 +478,7 @@ impl TextArea {
         let diff = inserted_len as isize - removed_len as isize;
 
         self.text.replace_range(range, text);
+        self.composer_leases.apply_edit(start..end, inserted_len);
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.update_elements_after_replace(start, end, inserted_len);
@@ -394,6 +502,92 @@ impl TextArea {
 
     pub fn cursor(&self) -> usize {
         self.cursor_pos
+    }
+
+    /// Insert producer-owned text at the native cursor and return an opaque correction lease.
+    ///
+    /// The returned lease is byte-based because the textarea itself is byte-indexed. All ranges
+    /// originate at valid UTF-8 boundaries and are rebased only by editor mutations, which also
+    /// operate on valid boundaries.
+    #[allow(dead_code)]
+    pub(crate) fn insert_owned_text(
+        &mut self,
+        text: &str,
+    ) -> Result<ComposerLeaseId, ComposerLeaseError> {
+        if text.is_empty() {
+            return Err(ComposerLeaseError::EmptyText);
+        }
+        let start = self.clamp_pos_for_insertion(self.cursor_pos);
+        // `add_element_range` may have made the current cursor atomic after it was positioned.
+        // Move to the exact boundary chosen above before insertion so the ordinary cursor rebase
+        // cannot leave the caret inside the shifted element.
+        self.set_cursor(start);
+        self.insert_str_at(start, text);
+        Ok(self
+            .composer_leases
+            .insert(start..start.saturating_add(text.len())))
+    }
+
+    /// Atomically replace still-owned text when both the lease and expected bytes match.
+    ///
+    /// A successful replacement is terminal and retires the lease. An expected-text mismatch also
+    /// retires it: once the editor and producer disagree, retrying under the old ownership claim
+    /// would be unsafe.
+    #[allow(dead_code)]
+    pub(crate) fn replace_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        let Some(range) = self.composer_leases.range(lease) else {
+            return Err(ComposerLeaseError::LeaseUnavailable);
+        };
+        if self.text.get(range.clone()) != Some(expected) {
+            self.composer_leases.retire(lease);
+            return Err(ComposerLeaseError::ExpectedTextMismatch);
+        }
+        if self.cursor_pos >= range.start && self.cursor_pos < range.end {
+            self.composer_leases.retire(lease);
+            return Err(ComposerLeaseError::CursorConflicts);
+        }
+
+        self.composer_leases.retire(lease);
+        self.replace_range_raw(range, replacement);
+        Ok(())
+    }
+
+    /// Accept the currently inserted text and relinquish the producer's edit right.
+    #[allow(dead_code)]
+    pub(crate) fn keep_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+    ) -> Result<(), ComposerLeaseError> {
+        self.composer_leases
+            .retire(lease)
+            .then_some(())
+            .ok_or(ComposerLeaseError::LeaseUnavailable)
+    }
+
+    /// Verify that a producer lease still owns exactly the expected bytes without changing it.
+    #[allow(dead_code)]
+    pub(crate) fn verify_owned_text(
+        &self,
+        lease: ComposerLeaseId,
+        expected: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        let Some(range) = self.composer_leases.range(lease) else {
+            return Err(ComposerLeaseError::LeaseUnavailable);
+        };
+        if self.text.get(range) != Some(expected) {
+            return Err(ComposerLeaseError::ExpectedTextMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn composer_lease_range(&self, lease: ComposerLeaseId) -> Option<Range<usize>> {
+        self.composer_leases.range(lease)
     }
 
     pub fn set_cursor(&mut self, pos: usize) {
@@ -1414,6 +1608,7 @@ impl TextArea {
         let diff = inserted_len as isize - removed_len as isize;
 
         self.text.replace_range(range, new);
+        self.composer_leases.apply_edit(start..end, inserted_len);
         self.wrap_cache.replace(None);
         self.preferred_col = None;
 
@@ -1469,6 +1664,11 @@ impl TextArea {
     }
 
     fn add_element(&mut self, range: Range<usize>) -> u64 {
+        // Adding atomic structure is an edit even when the visible bytes do not change. Revoke an
+        // intersecting producer lease so a later correction cannot overwrite the user's newly
+        // structured token.
+        self.composer_leases
+            .apply_edit(range.clone(), range.end.saturating_sub(range.start));
         let id = self.next_element_id();
         self.elements.push(TextElement { id, range });
         self.elements.sort_by_key(|e| e.range.start);
@@ -1512,7 +1712,15 @@ impl TextArea {
         let len_before = self.elements.len();
         self.elements
             .retain(|elem| elem.range.start != start || elem.range.end != end);
-        len_before != self.elements.len()
+        let removed = len_before != self.elements.len();
+        if removed {
+            // Removing atomic structure is likewise a metadata edit. This is normally redundant
+            // because adding an overlapping element already revoked the lease, but keeping both
+            // sides complete prevents future element sources from reopening stale ownership.
+            self.composer_leases
+                .apply_edit(start..end, end.saturating_sub(start));
+        }
+        removed
     }
 
     fn next_element_id(&mut self) -> u64 {
@@ -2048,6 +2256,238 @@ mod tests {
         let mut t = TextArea::new();
         t.insert_str(text);
         t
+    }
+
+    #[test]
+    fn composer_lease_replaces_only_owned_text_at_native_cursor() {
+        let mut t = ta_with("left right");
+        t.set_cursor(/*pos*/ 5);
+
+        let lease = t.insert_owned_text("fast ").expect("owned insertion");
+        assert_eq!(lease.get(), 1);
+        assert_eq!(t.composer_lease_range(lease), Some(5..10));
+        assert_eq!(t.text(), "left fast right");
+
+        t.replace_owned_text(lease, "fast ", "final ")
+            .expect("matching lease replacement");
+        assert_eq!(t.text(), "left final right");
+        assert_eq!(t.composer_lease_range(lease), None);
+        assert_eq!(
+            t.replace_owned_text(lease, "final ", "later "),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn composer_lease_rebases_before_and_ignores_end_boundary_edits() {
+        let mut t = ta_with("left ");
+        let lease = t.insert_owned_text("fast").expect("owned insertion");
+
+        t.set_cursor(/*pos*/ 0);
+        t.insert_str("before ");
+        assert_eq!(t.composer_lease_range(lease), Some(12..16));
+
+        t.set_cursor(/*pos*/ 16);
+        t.insert_str(" after");
+        assert_eq!(t.composer_lease_range(lease), Some(12..16));
+
+        // Replacements that only touch a lease boundary remain outside the owned span.
+        t.replace_range(0..12, "prior ");
+        assert_eq!(t.composer_lease_range(lease), Some(6..10));
+        t.replace_range(10..16, " later");
+        assert_eq!(t.composer_lease_range(lease), Some(6..10));
+
+        t.replace_owned_text(lease, "fast", "final")
+            .expect("outside edits preserve ownership");
+        assert_eq!(t.text(), "prior final later");
+    }
+
+    #[test]
+    fn composer_lease_start_boundary_insert_revokes_ownership() {
+        let mut t = ta_with("prefix ");
+        let lease = t.insert_owned_text("fast").expect("owned insertion");
+        let start = t.composer_lease_range(lease).expect("active lease").start;
+
+        t.set_cursor(start);
+        t.insert_str("missing ");
+
+        assert_eq!(t.composer_lease_range(lease), None);
+        assert_eq!(
+            t.replace_owned_text(lease, "fast", "missing final"),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+        assert_eq!(t.text(), "prefix missing fast");
+    }
+
+    #[test]
+    fn composer_lease_intersecting_edits_revoke_ownership() {
+        let mut inserted = TextArea::new();
+        let insert_lease = inserted
+            .insert_owned_text("abcdef")
+            .expect("owned insertion");
+        inserted.set_cursor(/*pos*/ 3);
+        inserted.insert_str("X");
+        assert_eq!(inserted.composer_lease_range(insert_lease), None);
+
+        let mut deleted = TextArea::new();
+        let delete_lease = deleted
+            .insert_owned_text("abcdef")
+            .expect("owned insertion");
+        deleted.replace_range(1..3, "");
+        assert_eq!(deleted.composer_lease_range(delete_lease), None);
+    }
+
+    #[test]
+    fn composer_lease_replacement_rejects_cursor_inside_or_at_start() {
+        for cursor in [0, 2] {
+            let mut t = TextArea::new();
+            let lease = t.insert_owned_text("fast").expect("owned insertion");
+            t.set_cursor(cursor);
+            let before = t.text().to_string();
+
+            assert_eq!(
+                t.replace_owned_text(lease, "fast", "final"),
+                Err(ComposerLeaseError::CursorConflicts)
+            );
+            assert_eq!(t.text(), before);
+            assert_eq!(t.composer_lease_range(lease), None);
+        }
+    }
+
+    #[test]
+    fn composer_lease_expected_mismatch_is_terminal_and_has_no_text_effect() {
+        let mut t = TextArea::new();
+        let lease = t.insert_owned_text("fast").expect("owned insertion");
+        let before = t.text().to_string();
+
+        assert_eq!(
+            t.replace_owned_text(lease, "different", "final"),
+            Err(ComposerLeaseError::ExpectedTextMismatch)
+        );
+        assert_eq!(t.text(), before);
+        assert_eq!(t.composer_lease_range(lease), None);
+    }
+
+    #[test]
+    fn composer_lease_keep_and_full_reset_retire_ownership() {
+        let mut kept = TextArea::new();
+        let kept_lease = kept.insert_owned_text("fast").expect("owned insertion");
+        kept.keep_owned_text(kept_lease)
+            .expect("active lease can be kept");
+        assert_eq!(kept.text(), "fast");
+        assert_eq!(kept.composer_lease_range(kept_lease), None);
+        assert_eq!(
+            kept.keep_owned_text(kept_lease),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+
+        let mut reset = TextArea::new();
+        let reset_lease = reset.insert_owned_text("fast").expect("owned insertion");
+        reset.set_text_clearing_elements("replacement draft");
+        assert_eq!(reset.composer_lease_range(reset_lease), None);
+        assert_eq!(
+            reset.replace_owned_text(reset_lease, "fast", "final"),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn composer_lease_verify_is_read_only_and_exact() {
+        let mut textarea = ta_with("prefix suffix");
+        textarea.set_cursor("prefix ".len());
+        let lease = textarea.insert_owned_text("fast").expect("owned insert");
+
+        assert_eq!(textarea.verify_owned_text(lease, "fast"), Ok(()));
+        assert_eq!(
+            textarea.verify_owned_text(lease, "final"),
+            Err(ComposerLeaseError::ExpectedTextMismatch)
+        );
+        assert_eq!(
+            textarea.verify_owned_text(ComposerLeaseId(lease.get() + 1), "fast"),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+        assert_eq!(textarea.verify_owned_text(lease, "fast"), Ok(()));
+
+        textarea.keep_owned_text(lease).expect("keep retires lease");
+        assert_eq!(
+            textarea.verify_owned_text(lease, "fast"),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn composer_leases_track_multiple_independent_utf8_ranges() {
+        let mut t = ta_with("α ");
+        let first = t.insert_owned_text("König").expect("first owned insertion");
+        t.insert_str(" / ");
+        let second = t.insert_owned_text("音声").expect("second owned insertion");
+
+        t.set_cursor(/*pos*/ 0);
+        t.insert_str("→ ");
+        let first_range = t.composer_lease_range(first).expect("first active lease");
+        let second_range = t.composer_lease_range(second).expect("second active lease");
+        assert!(t.text().is_char_boundary(first_range.start));
+        assert!(t.text().is_char_boundary(first_range.end));
+        assert!(t.text().is_char_boundary(second_range.start));
+        assert!(t.text().is_char_boundary(second_range.end));
+
+        t.set_cursor(first_range.start + "Kö".len());
+        t.insert_str("X");
+        assert_eq!(t.composer_lease_range(first), None);
+
+        t.set_cursor(t.text().len());
+        t.replace_owned_text(second, "音声", "voice 🎙️")
+            .expect("unrelated lease survives and remains UTF-8 safe");
+        assert_eq!(t.text(), "→ α KöXnig / voice 🎙️");
+    }
+
+    #[test]
+    fn composer_lease_rejects_empty_owned_insertions_without_consuming_id() {
+        let mut t = TextArea::new();
+        assert_eq!(t.insert_owned_text(""), Err(ComposerLeaseError::EmptyText));
+        let lease = t.insert_owned_text("fast").expect("owned insertion");
+        assert_eq!(lease.get(), 1);
+    }
+
+    #[test]
+    fn composer_lease_uses_the_actual_element_clamped_insertion_position() {
+        let mut t = ta_with("before <attachment> after");
+        let element_start = "before ".len();
+        let element_end = element_start + "<attachment>".len();
+
+        // Public operations can create this state: position the cursor while the bytes are plain,
+        // then make the surrounding range atomic without changing those bytes.
+        t.set_cursor(element_start + 2);
+        t.add_element_range(element_start..element_end)
+            .expect("new atomic element");
+        let expected_start = t.clamp_pos_for_insertion(t.cursor_pos);
+        let lease = t.insert_owned_text("fast").expect("owned insertion");
+        let range = t.composer_lease_range(lease).expect("active lease");
+        assert_eq!(&t.text()[range.clone()], "fast");
+        assert_eq!(range.start, expected_start);
+        assert_eq!(t.cursor(), range.end);
+        assert!(t.find_element_containing(t.cursor()).is_none());
+    }
+
+    #[test]
+    fn composer_lease_is_revoked_by_intersecting_element_metadata_edits() {
+        let mut added = TextArea::new();
+        let added_lease = added.insert_owned_text("/plan").expect("owned insertion");
+        added
+            .add_element_range(0.."/plan".len())
+            .expect("new structured token");
+        assert_eq!(added.composer_lease_range(added_lease), None);
+
+        let mut removed = ta_with("/plan");
+        let range = 0.."/plan".len();
+        removed
+            .add_element_range(range.clone())
+            .expect("new structured token");
+        // Seed the otherwise-impossible legacy state directly so removal itself is covered: an
+        // intersecting active lease must not survive even if it predates this invariant.
+        let removed_lease = removed.composer_leases.insert(range.clone());
+        assert!(removed.remove_element_range(range));
+        assert_eq!(removed.composer_lease_range(removed_lease), None);
     }
 
     #[test]
