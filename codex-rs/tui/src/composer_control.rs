@@ -14,6 +14,8 @@ use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_protocol::protocol::MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS;
+use codex_utils_string::truncate_middle_with_token_budget;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -119,6 +121,22 @@ impl NativeComposerSubmission {
 
     pub(crate) fn client_user_message_id(&self) -> String {
         format!("koenig-composer-{}", self.submission_id)
+    }
+
+    pub(crate) fn receipt_context(&self) -> (String, String) {
+        let receipt = self.client_user_message_id();
+        (
+            format!(
+                "koenig_transcription_receipt_{}",
+                self.submission_id.simple()
+            ),
+            format!(
+                "Koenig submission receipt {receipt}. The immediately following user message \
+                 contains the Koenig-owned transcription associated with this receipt. A later \
+                 Application-context correction naming this receipt mechanically amends only the \
+                 explicitly identified owned range in that message."
+            ),
+        )
     }
 
     pub(crate) fn thread_id(&self) -> &str {
@@ -338,6 +356,7 @@ struct Capture {
 
 enum ExternalLeaseState<L> {
     Draft { native: L },
+    SubmissionPending { receipt: SubmittedLeaseReceipt },
     SubmittedIntact { receipt: SubmittedLeaseReceipt },
     CorrectionPending { receipt: SubmittedLeaseReceipt },
 }
@@ -353,6 +372,9 @@ impl<L: Copy> Clone for ExternalLeaseState<L> {
     fn clone(&self) -> Self {
         match self {
             Self::Draft { native } => Self::Draft { native: *native },
+            Self::SubmissionPending { receipt } => Self::SubmissionPending {
+                receipt: receipt.clone(),
+            },
             Self::SubmittedIntact { receipt } => Self::SubmittedIntact {
                 receipt: receipt.clone(),
             },
@@ -657,6 +679,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     Err(err) => WireResult::not_applied(map_lease_error(err)),
                 }
             }
+            ExternalLeaseState::SubmissionPending { .. } => WireResult::SubmissionPending,
             ExternalLeaseState::SubmittedIntact { .. } => {
                 if target.thread_id().as_deref() == Some(lease.thread_id.as_str()) {
                     WireResult::SubmittedIntact
@@ -691,6 +714,11 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     Ok(()) => WireResult::Kept,
                     Err(err) => WireResult::not_applied(map_lease_error(err)),
                 }
+            }
+            ExternalLeaseState::SubmissionPending { .. } => {
+                self.leases.remove(&lease_id);
+                self.lease_order.retain(|queued| *queued != lease_id);
+                WireResult::Kept
             }
             ExternalLeaseState::SubmittedIntact { .. } => {
                 if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
@@ -758,6 +786,20 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     }
                 }
             }
+            ExternalLeaseState::SubmissionPending { .. } => {
+                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ComposerUnavailable,
+                    ));
+                }
+                if expected == replacement {
+                    self.leases.remove(&lease_id);
+                    self.lease_order.retain(|queued| *queued != lease_id);
+                    CommandExecution::Complete(WireResult::Kept)
+                } else {
+                    CommandExecution::Complete(WireResult::SubmissionPending)
+                }
+            }
             ExternalLeaseState::SubmittedIntact { receipt } => {
                 if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
                     return CommandExecution::Complete(WireResult::not_applied(
@@ -781,7 +823,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     ));
                 }
                 let correction_id = Uuid::new_v4();
-                let context_key = format!("koenig_transcription_correction/{correction_id}");
+                let context_key =
+                    format!("koenig_transcription_correction_{}", correction_id.simple());
                 let Some(context_value) = mechanical_correction_context(
                     receipt.submission_id,
                     &receipt.submitted_text,
@@ -828,7 +871,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
-    fn note_submission_accepted_by_native(
+    fn note_submission_pending_by_native(
         &mut self,
         thread_id: &str,
         submission_id: Uuid,
@@ -852,7 +895,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 .get(range.clone())
                 .is_some_and(|submitted| text_hash(submitted) == lease.expected_hash)
             {
-                lease.state = ExternalLeaseState::SubmittedIntact {
+                lease.state = ExternalLeaseState::SubmissionPending {
                     receipt: SubmittedLeaseReceipt {
                         submission_id,
                         submitted_text: Arc::clone(&submitted_text),
@@ -862,21 +905,75 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             }
         }
     }
+
+    fn note_submission_committed_id(&mut self, thread_id: &str, submission_id: Uuid) {
+        for lease in self.leases.values_mut() {
+            if lease.thread_id != thread_id {
+                continue;
+            }
+            let ExternalLeaseState::SubmissionPending { receipt } = &lease.state else {
+                continue;
+            };
+            if receipt.submission_id == submission_id {
+                lease.state = ExternalLeaseState::SubmittedIntact {
+                    receipt: receipt.clone(),
+                };
+            }
+        }
+    }
+
+    fn note_submission_abandoned_id(&mut self, thread_id: &str, submission_id: Uuid) {
+        let abandoned = self
+            .leases
+            .iter()
+            .filter_map(|(lease_id, lease)| {
+                (lease.thread_id == thread_id
+                    && matches!(
+                        &lease.state,
+                        ExternalLeaseState::SubmissionPending { receipt }
+                            if receipt.submission_id == submission_id
+                    ))
+                .then_some(*lease_id)
+            })
+            .collect::<Vec<_>>();
+        for lease_id in abandoned {
+            self.leases.remove(&lease_id);
+            self.lease_order.retain(|queued| *queued != lease_id);
+        }
+    }
+
+    pub(crate) fn invalidate_thread(&mut self, thread_id: &str) {
+        self.captures
+            .retain(|_, capture| capture.thread_id != thread_id);
+        self.capture_order
+            .retain(|capture_id| self.captures.contains_key(capture_id));
+        self.leases.retain(|_, lease| lease.thread_id != thread_id);
+        self.lease_order
+            .retain(|lease_id| self.leases.contains_key(lease_id));
+    }
 }
 
 impl NativeComposerControlState {
-    pub(crate) fn note_submission_accepted(&mut self, submission: &NativeComposerSubmission) {
+    pub(crate) fn note_submission_pending(&mut self, submission: &NativeComposerSubmission) {
         let native_leases = submission
             .submitted_leases()
             .iter()
             .map(|lease| (lease.native, lease.range.clone()))
             .collect::<Vec<_>>();
-        self.note_submission_accepted_by_native(
+        self.note_submission_pending_by_native(
             submission.thread_id(),
             submission.submission_id(),
             submission.submitted_text_arc(),
             &native_leases,
         );
+    }
+
+    pub(crate) fn note_submission_committed(&mut self, submission: &NativeComposerSubmission) {
+        self.note_submission_committed_id(submission.thread_id(), submission.submission_id());
+    }
+
+    pub(crate) fn note_submission_abandoned(&mut self, submission: &NativeComposerSubmission) {
+        self.note_submission_abandoned_id(submission.thread_id(), submission.submission_id());
     }
 }
 
@@ -890,7 +987,6 @@ fn mechanical_correction_context(
     const CONTEXT_TOKENS: usize = 6;
     const OLD_SNIPPET_MAX_CHARS: usize = 640;
     const MAX_HUNK_LITERAL_BYTES: usize = 16 * 1024;
-    const MAX_CONTEXT_BYTES: usize = 48 * 1024;
 
     let mut config = TextDiff::configure();
     config.timeout(Duration::from_millis(100));
@@ -947,8 +1043,9 @@ fn mechanical_correction_context(
         "Automated mechanical transcription correction (application context, not a user \
          message).\nTarget: the same-thread user submission acknowledged under internal receipt \
          koenig-composer-{submission_id}, specifically Koenig-owned submitted-message bytes \
-         {}..{}. The receipt is audit metadata; the byte coordinates and exact old text are \
-         authoritative. Do not alter text outside that owned range.\nTreat only the exact \
+         {}..{}. The model-visible Application receipt immediately preceding that user message \
+         identifies the target; the byte coordinates and exact old text identify its owned \
+         range. Do not alter text outside that owned range.\nTreat only the exact \
          replacements below as corrections to the prior message. The receiving agent may discern \
          their semantic impact; Koenig asserts no edit beyond the enumerated mechanical \
          replacements.",
@@ -996,12 +1093,18 @@ fn mechanical_correction_context(
                 occurrence = occurrence.expect("non-empty old text has an occurrence"),
             ));
         }
-        if rendered.len() > MAX_CONTEXT_BYTES {
+        if truncate_middle_with_token_budget(&rendered, MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS)
+            .1
+            .is_some()
+        {
             return None;
         }
     }
 
-    Some(rendered)
+    truncate_middle_with_token_budget(&rendered, MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS)
+        .1
+        .is_none()
+        .then_some(rendered)
 }
 
 fn common_affix_hunk<'a>(old: &'a str, new: &'a str) -> (usize, &'a str, &'a str) {
@@ -1291,6 +1394,7 @@ enum WireResult {
         lease_id: Uuid,
     },
     Verified,
+    SubmissionPending,
     SubmittedIntact,
     Kept,
     Replaced,

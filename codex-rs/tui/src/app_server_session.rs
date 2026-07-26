@@ -790,6 +790,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         client_user_message_id: Option<String>,
+        application_receipt: Option<(String, String)>,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -815,7 +816,15 @@ impl AppServerSession {
                     client_user_message_id,
                     input: items,
                     responsesapi_client_metadata: None,
-                    additional_context: None,
+                    additional_context: application_receipt.map(|(key, value)| {
+                        HashMap::from([(
+                            key,
+                            AdditionalContextEntry {
+                                value,
+                                kind: AdditionalContextKind::Application,
+                            },
+                        )])
+                    }),
                     environments: None,
                     cwd: Some(cwd),
                     runtime_workspace_roots: Some(workspace_roots.to_vec()),
@@ -868,6 +877,7 @@ impl AppServerSession {
         thread_id: ThreadId,
         turn_id: String,
         client_user_message_id: Option<String>,
+        application_receipt: Option<(String, String)>,
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
@@ -879,7 +889,15 @@ impl AppServerSession {
                     client_user_message_id,
                     input: items,
                     responsesapi_client_metadata: None,
-                    additional_context: None,
+                    additional_context: application_receipt.map(|(key, value)| {
+                        HashMap::from([(
+                            key,
+                            AdditionalContextEntry {
+                                value,
+                                kind: AdditionalContextKind::Application,
+                            },
+                        )])
+                    }),
                     expected_turn_id: turn_id,
                 },
             })

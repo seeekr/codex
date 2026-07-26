@@ -247,6 +247,18 @@ enum ThreadInteractiveRequest {
     McpServerElicitation(McpServerElicitationFormRequest),
 }
 
+struct PendingComposerSubmissionCommit {
+    submission: NativeComposerSubmission,
+    turn_id: String,
+}
+
+enum ComposerSubmissionTransition {
+    Pending(NativeComposerSubmission),
+    Committed(NativeComposerSubmission),
+    Abandoned(NativeComposerSubmission),
+    InvalidateThread(String),
+}
+
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
 ///
 /// Only `ItemStarted` and `ItemCompleted` notifications with a `CollabAgentToolCall` item carry
@@ -580,9 +592,12 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
-    /// Content-opaque composer receipts acknowledged by app-server. The outer UI loop drains this
-    /// into the native composer-control state after each serialized app event.
-    accepted_composer_submissions: VecDeque<NativeComposerSubmission>,
+    /// Content-opaque composer submissions accepted into an app-server turn but not yet observed
+    /// as committed user messages.
+    pending_composer_submissions: HashMap<String, PendingComposerSubmissionCommit>,
+    /// Serialized lifecycle transitions drained into native composer-control state after each UI
+    /// event.
+    composer_submission_transitions: VecDeque<ComposerSubmissionTransition>,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -1072,7 +1087,8 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
-            accepted_composer_submissions: VecDeque::new(),
+            pending_composer_submissions: HashMap::new(),
+            composer_submission_transitions: VecDeque::new(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
@@ -1244,8 +1260,21 @@ See the Codex keymap documentation for supported actions and examples."
                         AppRunControl::Continue
                     }
                 };
-                for submission in app.accepted_composer_submissions.drain(..) {
-                    composer_control_state.note_submission_accepted(&submission);
+                for transition in app.composer_submission_transitions.drain(..) {
+                    match transition {
+                        ComposerSubmissionTransition::Pending(submission) => {
+                            composer_control_state.note_submission_pending(&submission);
+                        }
+                        ComposerSubmissionTransition::Committed(submission) => {
+                            composer_control_state.note_submission_committed(&submission);
+                        }
+                        ComposerSubmissionTransition::Abandoned(submission) => {
+                            composer_control_state.note_submission_abandoned(&submission);
+                        }
+                        ComposerSubmissionTransition::InvalidateThread(thread_id) => {
+                            composer_control_state.invalidate_thread(&thread_id);
+                        }
+                    }
                 }
                 if App::should_stop_waiting_for_initial_session(
                     waiting_for_initial_session_configured,

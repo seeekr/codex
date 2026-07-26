@@ -10154,7 +10154,11 @@ async fn steer_input_accepts_application_context_without_user_input() {
     assert_eq!(turn_id, tc.sub_id);
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::ResponseItem(ResponseItem::Message {
+        vec![TurnInput::CommittedApplicationContext]
+    );
+    assert_eq!(
+        strip_metadata_from_items(sess.clone_history().await.raw_items()),
+        vec![ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -10164,8 +10168,129 @@ async fn steer_input_accepts_application_context_without_user_input() {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        })]
+        }]
     );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    assert!(
+        matches!(
+            strip_metadata_from_items(sess.clone_history().await.raw_items()).first(),
+            Some(ResponseItem::Message {
+                role,
+                content,
+                ..
+            }) if role == "developer"
+                && content == &[ContentItem::InputText {
+                    text: "<koenig_correction_test>replace parakeat with \
+                           Parakeet</koenig_correction_test>"
+                        .to_string(),
+                }]
+        ),
+        "accepted Application context must survive an immediate interrupt"
+    );
+}
+
+#[tokio::test]
+async fn application_context_receipts_are_idempotent_and_conflicts_fail() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+    let context = BTreeMap::from([(
+        "koenig_correction_idempotent".to_string(),
+        AdditionalContextEntry {
+            value: "replace first".to_string(),
+            kind: AdditionalContextKind::Application,
+        },
+    )]);
+
+    for _ in 0..2 {
+        sess.steer_input(
+            Vec::new(),
+            context.clone(),
+            Some(&tc.sub_id),
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect("same receipt and value is idempotent");
+    }
+    assert_eq!(
+        sess.clone_history().await.raw_items().len(),
+        1,
+        "an idempotent retry must not duplicate model-visible context"
+    );
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::CommittedApplicationContext],
+        "an idempotent retry must not queue a second wake marker"
+    );
+
+    let err = sess
+        .steer_input(
+            Vec::new(),
+            BTreeMap::from([(
+                "koenig_correction_idempotent".to_string(),
+                AdditionalContextEntry {
+                    value: "different correction".to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            )]),
+            Some(&tc.sub_id),
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect_err("same receipt with a different value must conflict");
+    assert_eq!(
+        err,
+        SteerInputError::ApplicationContextReceiptConflict {
+            key: "koenig_correction_idempotent".to_string(),
+        }
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn context_only_steer_rejects_non_application_context() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let err = sess
+        .steer_input(
+            Vec::new(),
+            BTreeMap::from([(
+                "untrusted_context".to_string(),
+                AdditionalContextEntry {
+                    value: "must not become a context-only steer".to_string(),
+                    kind: AdditionalContextKind::Untrusted,
+                },
+            )]),
+            Some(&tc.sub_id),
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect_err("context-only steering is reserved for Application context");
+
+    assert_eq!(err, SteerInputError::EmptyInput);
+    assert!(sess.clone_history().await.raw_items().is_empty());
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]

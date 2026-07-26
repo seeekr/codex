@@ -171,7 +171,7 @@ fn insert<L: Copy + Eq, T: ComposerControlTarget<Lease = L>>(
     }
 }
 
-fn mark_submitted(
+fn mark_submission_pending(
     state: &mut ComposerControlState<u64>,
     target: &FakeTarget,
     lease_ids: &[Uuid],
@@ -194,12 +194,22 @@ fn mark_submitted(
         })
         .collect::<Vec<_>>();
     let submission_id = Uuid::new_v4();
-    state.note_submission_accepted_by_native(
+    state.note_submission_pending_by_native(
         "synthetic-thread",
         submission_id,
         Arc::from(target.text.as_str()),
         &native_leases,
     );
+    submission_id
+}
+
+fn mark_submitted(
+    state: &mut ComposerControlState<u64>,
+    target: &FakeTarget,
+    lease_ids: &[Uuid],
+) -> Uuid {
+    let submission_id = mark_submission_pending(state, target, lease_ids);
+    state.note_submission_committed_id("synthetic-thread", submission_id);
     submission_id
 }
 
@@ -441,6 +451,96 @@ fn accepted_submission_survives_composer_clear_for_verify_and_keep() {
 }
 
 #[test]
+fn submission_stays_pending_until_matching_user_message_commit() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
+    let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "parakeat".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionPending
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "parakeat".to_string(),
+                replacement: "Parakeet".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::SubmissionPending)
+    ));
+
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "parakeat".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmittedIntact
+    ));
+}
+
+#[test]
+fn abandoned_submission_and_rollback_invalidate_owned_state() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let first_capture = capture(&mut state, &mut target);
+    let first_lease = insert(&mut state, &mut target, first_capture, "first");
+    let submission_id = mark_submission_pending(&mut state, &target, &[first_lease]);
+    state.note_submission_abandoned_id("synthetic-thread", submission_id);
+    assert!(!state.leases.contains_key(&first_lease));
+
+    let second_capture = capture(&mut state, &mut target);
+    let second_lease = insert(&mut state, &mut target, second_capture, " second");
+    mark_submitted(&mut state, &target, &[second_lease]);
+    state.invalidate_thread("synthetic-thread");
+    assert!(state.captures.is_empty());
+    assert!(state.leases.is_empty());
+}
+
+#[test]
+fn submission_receipt_is_xml_safe_and_unambiguously_names_the_following_message() {
+    let submission = NativeComposerSubmission::new(
+        "synthetic-thread".to_string(),
+        "owned",
+        vec![SubmittedComposerLease {
+            id: ComposerLeaseId::for_test(1),
+            range: 0..5,
+        }],
+    )
+    .expect("submission");
+    let (key, value) = submission.receipt_context();
+
+    assert!(key.starts_with("koenig_transcription_receipt_"));
+    assert!(!key.contains('/'));
+    assert!(
+        key.chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    );
+    assert!(value.contains(&submission.client_user_message_id()));
+    assert!(value.contains("immediately following user message"));
+}
+
+#[test]
 fn cleared_or_edited_draft_without_acceptance_is_not_submitted() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
@@ -488,7 +588,7 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
     assert!(
         correction
             .context_key
-            .starts_with("koenig_transcription_correction/")
+            .starts_with("koenig_transcription_correction_")
     );
     assert!(
         correction

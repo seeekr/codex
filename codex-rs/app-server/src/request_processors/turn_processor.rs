@@ -941,6 +941,11 @@ impl TurnRequestProcessor {
                             Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
                         )
                     }
+                    SteerInputError::ApplicationContextReceiptConflict { key } => (
+                        format!("application context receipt `{key}` was reused with new content"),
+                        None,
+                        None,
+                    ),
                     SteerInputError::EmptyInput => (
                         "input must not be empty".to_string(),
                         None,

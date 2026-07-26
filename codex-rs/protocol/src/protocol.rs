@@ -520,6 +520,12 @@ pub struct AdditionalContextEntry {
     pub kind: AdditionalContextKind,
 }
 
+/// Maximum lossless value size accepted by the additional-context fragment renderer.
+///
+/// Producers that require exact delivery must reject values that would cross this token budget
+/// rather than relying on the renderer's generic middle-truncation behavior.
+pub const MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS: usize = 1_000;
+
 /// Submission operation
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]

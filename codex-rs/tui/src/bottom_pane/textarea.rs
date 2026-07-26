@@ -36,6 +36,7 @@ use std::ops::Range;
 use textwrap::Options;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use uuid::Uuid;
 
 mod vim;
 use self::vim::VimMode;
@@ -95,12 +96,31 @@ pub(crate) struct TextElementSnapshot {
 /// owned text revokes it, so a later producer correction cannot overwrite user-authored changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
-pub(crate) struct ComposerLeaseId(u64);
+pub(crate) struct ComposerLeaseId {
+    generation: Uuid,
+    sequence: u64,
+}
 
 #[allow(dead_code)]
 impl ComposerLeaseId {
     pub(crate) fn get(self) -> u64 {
-        self.0
+        self.sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sequence: u64) -> Self {
+        Self {
+            generation: Uuid::nil(),
+            sequence,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_sequence(self, sequence: u64) -> Self {
+        Self {
+            generation: self.generation,
+            sequence,
+        }
     }
 }
 
@@ -122,6 +142,7 @@ pub(crate) enum ComposerLeaseError {
 #[derive(Debug)]
 #[allow(dead_code)]
 struct ComposerLeases {
+    generation: Uuid,
     next_id: u64,
     ranges: BTreeMap<ComposerLeaseId, Range<usize>>,
 }
@@ -130,13 +151,17 @@ struct ComposerLeases {
 impl ComposerLeases {
     fn new() -> Self {
         Self {
+            generation: Uuid::new_v4(),
             next_id: 1,
             ranges: BTreeMap::new(),
         }
     }
 
     fn insert(&mut self, range: Range<usize>) -> ComposerLeaseId {
-        let id = ComposerLeaseId(self.next_id);
+        let id = ComposerLeaseId {
+            generation: self.generation,
+            sequence: self.next_id,
+        };
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -2425,7 +2450,7 @@ mod tests {
             Err(ComposerLeaseError::ExpectedTextMismatch)
         );
         assert_eq!(
-            textarea.verify_owned_text(ComposerLeaseId(lease.get() + 1), "fast"),
+            textarea.verify_owned_text(lease.with_sequence(lease.get() + 1), "fast"),
             Err(ComposerLeaseError::LeaseUnavailable)
         );
         assert_eq!(textarea.verify_owned_text(lease, "fast"), Ok(()));
@@ -2435,6 +2460,25 @@ mod tests {
             textarea.verify_owned_text(lease, "fast"),
             Err(ComposerLeaseError::LeaseUnavailable)
         );
+    }
+
+    #[test]
+    fn composer_lease_ids_do_not_alias_across_textarea_generations() {
+        let mut original = TextArea::new();
+        let stale = original.insert_owned_text("same").expect("original lease");
+        let mut reconstructed = TextArea::new();
+        let current = reconstructed
+            .insert_owned_text("same")
+            .expect("reconstructed lease");
+
+        assert_eq!(stale.get(), 1);
+        assert_eq!(current.get(), 1);
+        assert_ne!(stale, current);
+        assert_eq!(
+            reconstructed.verify_owned_text(stale, "same"),
+            Err(ComposerLeaseError::LeaseUnavailable)
+        );
+        assert_eq!(reconstructed.verify_owned_text(current, "same"), Ok(()));
     }
 
     #[test]
