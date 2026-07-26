@@ -197,6 +197,7 @@ impl TurnRequestProcessor {
         let status = thread
             .commit_correction(
                 params.correction_id,
+                params.expected_client_user_message_id,
                 params.payload,
                 self.request_trace_context(request_id).await,
             )
@@ -210,9 +211,7 @@ impl TurnRequestProcessor {
                 error
             })?;
         let status = match status {
-            codex_core::CorrectionCommitStatus::Committed => {
-                ThreadCorrectionCommitStatus::Committed
-            }
+            codex_core::CorrectionCommitStatus::Queued => ThreadCorrectionCommitStatus::Queued,
             codex_core::CorrectionCommitStatus::AlreadyCommitted => {
                 ThreadCorrectionCommitStatus::AlreadyCommitted
             }

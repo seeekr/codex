@@ -17,6 +17,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use codex_protocol::protocol::CorrectionIntent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -35,11 +36,16 @@ pub(crate) struct SessionState {
     pub(crate) correction_receipts: BTreeMap<String, ResponseItem>,
     /// Stable IDs that appeared with more than one canonical payload in surviving rollout state.
     pub(crate) correction_receipt_conflicts: HashSet<String>,
-    /// Correction intents retained across an ambiguous append/flush failure in this process.
-    ///
-    /// Retrying the same payload is safe; reusing its ID for different content must stay a
-    /// conflict even when persistence may have written the first frame before returning an error.
-    pub(crate) correction_intents: BTreeMap<String, ResponseItem>,
+    /// Durable correction intents in producer append order, including already materialized ones.
+    pub(crate) correction_intents: Vec<CorrectionIntent>,
+    /// Intent stable IDs known to have completed append and flush in this process or replay.
+    pub(crate) persisted_correction_intent_ids: HashSet<String>,
+    /// Correction stable IDs durably included in a successful normal sampling request.
+    pub(crate) processed_correction_ids: HashSet<String>,
+    /// Client user-message IDs whose durable instruction boundary survives rollback.
+    pub(crate) surviving_client_user_message_ids: HashSet<String>,
+    /// Explicit Stop suppresses correction-only turns until real work resumes the session.
+    pub(crate) correction_auto_start_suppressed: bool,
     /// Settings used by the latest regular user turn, used for turn-to-turn
     /// model/realtime handling on subsequent regular turns (including full-context
     /// reinjection after resume or `/compact`).
@@ -79,7 +85,11 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             correction_receipts: BTreeMap::new(),
             correction_receipt_conflicts: HashSet::new(),
-            correction_intents: BTreeMap::new(),
+            correction_intents: Vec::new(),
+            persisted_correction_intent_ids: HashSet::new(),
+            processed_correction_ids: HashSet::new(),
+            surviving_client_user_message_ids: HashSet::new(),
+            correction_auto_start_suppressed: false,
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             startup_prewarm: None,

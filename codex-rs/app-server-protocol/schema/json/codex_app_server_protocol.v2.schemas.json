@@ -15129,7 +15129,7 @@
     },
     "ThreadCorrectionCommitStatus": {
       "enum": [
-        "committed",
+        "queued",
         "alreadyCommitted"
       ],
       "type": "string"

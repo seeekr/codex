@@ -58,6 +58,9 @@ async fn dispatch_composer_correction_unbounded(
                     params: ThreadCorrectionCommitParams {
                         thread_id: thread_id.to_string(),
                         correction_id: pending.correction_id().to_string(),
+                        expected_client_user_message_id: pending
+                            .expected_client_user_message_id()
+                            .to_string(),
                         payload: pending.payload().to_string(),
                     },
                 })

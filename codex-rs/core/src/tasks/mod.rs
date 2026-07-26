@@ -74,6 +74,7 @@ pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
 pub(crate) struct TaskStartReservation {
     pub(crate) turn_state: Arc<tokio::sync::Mutex<crate::state::TurnState>>,
     startup_done: Arc<TaskPublication>,
+    resumes_real_work: bool,
 }
 
 impl Drop for TaskStartReservation {
@@ -367,6 +368,22 @@ where
 
 impl Session {
     pub(crate) async fn reserve_task_start(&self) -> Option<TaskStartReservation> {
+        self.reserve_task_start_inner(false).await
+    }
+
+    /// Reserves a startup slot tagged to resume user-visible work.
+    ///
+    /// The prior Stop latch remains unchanged until the validated task is
+    /// installed. Stop can therefore wait on a taskless reservation without
+    /// losing a durable latch if startup is released or abandoned.
+    pub(crate) async fn reserve_real_work_start(&self) -> Option<TaskStartReservation> {
+        self.reserve_task_start_inner(true).await
+    }
+
+    async fn reserve_task_start_inner(
+        &self,
+        resumes_real_work: bool,
+    ) -> Option<TaskStartReservation> {
         let mut active = self.active_turn.lock().await;
         if active.as_ref().is_some_and(|active_turn| {
             active_turn.task.is_none()
@@ -385,11 +402,14 @@ impl Session {
             return None;
         }
         let startup_done = Arc::new(TaskPublication::new());
-        let mut active_turn = ActiveTurn::default();
-        active_turn.startup_done = Some(Arc::clone(&startup_done));
+        let active_turn = ActiveTurn {
+            startup_done: Some(Arc::clone(&startup_done)),
+            ..Default::default()
+        };
         let reservation = TaskStartReservation {
             turn_state: Arc::clone(&active_turn.turn_state),
             startup_done,
+            resumes_real_work,
         };
         *active = Some(active_turn);
         Some(reservation)
@@ -426,7 +446,7 @@ impl Session {
         let reservation = loop {
             self.abort_all_tasks(TurnAbortReason::Replaced).await;
             self.clear_connector_selection().await;
-            if let Some(reservation) = self.reserve_task_start().await {
+            if let Some(reservation) = self.reserve_real_work_start().await {
                 break reservation;
             }
         };
@@ -437,7 +457,26 @@ impl Session {
         );
     }
 
-    pub(crate) async fn start_reserved_task<T: SessionTask>(
+    pub(crate) fn start_reserved_task<T: SessionTask>(
+        self: &Arc<Self>,
+        reservation: TaskStartReservation,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> BoxFuture<'static, bool> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session
+                .start_reserved_task_inner(reservation, turn_context, input, task)
+                .await
+        })
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock linearizes task publication with clearing the prior Stop latch"
+    )]
+    async fn start_reserved_task_inner<T: SessionTask>(
         self: &Arc<Self>,
         reservation: TaskStartReservation,
         turn_context: Arc<TurnContext>,
@@ -469,6 +508,11 @@ impl Session {
             .clear_turn(&turn_context.sub_id);
 
         let turn_state = Arc::clone(&reservation.turn_state);
+        let correction_only_turn = !input.is_empty()
+            && input
+                .iter()
+                .all(|item| matches!(item, TurnInput::CommittedCorrection));
+        turn_state.lock().await.correction_only_turn = correction_only_turn;
 
         let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
@@ -557,8 +601,10 @@ impl Session {
                 }
                 if !task_cancellation_token.is_cancelled() {
                     // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
-                        .await;
+                    Box::pin(
+                        sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result),
+                    )
+                    .await;
                 }
                 done_clone.notify_waiters();
             }
@@ -584,20 +630,35 @@ impl Session {
         turn.startup_done = None;
         turn.terminal_done = Some(terminal_done);
         turn.task = Some(running_task);
-        assert!(
-            start_tx.send(()).is_ok(),
-            "newly spawned task must retain its start receiver until publication"
-        );
+        if turn.interrupt_pending {
+            drop(start_tx);
+        } else {
+            if reservation.resumes_real_work {
+                self.allow_correction_auto_start().await;
+            }
+            assert!(
+                start_tx.send(()).is_ok(),
+                "newly spawned task must retain its start receiver until publication"
+            );
+        }
         drop(active);
         reservation.startup_done.publish();
         true
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock keeps the correction-only classification bound to the task whose steering gate is opened"
+    )]
     pub(crate) async fn publish_turn_started_for_steering(&self, turn_id: &str) {
         let mut active = self.active_turn.lock().await;
-        if let Some(task) = active
-            .as_mut()
-            .and_then(|active_turn| active_turn.task.as_mut())
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if active_turn.turn_state.lock().await.correction_only_turn {
+            return;
+        }
+        if let Some(task) = active_turn.task.as_mut()
             && task.turn_context.sub_id == turn_id
         {
             task.accepts_steer = true;
@@ -627,6 +688,56 @@ impl Session {
         done.publish();
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock linearizes terminal publication with correction-only follow-up reservation"
+    )]
+    pub(crate) async fn publish_turn_terminal_and_reserve_correction(
+        &self,
+        done: &Arc<TaskPublication>,
+        should_schedule_correction: bool,
+    ) -> Option<TaskStartReservation> {
+        let (reservation, became_idle) = {
+            let mut active = self.active_turn.lock().await;
+            if !active.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none()
+                    && active_turn
+                        .terminal_done
+                        .as_ref()
+                        .is_some_and(|active_done| Arc::ptr_eq(active_done, done))
+            }) {
+                (None, false)
+            } else if should_schedule_correction
+                && self.correction_auto_start_allowed().await
+                && self.has_pending_corrections().await
+            {
+                let startup_done = Arc::new(TaskPublication::new());
+                let next_turn = ActiveTurn {
+                    interrupt_pending: active
+                        .as_ref()
+                        .is_some_and(|active_turn| active_turn.interrupt_pending),
+                    startup_done: Some(Arc::clone(&startup_done)),
+                    ..Default::default()
+                };
+                let reservation = TaskStartReservation {
+                    turn_state: Arc::clone(&next_turn.turn_state),
+                    startup_done,
+                    resumes_real_work: false,
+                };
+                *active = Some(next_turn);
+                (Some(reservation), false)
+            } else {
+                *active = None;
+                (None, true)
+            }
+        };
+        if became_idle {
+            self.emit_thread_idle_lifecycle_if_idle().await;
+        }
+        done.publish();
+        reservation
+    }
+
     /// Starts a regular turn when the session is idle and pending work is waiting.
     ///
     /// Pending work currently includes mailbox mail marked with `trigger_turn`.
@@ -651,7 +762,7 @@ impl Session {
             return;
         }
 
-        let Some(reservation) = self.reserve_task_start().await else {
+        let Some(reservation) = self.reserve_real_work_start().await else {
             return;
         };
 
@@ -666,12 +777,30 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        self.abort_all_tasks_inner(reason).await;
+    }
+
+    pub(crate) async fn interrupt_all_tasks(self: &Arc<Self>) -> bool {
+        self.abort_all_tasks_inner(TurnAbortReason::Interrupted)
+            .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock makes the Stop latch atomic with taking the running task"
+    )]
+    async fn abort_all_tasks_inner(self: &Arc<Self>, reason: TurnAbortReason) -> bool {
         let (task, turn_state) = loop {
             let (task, turn_state, pending_publication) = {
                 let mut active = self.active_turn.lock().await;
                 match active.as_mut() {
                     Some(active_turn) => match active_turn.task.take() {
-                        Some(task) => (Some(task), Some(Arc::clone(&active_turn.turn_state)), None),
+                        Some(task) => {
+                            if reason == TurnAbortReason::Interrupted {
+                                self.suppress_correction_auto_start().await;
+                            }
+                            (Some(task), Some(Arc::clone(&active_turn.turn_state)), None)
+                        }
                         None => {
                             if let Some(startup) = active_turn.startup_done.as_ref().map(Arc::clone)
                             {
@@ -680,6 +809,7 @@ impl Session {
                                     *active = None;
                                     (None, None, None)
                                 } else {
+                                    active_turn.interrupt_pending = true;
                                     (None, None, Some(notified))
                                 }
                             } else if let Some(terminal) =
@@ -690,6 +820,7 @@ impl Session {
                                     *active = None;
                                     (None, None, None)
                                 } else {
+                                    active_turn.interrupt_pending = true;
                                     (None, None, Some(notified))
                                 }
                             } else {
@@ -708,7 +839,6 @@ impl Session {
             break (task, turn_state);
         };
 
-        let aborted_turn = task.is_some();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         let mut terminal_guard = task
             .as_ref()
@@ -731,11 +861,16 @@ impl Session {
             self.publish_turn_terminal(terminal_guard.done()).await;
             terminal_guard.mark_published();
         }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
+        if reason == TurnAbortReason::Interrupted && turn_context.is_some() {
             self.maybe_start_turn_for_pending_work().await;
         }
+        turn_context.is_some()
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock makes the targeted Stop latch atomic with taking its task"
+    )]
     pub(crate) async fn abort_turn_if_active(
         self: &Arc<Self>,
         turn_id: &str,
@@ -746,14 +881,18 @@ impl Session {
             let Some(active_turn) = active.as_mut() else {
                 return false;
             };
-            if !active_turn
+            if active_turn
                 .task
                 .as_ref()
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
+                .is_none_or(|task| task.turn_context.sub_id != turn_id)
             {
                 return false;
             }
-            (active_turn.task.take(), Arc::clone(&active_turn.turn_state))
+            let task = active_turn.task.take();
+            if task.is_some() && reason == TurnAbortReason::Interrupted {
+                self.suppress_correction_auto_start().await;
+            }
+            (task, Arc::clone(&active_turn.turn_state))
         };
         let Some(task) = task else {
             return false;
@@ -779,11 +918,16 @@ impl Session {
         true
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn lock makes a self-aborted task's Stop latch atomic with terminal ownership"
+    )]
     pub async fn on_task_finished(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) -> bool {
+        let task_succeeded = task_result.is_ok();
         let (last_agent_message, abort_reason) = match task_result {
             Ok(last_agent_message) => (last_agent_message, None),
             Err(CodexErr::TurnAborted) => (None, Some(TurnAbortReason::Interrupted)),
@@ -792,11 +936,14 @@ impl Session {
                 (None, None)
             }
         };
+        let terminal_interrupted = abort_reason
+            .as_ref()
+            .is_some_and(|reason| *reason == TurnAbortReason::Interrupted);
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
-        let turn_state = {
+        let turn_state_and_kind = {
             let mut active = self.active_turn.lock().await;
             active.as_mut().and_then(|active_turn| {
                 let task = active_turn.task.as_mut()?;
@@ -804,22 +951,32 @@ impl Session {
                     return None;
                 }
                 task.accepts_steer = false;
-                Some(Arc::clone(&active_turn.turn_state))
+                Some((Arc::clone(&active_turn.turn_state), task.kind))
             })
         };
-        let Some(turn_state) = turn_state else {
+        let Some((turn_state, task_kind)) = turn_state_and_kind else {
             return false;
         };
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
-        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
+        let (
+            turn_had_memory_citation,
+            turn_tool_calls,
+            token_usage_at_turn_start,
+            correction_only_turn,
+            normal_sampling_attempted,
+            completed_normal_sampling,
+        ) = {
             let ts = turn_state.lock().await;
             (
                 ts.has_memory_citation,
                 ts.tool_calls,
                 ts.token_usage_at_turn_start.clone(),
+                ts.correction_only_turn,
+                ts.normal_sampling_attempted,
+                ts.completed_normal_sampling,
             )
         };
         if !pending_input.is_empty() {
@@ -1008,6 +1165,9 @@ impl Session {
                 active_turn.task = Some(task);
                 return false;
             }
+            if terminal_interrupted {
+                self.suppress_correction_auto_start().await;
+            }
             let terminal_done = Arc::clone(&task.terminal_done);
             task.handle.detach();
             TerminalPublicationGuard::new(terminal_done)
@@ -1025,8 +1185,32 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
-        self.publish_turn_terminal(terminal_guard.done()).await;
+        let should_schedule_correction = task_succeeded
+            && (task_kind != TaskKind::Regular
+                || (!normal_sampling_attempted && !correction_only_turn)
+                || completed_normal_sampling);
+        let correction_reservation = self
+            .publish_turn_terminal_and_reserve_correction(
+                terminal_guard.done(),
+                should_schedule_correction,
+            )
+            .await;
         terminal_guard.mark_published();
+        if let Some(reservation) = correction_reservation {
+            let turn_context = self.new_default_turn().await;
+            self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+            assert!(
+                self.start_reserved_task(
+                    reservation,
+                    turn_context,
+                    vec![TurnInput::CommittedCorrection],
+                    RegularTask::new(),
+                )
+                .await,
+                "terminal-to-correction reservation must remain owned until task publication"
+            );
+        }
         true
     }
 

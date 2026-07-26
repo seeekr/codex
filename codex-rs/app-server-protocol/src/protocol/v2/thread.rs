@@ -1307,6 +1307,8 @@ pub struct ThreadCorrectionCommitParams {
     pub thread_id: String,
     /// Stable producer-generated UUID retained across bounded transport retries.
     pub correction_id: String,
+    /// Exact client user-message ID whose surviving instruction boundary owns the correction.
+    pub expected_client_user_message_id: String,
     /// Exact model-visible correction payload.
     pub payload: String,
 }
@@ -1315,7 +1317,7 @@ pub struct ThreadCorrectionCommitParams {
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadCorrectionCommitStatus {
-    Committed,
+    Queued,
     AlreadyCommitted,
 }
 

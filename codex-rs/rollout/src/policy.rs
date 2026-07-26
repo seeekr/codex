@@ -114,9 +114,13 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::ImageGenerationEnd(_)
         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
 
-        // Correction intents use a compatibility carrier that older Codex builds safely ignore.
-        // Only the typed sentinel shape is durable; ordinary raw events remain transient.
-        EventMsg::RawResponseItem(event) => event.persisted_correction_intent().is_some(),
+        // Correction lifecycle records use compatibility carriers that older Codex builds safely
+        // ignore. Only a single typed sentinel payload is durable; ordinary or ambiguous raw
+        // events remain transient.
+        EventMsg::RawResponseItem(event) => {
+            event.persisted_correction_intent().is_some()
+                || event.persisted_corrections_sampled().is_some()
+        }
 
         // Transient, non-durable events.
         EventMsg::Error(_)
@@ -200,6 +204,7 @@ mod tests {
         let ordinary = EventMsg::RawResponseItem(RawResponseItemEvent {
             item: ResponseItem::Other,
             correction_intent: None,
+            corrections_sampled: None,
         });
         let malformed = EventMsg::RawResponseItem(RawResponseItemEvent {
             item: ResponseItem::Message {
@@ -212,12 +217,25 @@ mod tests {
                 internal_chat_message_metadata_passthrough: None,
             },
             correction_intent: Some(correction_intent()),
+            corrections_sampled: None,
+        });
+        let sampled = EventMsg::RawResponseItem(RawResponseItemEvent::corrections_sampled(vec![
+            "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+        ]));
+        let ambiguous = EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::Other,
+            correction_intent: Some(correction_intent()),
+            corrections_sampled: Some(codex_protocol::protocol::CorrectionsSampled {
+                correction_ids: vec!["b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string()],
+            }),
         });
 
         for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
             assert!(should_persist_event_msg(&valid, history_mode));
+            assert!(should_persist_event_msg(&sampled, history_mode));
             assert!(!should_persist_event_msg(&ordinary, history_mode));
             assert!(!should_persist_event_msg(&malformed, history_mode));
+            assert!(!should_persist_event_msg(&ambiguous, history_mode));
         }
     }
 }

@@ -193,6 +193,18 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
+    pub(crate) async fn remove_committed_correction_markers_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) {
+        turn_state
+            .lock()
+            .await
+            .pending_input
+            .items
+            .retain(|input| !matches!(input, TurnInput::CommittedCorrection));
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"

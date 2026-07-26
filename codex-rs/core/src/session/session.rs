@@ -513,6 +513,7 @@ impl Session {
             session_configuration.collaboration_mode.model(),
             session_configuration.provider
         );
+        let recover_corrections_on_resume = matches!(&initial_history, InitialHistory::Resumed(_));
         let forked_from_id = session_configuration
             .forked_from_thread_id
             .or_else(|| initial_history.forked_from_id());
@@ -1274,6 +1275,9 @@ impl Session {
         match session_result {
             Ok(sess) => {
                 live_thread_init.commit();
+                if recover_corrections_on_resume {
+                    sess.maybe_start_correction_turn_if_idle().await;
+                }
                 Ok(sess)
             }
             Err(err) => {

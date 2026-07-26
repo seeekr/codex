@@ -100,6 +100,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
             internal_chat_message_metadata_passthrough: None,
         },
         correction_intent: None,
+        corrections_sampled: None,
     });
     for id in ["visible-1", "visible-2", "blocked"] {
         tx_events
