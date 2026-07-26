@@ -271,6 +271,8 @@ use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
+use crate::bottom_pane::ComposerLeaseError;
+use crate::bottom_pane::ComposerLeaseId;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
@@ -1752,6 +1754,54 @@ impl ChatWidget {
 
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.bottom_pane.insert_str(text);
+    }
+
+    pub(crate) fn composer_control_available(&self) -> bool {
+        self.thread_id.is_some()
+            && self.bottom_pane.composer_input_enabled()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && !self.bottom_pane.is_in_paste_burst()
+            && !self.bottom_pane.composer_has_pending_pastes()
+    }
+
+    pub(crate) fn composer_text(&self) -> String {
+        self.bottom_pane.composer_text()
+    }
+
+    pub(crate) fn composer_cursor(&self) -> usize {
+        self.bottom_pane.composer_cursor()
+    }
+
+    pub(crate) fn insert_composer_owned_text(
+        &mut self,
+        text: &str,
+    ) -> Result<ComposerLeaseId, ComposerLeaseError> {
+        self.bottom_pane.insert_composer_owned_text(text)
+    }
+
+    pub(crate) fn verify_composer_owned_text(
+        &self,
+        lease: ComposerLeaseId,
+        expected: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.bottom_pane.verify_composer_owned_text(lease, expected)
+    }
+
+    pub(crate) fn keep_composer_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+    ) -> Result<(), ComposerLeaseError> {
+        self.bottom_pane.keep_composer_owned_text(lease)
+    }
+
+    pub(crate) fn replace_composer_owned_text(
+        &mut self,
+        lease: ComposerLeaseId,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<(), ComposerLeaseError> {
+        self.bottom_pane
+            .replace_composer_owned_text(lease, expected, replacement)
     }
 
     /// Replace the composer content with the provided text and reset cursor.
