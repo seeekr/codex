@@ -21,6 +21,8 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::composer_control::NativeComposerSubmission;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) enum AppCommand {
@@ -44,6 +46,8 @@ pub(crate) enum AppCommand {
         final_output_json_schema: Option<Value>,
         collaboration_mode: Option<CollaborationMode>,
         personality: Option<Personality>,
+        #[serde(skip)]
+        composer_submission: Option<NativeComposerSubmission>,
     },
     OverrideTurnContext {
         cwd: Option<PathBuf>,
@@ -158,7 +162,22 @@ impl AppCommand {
             final_output_json_schema,
             collaboration_mode,
             personality,
+            composer_submission: None,
         }
+    }
+
+    pub(crate) fn with_composer_submission(
+        mut self,
+        submission: Option<NativeComposerSubmission>,
+    ) -> Self {
+        if let Self::UserTurn {
+            composer_submission,
+            ..
+        } = &mut self
+        {
+            *composer_submission = submission;
+        }
+        self
     }
 
     #[allow(clippy::too_many_arguments)]

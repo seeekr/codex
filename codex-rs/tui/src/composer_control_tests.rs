@@ -138,7 +138,7 @@ impl ComposerControlTarget for FakeTarget {
     }
 }
 
-fn capture<L: Copy, T: ComposerControlTarget<Lease = L>>(
+fn capture<L: Copy + Eq, T: ComposerControlTarget<Lease = L>>(
     state: &mut ComposerControlState<L>,
     target: &mut T,
 ) -> Uuid {
@@ -152,7 +152,7 @@ fn capture<L: Copy, T: ComposerControlTarget<Lease = L>>(
     }
 }
 
-fn insert<L: Copy, T: ComposerControlTarget<Lease = L>>(
+fn insert<L: Copy + Eq, T: ComposerControlTarget<Lease = L>>(
     state: &mut ComposerControlState<L>,
     target: &mut T,
     capture_id: Uuid,
@@ -168,6 +168,59 @@ fn insert<L: Copy, T: ComposerControlTarget<Lease = L>>(
     ) {
         WireResult::Inserted { lease_id } => lease_id,
         _ => panic!("synthetic insert should succeed"),
+    }
+}
+
+fn mark_submitted(
+    state: &mut ComposerControlState<u64>,
+    target: &FakeTarget,
+    lease_ids: &[Uuid],
+) -> Uuid {
+    let native_leases = lease_ids
+        .iter()
+        .map(|lease_id| {
+            let lease = state.leases.get(lease_id).expect("external lease");
+            match lease.state {
+                ExternalLeaseState::Draft { native } => (
+                    native,
+                    target
+                        .leases
+                        .get(&native)
+                        .expect("native lease range")
+                        .clone(),
+                ),
+                _ => panic!("lease should still be draft-owned"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let submission_id = Uuid::new_v4();
+    state.note_submission_accepted_by_native(
+        "synthetic-thread",
+        submission_id,
+        Arc::from(target.text.as_str()),
+        &native_leases,
+    );
+    submission_id
+}
+
+fn pending_correction(
+    state: &mut ComposerControlState<u64>,
+    target: &mut FakeTarget,
+    lease_id: Uuid,
+    expected: &str,
+    replacement: &str,
+) -> PreparedCorrection {
+    match state.prepare_command(
+        ComposerCommand::Replace {
+            lease_id,
+            expected: expected.to_string(),
+            replacement: replacement.to_string(),
+        },
+        target,
+        /*app_overlay_active*/ false,
+    ) {
+        CommandExecution::Correct(correction) => correction,
+        CommandExecution::Complete(_) => panic!("submitted replacement should dispatch correction"),
     }
 }
 
@@ -299,6 +352,440 @@ fn capture_compare_and_swap_rejects_intervening_input_and_snapshot_changes() {
             ..
         }
     ));
+}
+
+#[test]
+fn captures_rebase_only_across_acknowledged_native_mutations() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("draft");
+
+    let capture_a = capture(&mut state, &mut target);
+    let capture_b = capture(&mut state, &mut target);
+    let lease_a = insert(&mut state, &mut target, capture_a, " A");
+    let lease_b = insert(&mut state, &mut target, capture_b, " B");
+    assert_eq!(target.text, "draft A B");
+
+    let capture_c = capture(&mut state, &mut target);
+    let capture_d = capture(&mut state, &mut target);
+    let lease_c = insert(&mut state, &mut target, capture_c, " C");
+    state.note_tui_event(&TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Insert {
+                capture_id: capture_d,
+                text: " D".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            outcome: MutationOutcome::NotApplied,
+        }
+    ));
+
+    let capture_e = capture(&mut state, &mut target);
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Replace {
+                lease_id: lease_c,
+                expected: " C".to_string(),
+                replacement: " corrected C".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Replaced
+    ));
+    let _lease_e = insert(&mut state, &mut target, capture_e, " E");
+    assert_eq!(target.text, "draft A B corrected C E");
+
+    assert!(state.leases.contains_key(&lease_a));
+    assert!(state.leases.contains_key(&lease_b));
+}
+
+#[test]
+fn accepted_submission_survives_composer_clear_for_verify_and_keep() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "transcribed");
+    mark_submitted(&mut state, &target, &[lease_id]);
+
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "transcribed".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmittedIntact
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Kept
+    ));
+    assert!(target.text.is_empty());
+}
+
+#[test]
+fn cleared_or_edited_draft_without_acceptance_is_not_submitted() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "transcribed");
+
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "transcribed".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        }
+    ));
+}
+
+#[test]
+fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "parakeat result");
+    let submission_id = mark_submitted(&mut state, &target, &[lease_id]);
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+
+    let correction = pending_correction(
+        &mut state,
+        &mut target,
+        lease_id,
+        "parakeat result",
+        "Parakeet result",
+    );
+    assert_eq!(correction.thread_id, "synthetic-thread");
+    assert!(
+        correction
+            .context_key
+            .starts_with("koenig_transcription_correction/")
+    );
+    assert!(
+        correction
+            .context_value
+            .contains(&format!("koenig-composer-{submission_id}"))
+    );
+    assert!(
+        correction
+            .context_value
+            .contains("application context, not a user message")
+    );
+
+    let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+    state.finish_correction(
+        PendingComposerCorrection {
+            lease_id: correction.lease_id,
+            thread_id: correction.thread_id,
+            context_key: correction.context_key,
+            context_value: correction.context_value,
+            reply,
+        },
+        CorrectionDispatchOutcome::Acknowledged,
+    );
+    assert!(matches!(
+        reply_rx.recv().expect("correction reply"),
+        WireResult::Corrected
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "parakeat result".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn submitted_correction_known_rejection_is_retryable_but_ack_loss_is_terminal() {
+    for (outcome, expected_outcome, remains_submitted) in [
+        (
+            CorrectionDispatchOutcome::NotApplied,
+            MutationOutcome::NotApplied,
+            true,
+        ),
+        (
+            CorrectionDispatchOutcome::Unknown,
+            MutationOutcome::Unknown,
+            false,
+        ),
+    ] {
+        let mut state = ComposerControlState::<u64>::new();
+        let mut target = FakeTarget::new("");
+        let capture_id = capture(&mut state, &mut target);
+        let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
+        mark_submitted(&mut state, &target, &[lease_id]);
+        target.text.clear();
+        target.cursor = 0;
+        target.leases.clear();
+        let correction =
+            pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
+        let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+        state.finish_correction(
+            PendingComposerCorrection {
+                lease_id: correction.lease_id,
+                thread_id: correction.thread_id,
+                context_key: correction.context_key,
+                context_value: correction.context_value,
+                reply,
+            },
+            outcome,
+        );
+        assert!(matches!(
+            reply_rx.recv().expect("correction reply"),
+            WireResult::Error {
+                code: ErrorCode::CorrectionUnavailable,
+                outcome,
+            } if std::mem::discriminant(&outcome) == std::mem::discriminant(&expected_outcome)
+        ));
+        let verify = state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "parakeat".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        );
+        if remains_submitted {
+            assert!(matches!(verify, WireResult::SubmittedIntact));
+        } else {
+            assert!(matches!(
+                verify,
+                WireResult::Error {
+                    code: ErrorCode::LeaseUnavailable,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+fn submitted_replace_rejects_wrong_thread_without_effect() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
+    mark_submitted(&mut state, &target, &[lease_id]);
+    target.thread_id = "different-thread".to_string();
+    target.text.clear();
+    target.cursor = 0;
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "parakeat".to_string(),
+                replacement: "Parakeet".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::ComposerUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+}
+
+#[test]
+fn submitted_locator_is_global_and_never_claims_unowned_prefix_suffix_or_other_lease() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("prefix parakeat | ");
+    let first_capture = capture(&mut state, &mut target);
+    let first_lease = insert(&mut state, &mut target, first_capture, "parakeat");
+    target.user_insert(target.text.len(), " | middle parakeat | ");
+    let second_capture = capture(&mut state, &mut target);
+    let second_lease = insert(&mut state, &mut target, second_capture, "parakeat");
+    target.user_insert(target.text.len(), " | suffix");
+
+    let submitted_text = target.text.clone();
+    let first_native = match state.leases[&first_lease].state {
+        ExternalLeaseState::Draft { native } => native,
+        _ => unreachable!(),
+    };
+    let second_native = match state.leases[&second_lease].state {
+        ExternalLeaseState::Draft { native } => native,
+        _ => unreachable!(),
+    };
+    let first_range = target.leases[&first_native].clone();
+    let second_range = target.leases[&second_native].clone();
+    mark_submitted(&mut state, &target, &[first_lease, second_lease]);
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+
+    let first = pending_correction(&mut state, &mut target, first_lease, "parakeat", "Parakeet");
+    let second = pending_correction(
+        &mut state,
+        &mut target,
+        second_lease,
+        "parakeat",
+        "Parakeet",
+    );
+    assert!(first.context_value.contains(&format!(
+        "Koenig-owned submitted-message bytes {}..{}",
+        first_range.start, first_range.end
+    )));
+    assert!(first.context_value.contains(&format!(
+        "Hunk 1: old bytes {}..{}",
+        first_range.start, first_range.end
+    )));
+    assert!(second.context_value.contains(&format!(
+        "Koenig-owned submitted-message bytes {}..{}",
+        second_range.start, second_range.end
+    )));
+    assert!(second.context_value.contains("occurrence 4"));
+    assert!(!first.context_value.contains("prefix parakeat"));
+    assert!(!first.context_value.contains("| suffix"));
+    assert_eq!(
+        submitted_text.get(first_range),
+        Some("parakeat"),
+        "first locator must resolve only the first Koenig-owned lease"
+    );
+    assert_eq!(
+        submitted_text.get(second_range),
+        Some("parakeat"),
+        "second locator must resolve only the second Koenig-owned lease"
+    );
+}
+
+#[test]
+fn correction_hunks_are_compact_unique_and_deterministically_located() {
+    let repeated_prefix = (0..14)
+        .map(|index| format!("before{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let repeated_suffix = (0..14)
+        .map(|index| format!("after{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let segment = format!("{repeated_prefix} parakeat {repeated_suffix}");
+    let expected_repeated = format!("{segment} | {segment} | {segment}");
+    let second_error_start = expected_repeated
+        .match_indices("parakeat")
+        .nth(1)
+        .map(|(position, _)| position)
+        .expect("second repeated error");
+    let mut replacement_repeated = expected_repeated.clone();
+    replacement_repeated.replace_range(
+        second_error_start..second_error_start + "parakeat".len(),
+        "Parakeet",
+    );
+    let repeated_context = mechanical_correction_context(
+        Uuid::new_v4(),
+        &expected_repeated,
+        0..expected_repeated.len(),
+        &expected_repeated,
+        &replacement_repeated,
+    )
+    .expect("bounded repeated correction context");
+    assert!(
+        repeated_context.contains("occurrence 2"),
+        "{repeated_context}"
+    );
+
+    let filler = (0..80)
+        .map(|index| format!("filler{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected = format!("start parakeat {filler} second eror end");
+    let replacement = format!("start Parakeet {filler} second error end");
+    let first = mechanical_correction_context(
+        Uuid::new_v4(),
+        &expected,
+        0..expected.len(),
+        &expected,
+        &replacement,
+    )
+    .expect("bounded multi-hunk correction context");
+    let second = mechanical_correction_context(
+        Uuid::new_v4(),
+        &expected,
+        0..expected.len(),
+        &expected,
+        &replacement,
+    )
+    .expect("bounded multi-hunk correction context");
+    assert!(first.contains("Hunk 1:"));
+    assert!(first.contains("Hunk 2:"));
+    assert!(!first.contains(&filler));
+    assert_ne!(
+        first.lines().find(|line| line.contains("koenig-composer-")),
+        second
+            .lines()
+            .find(|line| line.contains("koenig-composer-"))
+    );
+}
+
+#[test]
+fn long_correction_context_uses_only_the_changed_core_or_fails_closed() {
+    let shared_prefix = "unchanged context ".repeat(30_000);
+    let expected = format!("{shared_prefix}late parakeat tail");
+    let replacement = format!("{shared_prefix}late Parakeet tail");
+    let context = mechanical_correction_context(
+        Uuid::new_v4(),
+        &expected,
+        0..expected.len(),
+        &expected,
+        &replacement,
+    )
+    .expect("a tiny correction in a long submission remains representable");
+
+    assert!(context.len() < 4_096, "context was {} bytes", context.len());
+    assert!(context.contains("parakeat"));
+    assert!(context.contains("Parakeet"));
+    assert!(!context.contains(&"unchanged context ".repeat(100)));
+
+    let oversized_old = "a".repeat(20_000);
+    let oversized_new = "b".repeat(20_000);
+    assert!(
+        mechanical_correction_context(
+            Uuid::new_v4(),
+            &oversized_old,
+            0..oversized_old.len(),
+            &oversized_old,
+            &oversized_new,
+        )
+        .is_none(),
+        "an unbounded changed core must be rejected instead of reproduced"
+    );
 }
 
 #[test]

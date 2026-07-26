@@ -20,6 +20,8 @@ use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AdditionalContextEntry;
+use codex_app_server_protocol::AdditionalContextKind;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
@@ -787,6 +789,7 @@ impl AppServerSession {
     pub(crate) async fn turn_start(
         &mut self,
         thread_id: ThreadId,
+        client_user_message_id: Option<String>,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -809,7 +812,7 @@ impl AppServerSession {
                 request_id,
                 params: TurnStartParams {
                     thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
+                    client_user_message_id,
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
@@ -864,6 +867,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         turn_id: String,
+        client_user_message_id: Option<String>,
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
@@ -872,10 +876,65 @@ impl AppServerSession {
                 request_id,
                 params: TurnSteerParams {
                     thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
+                    client_user_message_id,
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
+                    expected_turn_id: turn_id,
+                },
+            })
+            .await
+    }
+
+    pub(crate) async fn turn_start_application_context(
+        &mut self,
+        thread_id: ThreadId,
+        context_key: String,
+        context_value: String,
+    ) -> std::result::Result<TurnStartResponse, TypedRequestError> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::TurnStart {
+                request_id,
+                params: TurnStartParams {
+                    thread_id: thread_id.to_string(),
+                    input: Vec::new(),
+                    additional_context: Some(HashMap::from([(
+                        context_key,
+                        AdditionalContextEntry {
+                            value: context_value,
+                            kind: AdditionalContextKind::Application,
+                        },
+                    )])),
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+    }
+
+    pub(crate) async fn turn_steer_application_context(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: String,
+        context_key: String,
+        context_value: String,
+    ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::TurnSteer {
+                request_id,
+                params: TurnSteerParams {
+                    thread_id: thread_id.to_string(),
+                    client_user_message_id: None,
+                    input: Vec::new(),
+                    responsesapi_client_metadata: None,
+                    additional_context: Some(HashMap::from([(
+                        context_key,
+                        AdditionalContextEntry {
+                            value: context_value,
+                            kind: AdditionalContextKind::Application,
+                        },
+                    )])),
                     expected_turn_id: turn_id,
                 },
             })

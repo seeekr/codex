@@ -3912,14 +3912,13 @@ impl Session {
             }
         }
 
-        if input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
-        }
-
         let additional_context_input = {
             let mut state = self.state.lock().await;
             state.additional_context.merge(additional_context)
         };
+        if input.is_empty() && additional_context_input.is_empty() {
+            return Err(SteerInputError::EmptyInput);
+        }
 
         if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
             active_task
@@ -3933,10 +3932,12 @@ impl Session {
             .map(ResponseItem::from)
             .map(TurnInput::ResponseItem)
             .collect::<Vec<_>>();
-        pending_input.push(TurnInput::UserInput {
-            content: input,
-            client_id: client_user_message_id,
-        });
+        if !input.is_empty() {
+            pending_input.push(TurnInput::UserInput {
+                content: input,
+                client_id: client_user_message_id,
+            });
+        }
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 active_turn.turn_state.as_ref(),

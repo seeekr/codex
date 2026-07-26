@@ -210,6 +210,8 @@ use super::skill_popup::SkillPopup;
 use super::slash_commands::BuiltinCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandItem;
+use super::textarea::ComposerLeaseId;
+use super::textarea::SubmittedComposerLease;
 use crate::bottom_pane::paste_burst::FlushResult;
 use crate::history_cell::sanitize_user_text;
 use crate::key_hint::KeyBindingListExt;
@@ -252,7 +254,6 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::ComposerLeaseError;
-use crate::bottom_pane::textarea::ComposerLeaseId;
 use crate::bottom_pane::textarea::TextArea;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
@@ -294,12 +295,14 @@ pub enum InputResult {
     Submitted {
         text: String,
         text_elements: Vec<TextElement>,
+        composer_leases: Vec<SubmittedComposerLease>,
     },
     Queued {
         text: String,
         text_elements: Vec<TextElement>,
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
+        composer_leases: Vec<SubmittedComposerLease>,
     },
     /// A bare slash command parsed by the composer.
     ///
@@ -1501,6 +1504,10 @@ impl ChatComposer {
 
     pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         std::mem::take(&mut self.draft.recent_submission_mention_bindings)
+    }
+
+    pub(crate) fn take_recent_submission_composer_leases(&mut self) -> Vec<SubmittedComposerLease> {
+        std::mem::take(&mut self.draft.recent_submission_composer_leases)
     }
 
     /// Commit the staged slash-command draft to local Up-arrow recall.
@@ -2753,9 +2760,27 @@ impl ChatComposer {
         let original_mention_bindings = self.snapshot_mention_bindings();
         let original_local_image_paths = self.attachments.local_image_paths();
         let original_pending_pastes = self.draft.pending_pastes.clone();
+        let composer_lease_snapshots = if original_pending_pastes.is_empty() {
+            let canonical_shift = usize::from(self.draft.is_bash_mode);
+            self.draft
+                .textarea
+                .composer_lease_snapshots()
+                .into_iter()
+                .map(|(id, range)| {
+                    (
+                        id,
+                        range.start.saturating_add(canonical_shift)
+                            ..range.end.saturating_add(canonical_shift),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut text_elements = original_text_elements.clone();
         let input_starts_with_space = original_input.starts_with(' ');
         self.draft.recent_submission_mention_bindings.clear();
+        self.draft.recent_submission_composer_leases.clear();
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
 
@@ -2772,6 +2797,8 @@ impl ChatComposer {
         let expanded_input = text.clone();
 
         // If there is neither text nor attachments, suppress submission entirely.
+        let trim_start = expanded_input.len() - expanded_input.trim_start().len();
+        let trim_end = expanded_input.trim_end().len();
         text = text.trim().to_string();
         text_elements = Self::trim_text_elements(&expanded_input, &text, text_elements);
 
@@ -2823,6 +2850,17 @@ impl ChatComposer {
             return None;
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
+        self.draft.recent_submission_composer_leases = composer_lease_snapshots
+            .into_iter()
+            .filter_map(|(id, range)| {
+                (range.start >= trim_start && range.end <= trim_end).then(|| {
+                    SubmittedComposerLease {
+                        id,
+                        range: range.start - trim_start..range.end - trim_start,
+                    }
+                })
+            })
+            .collect();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
             self.history.record_local_submission(HistoryEntry {
                 text: text.clone(),
@@ -2902,6 +2940,7 @@ impl ChatComposer {
                         text_elements,
                         action,
                         pending_pastes,
+                        composer_leases: self.take_recent_submission_composer_leases(),
                     },
                     true,
                 );
@@ -2974,6 +3013,7 @@ impl ChatComposer {
                         text_elements,
                         action: QueuedInputAction::Plain,
                         pending_pastes: Vec::new(),
+                        composer_leases: self.take_recent_submission_composer_leases(),
                     },
                     true,
                 )
@@ -2984,6 +3024,7 @@ impl ChatComposer {
                     InputResult::Submitted {
                         text,
                         text_elements,
+                        composer_leases: self.take_recent_submission_composer_leases(),
                     },
                     true,
                 )
@@ -4652,6 +4693,45 @@ mod tests {
     }
 
     #[test]
+    fn submission_reports_trim_adjusted_ranges_for_each_owned_lease() {
+        let (mut composer, _rx) = new_test_composer();
+        composer
+            .draft
+            .textarea
+            .set_text_clearing_elements("  prefix ");
+        composer.draft.textarea.set_cursor("  prefix ".len());
+        let first = composer
+            .insert_owned_text("parakeat")
+            .expect("first owned insertion");
+        composer.draft.textarea.insert_str(" unowned ");
+        let second = composer
+            .insert_owned_text("eror")
+            .expect("second owned insertion");
+        composer.draft.textarea.insert_str(" suffix  ");
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let InputResult::Submitted {
+            text,
+            composer_leases,
+            ..
+        } = result
+        else {
+            panic!("expected submitted composer input");
+        };
+        assert_eq!(text, "prefix parakeat unowned eror suffix");
+        assert_eq!(composer_leases.len(), 2);
+        assert_eq!(composer_leases[0].id, first);
+        assert_eq!(text.get(composer_leases[0].range.clone()), Some("parakeat"));
+        assert_eq!(composer_leases[1].id, second);
+        assert_eq!(text.get(composer_leases[1].range.clone()), Some("eror"));
+        assert_eq!(
+            &text[composer_leases[0].range.end..composer_leases[1].range.start],
+            " unowned "
+        );
+    }
+
+    #[test]
     fn footer_hint_row_is_separated_from_composer() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
@@ -5834,6 +5914,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5));
                 assert!(text_elements.is_empty());
@@ -7521,6 +7602,7 @@ mod tests {
                 text_elements: Vec::new(),
                 action: QueuedInputAction::Plain,
                 pending_pastes: Vec::new(),
+                composer_leases: Vec::new(),
             }
         );
         assert!(composer.draft.textarea.text().is_empty());
@@ -8551,6 +8633,7 @@ mod tests {
                 text_elements: Vec::new(),
                 action: QueuedInputAction::Plain,
                 pending_pastes: Vec::new(),
+                composer_leases: Vec::new(),
             }
         );
     }
@@ -9196,6 +9279,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, format!("{large} src/main.rs"));
                 assert!(text_elements.is_empty());
@@ -9709,6 +9793,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, "[Image #1] hi");
                 assert_eq!(text_elements.len(), 1);
@@ -10204,6 +10289,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 let expected = format!("{large_content} [Image #1]");
                 assert_eq!(text, expected);
@@ -10247,6 +10333,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 let trimmed = large_content.trim().to_string();
                 assert_eq!(text, format!("{trimmed} [Image #1]"));
@@ -10290,6 +10377,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, "line1\nline2\n [Image #1]");
                 assert!(!text.contains('\r'));
@@ -10353,6 +10441,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, format!("/unknown {large_content}"));
                 assert!(text_elements.is_empty());
@@ -10381,6 +10470,7 @@ mod tests {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             } => {
                 assert_eq!(text, "[Image #1]");
                 assert_eq!(text_elements.len(), 1);

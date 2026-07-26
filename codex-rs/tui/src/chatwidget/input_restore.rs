@@ -87,11 +87,29 @@ impl ChatWidget {
             );
             let (message, history_record) = merge_user_messages_with_history_record(
                 rejected_messages
-                    .into_iter()
+                    .iter()
                     .zip(history_records)
+                    .map(|(queued, history_record)| (queued.user_message.clone(), history_record))
                     .collect::<Vec<_>>(),
             );
-            Some((QueuedUserMessage::from(message), history_record))
+            let composer_submission = NativeComposerSubmission::merge_parts(
+                rejected_messages.iter().map(|message| {
+                    (
+                        message.user_message.text.clone(),
+                        message.composer_submission.clone(),
+                    )
+                }),
+                &message.text,
+            );
+            Some((
+                QueuedUserMessage {
+                    user_message: message,
+                    action: QueuedInputAction::Plain,
+                    pending_pastes: Vec::new(),
+                    composer_submission,
+                },
+                history_record,
+            ))
         }
     }
 
@@ -112,7 +130,11 @@ impl ChatWidget {
                 pending_pastes,
             ))
         } else {
-            let user_message = self.input_queue.rejected_steers_queue.pop_back()?;
+            let user_message = self
+                .input_queue
+                .rejected_steers_queue
+                .pop_back()?
+                .user_message;
             let history_record = self
                 .input_queue
                 .rejected_steer_history_records
@@ -134,7 +156,12 @@ impl ChatWidget {
         };
         self.input_queue
             .rejected_steers_queue
-            .push_back(pending_steer.user_message);
+            .push_back(QueuedUserMessage {
+                user_message: pending_steer.user_message,
+                action: QueuedInputAction::Plain,
+                pending_pastes: Vec::new(),
+                composer_submission: pending_steer.composer_submission,
+            });
         self.input_queue
             .rejected_steer_history_records
             .push_back(pending_steer.history_record);
@@ -176,12 +203,30 @@ impl ChatWidget {
                 .input_queue
                 .pending_steers
                 .drain(..)
+                .collect::<Vec<_>>();
+            let submission_parts = pending_steers
+                .iter()
+                .map(|pending| {
+                    (
+                        pending.user_message.text.clone(),
+                        pending.composer_submission.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let pending_messages = pending_steers
+                .into_iter()
                 .map(|pending| (pending.user_message, pending.history_record))
                 .collect::<Vec<_>>();
-            if !pending_steers.is_empty() {
+            if !pending_messages.is_empty() {
                 let (user_message, history_record) =
-                    merge_user_messages_with_history_record(pending_steers);
-                self.submit_user_message_with_history_record(user_message, history_record);
+                    merge_user_messages_with_history_record(pending_messages);
+                let composer_submission =
+                    NativeComposerSubmission::merge_parts(submission_parts, &user_message.text);
+                self.submit_user_message_with_history_record_and_composer_submission(
+                    user_message,
+                    history_record,
+                    composer_submission,
+                );
             } else if let Some(combined) = self.drain_pending_messages_for_restore() {
                 self.restore_composer_state(combined);
             }
@@ -236,7 +281,9 @@ impl ChatWidget {
         let mut to_merge: Vec<UserMessage> = rejected_messages
             .into_iter()
             .zip(rejected_history_records.iter())
-            .map(|(message, history_record)| user_message_for_restore(message, history_record))
+            .map(|(message, history_record)| {
+                user_message_for_restore(message.user_message, history_record)
+            })
             .collect();
         to_merge.extend(
             self.input_queue
@@ -369,6 +416,12 @@ impl ChatWidget {
                 .iter()
                 .map(|pending| pending.compare_key.clone())
                 .collect(),
+            pending_steer_composer_submissions: self
+                .input_queue
+                .pending_steers
+                .iter()
+                .map(|pending| pending.composer_submission.clone())
+                .collect(),
             rejected_steers_queue: self.input_queue.rejected_steers_queue.clone(),
             rejected_steer_history_records: self.input_queue.rejected_steer_history_records.clone(),
             queued_user_messages: self.input_queue.queued_user_messages.clone(),
@@ -401,6 +454,8 @@ impl ChatWidget {
                 UserMessageHistoryRecord::UserMessageText,
             );
             let mut pending_steer_compare_keys = input_state.pending_steer_compare_keys;
+            let mut pending_steer_composer_submissions =
+                input_state.pending_steer_composer_submissions;
             self.input_queue.pending_steers = input_state
                 .pending_steers
                 .into_iter()
@@ -415,6 +470,7 @@ impl ChatWidget {
                     }),
                     history_record,
                     user_message,
+                    composer_submission: pending_steer_composer_submissions.pop_front().flatten(),
                 })
                 .collect();
             self.input_queue.rejected_steers_queue = input_state.rejected_steers_queue;

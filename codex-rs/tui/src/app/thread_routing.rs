@@ -14,6 +14,82 @@ pub(super) enum ThreadRollbackOrigin {
 }
 
 impl App {
+    pub(super) async fn dispatch_composer_correction(
+        &mut self,
+        app_server: &mut AppServerSession,
+        pending: &PendingComposerCorrection,
+    ) -> CorrectionDispatchOutcome {
+        let Ok(thread_id) = ThreadId::from_string(pending.thread_id()) else {
+            return CorrectionDispatchOutcome::NotApplied;
+        };
+        if self.active_thread_id != Some(thread_id)
+            || self.chat_widget.thread_id() != Some(thread_id)
+        {
+            return CorrectionDispatchOutcome::NotApplied;
+        }
+
+        if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
+            let mut steer_turn_id = turn_id;
+            let mut retried_after_turn_mismatch = false;
+            loop {
+                match app_server
+                    .turn_steer_application_context(
+                        thread_id,
+                        steer_turn_id.clone(),
+                        pending.context_key().to_string(),
+                        pending.context_value().to_string(),
+                    )
+                    .await
+                {
+                    Ok(_) => return CorrectionDispatchOutcome::Acknowledged,
+                    Err(error @ TypedRequestError::Server { .. }) => {
+                        match active_turn_steer_race(&error) {
+                            Some(ActiveTurnSteerRace::Missing) => {
+                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                    let mut store = channel.store.lock().await;
+                                    store.clear_active_turn_id();
+                                }
+                                break;
+                            }
+                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id })
+                                if !retried_after_turn_mismatch
+                                    && actual_turn_id != steer_turn_id =>
+                            {
+                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                    let mut store = channel.store.lock().await;
+                                    store.active_turn_id = Some(actual_turn_id.clone());
+                                }
+                                steer_turn_id = actual_turn_id;
+                                retried_after_turn_mismatch = true;
+                            }
+                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { .. }) | None => {
+                                return CorrectionDispatchOutcome::NotApplied;
+                            }
+                        }
+                    }
+                    Err(
+                        TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. },
+                    ) => return CorrectionDispatchOutcome::Unknown,
+                }
+            }
+        }
+
+        match app_server
+            .turn_start_application_context(
+                thread_id,
+                pending.context_key().to_string(),
+                pending.context_value().to_string(),
+            )
+            .await
+        {
+            Ok(_) => CorrectionDispatchOutcome::Acknowledged,
+            Err(TypedRequestError::Server { .. }) => CorrectionDispatchOutcome::NotApplied,
+            Err(TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. }) => {
+                CorrectionDispatchOutcome::Unknown
+            }
+        }
+    }
+
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
@@ -572,17 +648,32 @@ impl App {
                 final_output_json_schema,
                 collaboration_mode,
                 personality,
+                composer_submission,
             } => {
+                let client_user_message_id = composer_submission
+                    .as_ref()
+                    .map(NativeComposerSubmission::client_user_message_id);
                 let mut should_start_turn = true;
                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
                     let mut steer_turn_id = turn_id;
                     let mut retried_after_turn_mismatch = false;
                     loop {
                         match app_server
-                            .turn_steer(thread_id, steer_turn_id.clone(), items.to_vec())
+                            .turn_steer(
+                                thread_id,
+                                steer_turn_id.clone(),
+                                client_user_message_id.clone(),
+                                items.to_vec(),
+                            )
                             .await
                         {
-                            Ok(_) => return Ok(true),
+                            Ok(_) => {
+                                if let Some(submission) = composer_submission {
+                                    self.accepted_composer_submissions
+                                        .push_back(submission.clone());
+                                }
+                                return Ok(true);
+                            }
                             Err(error) => {
                                 if let Some(turn_error) =
                                     active_turn_not_steerable_turn_error(&error)
@@ -652,6 +743,7 @@ impl App {
                     let response = app_server
                         .turn_start(
                             thread_id,
+                            client_user_message_id,
                             items.to_vec(),
                             cwd.clone(),
                             *approval_policy,
@@ -667,6 +759,10 @@ impl App {
                             final_output_json_schema.clone(),
                         )
                         .await?;
+                    if let Some(submission) = composer_submission {
+                        self.accepted_composer_submissions
+                            .push_back(submission.clone());
+                    }
                     if self.active_thread_id == Some(thread_id)
                         && self.chat_widget.thread_id() == Some(thread_id)
                     {

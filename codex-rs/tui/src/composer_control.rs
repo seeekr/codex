@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt;
+use std::ops::Range;
+use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 use std::time::Instant;
@@ -15,6 +18,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use similar::ChangeTag;
+use similar::TextDiff;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -22,6 +27,7 @@ use uuid::Uuid;
 
 use crate::bottom_pane::ComposerLeaseError;
 use crate::bottom_pane::ComposerLeaseId;
+use crate::bottom_pane::SubmittedComposerLease;
 use crate::chatwidget::ChatWidget;
 use crate::tui::TuiEvent;
 
@@ -53,6 +59,129 @@ impl ComposerSnapshot {
             text,
             cursor,
         }
+    }
+}
+
+/// Content-opaque provenance carried with one composer submission until app-server acceptance.
+///
+/// The submitted text is retained only in memory so later correction locators can be computed
+/// against the exact accepted user message. Its custom `Debug` implementation never exposes text.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct NativeComposerSubmission {
+    submission_id: Uuid,
+    thread_id: String,
+    submitted_text: Arc<str>,
+    leases: Vec<NativeSubmittedLease>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NativeSubmittedLease {
+    native: ComposerLeaseId,
+    range: Range<usize>,
+}
+
+impl fmt::Debug for NativeComposerSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeComposerSubmission")
+            .field("submission_id", &self.submission_id)
+            .field("thread_id", &self.thread_id)
+            .field("submitted_text_bytes", &self.submitted_text.len())
+            .field("lease_count", &self.leases.len())
+            .finish()
+    }
+}
+
+impl NativeComposerSubmission {
+    pub(crate) fn new(
+        thread_id: String,
+        submitted_text: &str,
+        leases: Vec<SubmittedComposerLease>,
+    ) -> Option<Self> {
+        let leases = leases
+            .into_iter()
+            .filter_map(|lease| {
+                submitted_text
+                    .get(lease.range.clone())
+                    .map(|_| NativeSubmittedLease {
+                        native: lease.id,
+                        range: lease.range,
+                    })
+            })
+            .collect::<Vec<_>>();
+        (!leases.is_empty()).then(|| Self {
+            submission_id: Uuid::new_v4(),
+            thread_id,
+            submitted_text: Arc::from(submitted_text),
+            leases,
+        })
+    }
+
+    pub(crate) fn client_user_message_id(&self) -> String {
+        format!("koenig-composer-{}", self.submission_id)
+    }
+
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub(crate) fn merge_parts(
+        parts: impl IntoIterator<Item = (String, Option<Self>)>,
+        merged_text: &str,
+    ) -> Option<Self> {
+        let mut thread_id: Option<String> = None;
+        let mut leases = Vec::new();
+        let mut offset = 0;
+        for (index, (text, submission)) in parts.into_iter().enumerate() {
+            if index > 0 {
+                if merged_text.as_bytes().get(offset) != Some(&b'\n') {
+                    return None;
+                }
+                offset += 1;
+            }
+            if merged_text.get(offset..offset + text.len()) != Some(text.as_str()) {
+                return None;
+            }
+            if let Some(submission) = submission {
+                if submission.submitted_text.as_ref() != text {
+                    return None;
+                }
+                match thread_id.as_deref() {
+                    None => thread_id = Some(submission.thread_id.clone()),
+                    Some(existing) if existing == submission.thread_id => {}
+                    Some(_) => return None,
+                }
+                for lease in submission.leases {
+                    leases.push(NativeSubmittedLease {
+                        native: lease.native,
+                        range: lease.range.start + offset..lease.range.end + offset,
+                    });
+                }
+            }
+            offset += text.len();
+        }
+        if offset != merged_text.len() {
+            return None;
+        }
+        let thread_id = thread_id?;
+        (!leases.is_empty()).then(|| Self {
+            submission_id: Uuid::new_v4(),
+            thread_id,
+            submitted_text: Arc::from(merged_text),
+            leases,
+        })
+    }
+
+    fn submission_id(&self) -> Uuid {
+        self.submission_id
+    }
+
+    fn submitted_text_arc(&self) -> Arc<str> {
+        Arc::clone(&self.submitted_text)
+    }
+
+    fn submitted_leases(&self) -> &[NativeSubmittedLease] {
+        &self.leases
     }
 }
 
@@ -128,6 +257,39 @@ pub(crate) struct ComposerControlRequest {
     reply: SyncSender<WireResult>,
 }
 
+/// Application-context correction ready for the async app-server acknowledgement boundary.
+///
+/// This type carries transcript-derived context and therefore deliberately has no `Debug`
+/// implementation.
+pub(crate) struct PendingComposerCorrection {
+    lease_id: Uuid,
+    thread_id: String,
+    context_key: String,
+    context_value: String,
+    reply: SyncSender<WireResult>,
+}
+
+impl PendingComposerCorrection {
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub(crate) fn context_key(&self) -> &str {
+        &self.context_key
+    }
+
+    pub(crate) fn context_value(&self) -> &str {
+        &self.context_value
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CorrectionDispatchOutcome {
+    Acknowledged,
+    NotApplied,
+    Unknown,
+}
+
 /// Transcript-bearing command. Do not derive or implement `Debug`.
 enum ComposerCommand {
     Capture,
@@ -149,6 +311,18 @@ enum ComposerCommand {
     },
 }
 
+struct PreparedCorrection {
+    lease_id: Uuid,
+    thread_id: String,
+    context_key: String,
+    context_value: String,
+}
+
+enum CommandExecution {
+    Complete(WireResult),
+    Correct(PreparedCorrection),
+}
+
 impl ComposerCommand {
     fn may_change_text(&self) -> bool {
         matches!(self, Self::Insert { .. } | Self::Replace { .. })
@@ -162,8 +336,35 @@ struct Capture {
     input_epoch: u64,
 }
 
+enum ExternalLeaseState<L> {
+    Draft { native: L },
+    SubmittedIntact { receipt: SubmittedLeaseReceipt },
+    CorrectionPending { receipt: SubmittedLeaseReceipt },
+}
+
+#[derive(Clone)]
+struct SubmittedLeaseReceipt {
+    submission_id: Uuid,
+    submitted_text: Arc<str>,
+    range: Range<usize>,
+}
+
+impl<L: Copy> Clone for ExternalLeaseState<L> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Draft { native } => Self::Draft { native: *native },
+            Self::SubmittedIntact { receipt } => Self::SubmittedIntact {
+                receipt: receipt.clone(),
+            },
+            Self::CorrectionPending { receipt } => Self::CorrectionPending {
+                receipt: receipt.clone(),
+            },
+        }
+    }
+}
+
 struct ExternalLease<L> {
-    native: L,
+    state: ExternalLeaseState<L>,
     thread_id: String,
     expected_hash: [u8; 32],
 }
@@ -171,7 +372,7 @@ struct ExternalLease<L> {
 impl<L: Copy> Clone for ExternalLease<L> {
     fn clone(&self) -> Self {
         Self {
-            native: self.native,
+            state: self.state.clone(),
             thread_id: self.thread_id.clone(),
             expected_hash: self.expected_hash,
         }
@@ -188,7 +389,7 @@ pub(crate) struct ComposerControlState<L> {
 
 pub(crate) type NativeComposerControlState = ComposerControlState<ComposerLeaseId>;
 
-impl<L: Copy> ComposerControlState<L> {
+impl<L: Copy + Eq> ComposerControlState<L> {
     pub(crate) fn new() -> Self {
         Self {
             input_epoch: 0,
@@ -213,7 +414,8 @@ impl<L: Copy> ComposerControlState<L> {
         request: ComposerControlRequest,
         target: &mut T,
         app_overlay_active: bool,
-    ) where
+    ) -> Option<PendingComposerCorrection>
+    where
         T: ComposerControlTarget<Lease = L>,
     {
         let ComposerControlRequest {
@@ -221,14 +423,62 @@ impl<L: Copy> ComposerControlState<L> {
             deadline,
             reply,
         } = request;
-        let result = if Instant::now() > deadline {
-            WireResult::error(ErrorCode::UiTimeout, MutationOutcome::NotApplied)
+        let execution = if Instant::now() > deadline {
+            CommandExecution::Complete(WireResult::error(
+                ErrorCode::UiTimeout,
+                MutationOutcome::NotApplied,
+            ))
         } else {
-            self.execute(command, target, app_overlay_active)
+            self.prepare_command(command, target, app_overlay_active)
         };
-        let _ = reply.send(result);
+        match execution {
+            CommandExecution::Complete(result) => {
+                let _ = reply.send(result);
+                None
+            }
+            CommandExecution::Correct(correction) => Some(PendingComposerCorrection {
+                lease_id: correction.lease_id,
+                thread_id: correction.thread_id,
+                context_key: correction.context_key,
+                context_value: correction.context_value,
+                reply,
+            }),
+        }
     }
 
+    pub(crate) fn finish_correction(
+        &mut self,
+        pending: PendingComposerCorrection,
+        outcome: CorrectionDispatchOutcome,
+    ) {
+        let result = match outcome {
+            CorrectionDispatchOutcome::Acknowledged => {
+                self.leases.remove(&pending.lease_id);
+                self.lease_order
+                    .retain(|queued| *queued != pending.lease_id);
+                WireResult::Corrected
+            }
+            CorrectionDispatchOutcome::NotApplied => {
+                if let Some(lease) = self.leases.get_mut(&pending.lease_id)
+                    && let ExternalLeaseState::CorrectionPending { receipt } = &lease.state
+                {
+                    lease.state = ExternalLeaseState::SubmittedIntact {
+                        receipt: receipt.clone(),
+                    };
+                }
+                WireResult::not_applied(ErrorCode::CorrectionUnavailable)
+            }
+            CorrectionDispatchOutcome::Unknown => {
+                self.leases.remove(&pending.lease_id);
+                self.lease_order
+                    .retain(|queued| *queued != pending.lease_id);
+                WireResult::error(ErrorCode::CorrectionUnavailable, MutationOutcome::Unknown)
+            }
+        };
+        let _ = pending.reply.send(result);
+    }
+
+    #[cfg(test)]
     fn execute<T>(
         &mut self,
         command: ComposerCommand,
@@ -238,15 +488,43 @@ impl<L: Copy> ComposerControlState<L> {
     where
         T: ComposerControlTarget<Lease = L>,
     {
+        match self.prepare_command(command, target, app_overlay_active) {
+            CommandExecution::Complete(result) => result,
+            CommandExecution::Correct(correction) => {
+                if let Some(lease) = self.leases.get_mut(&correction.lease_id)
+                    && let ExternalLeaseState::CorrectionPending { receipt } = &lease.state
+                {
+                    lease.state = ExternalLeaseState::SubmittedIntact {
+                        receipt: receipt.clone(),
+                    };
+                }
+                WireResult::not_applied(ErrorCode::CorrectionUnavailable)
+            }
+        }
+    }
+
+    fn prepare_command<T>(
+        &mut self,
+        command: ComposerCommand,
+        target: &mut T,
+        app_overlay_active: bool,
+    ) -> CommandExecution
+    where
+        T: ComposerControlTarget<Lease = L>,
+    {
         match command {
-            ComposerCommand::Capture => self.capture(target, app_overlay_active),
-            ComposerCommand::Insert { capture_id, text } => {
-                self.insert(target, app_overlay_active, capture_id, text)
+            ComposerCommand::Capture => {
+                CommandExecution::Complete(self.capture(target, app_overlay_active))
             }
-            ComposerCommand::Verify { lease_id, expected } => {
-                self.verify(target, app_overlay_active, lease_id, expected)
+            ComposerCommand::Insert { capture_id, text } => CommandExecution::Complete(
+                self.insert(target, app_overlay_active, capture_id, text),
+            ),
+            ComposerCommand::Verify { lease_id, expected } => CommandExecution::Complete(
+                self.verify(target, app_overlay_active, lease_id, expected),
+            ),
+            ComposerCommand::Keep { lease_id } => {
+                CommandExecution::Complete(self.keep(target, app_overlay_active, lease_id))
             }
-            ComposerCommand::Keep { lease_id } => self.keep(target, app_overlay_active, lease_id),
             ComposerCommand::Replace {
                 lease_id,
                 expected,
@@ -312,17 +590,42 @@ impl<L: Copy> ComposerControlState<L> {
             Ok(native) => native,
             Err(err) => return WireResult::not_applied(map_lease_error(err)),
         };
+        self.rebase_matching_captures(target, &snapshot);
         let lease_id = fresh_id(&self.leases);
         self.leases.insert(
             lease_id,
             ExternalLease {
-                native,
+                state: ExternalLeaseState::Draft { native },
                 thread_id: snapshot.thread_id,
                 expected_hash,
             },
         );
         self.lease_order.push_back(lease_id);
         WireResult::Inserted { lease_id }
+    }
+
+    fn rebase_matching_captures<T>(&mut self, target: &T, before: &ComposerSnapshot)
+    where
+        T: ComposerControlTarget<Lease = L>,
+    {
+        let Some(after) = target.snapshot() else {
+            return;
+        };
+        if after.thread_id != before.thread_id {
+            return;
+        }
+        let before_hash = text_hash(&before.text);
+        let after_hash = text_hash(&after.text);
+        for capture in self.captures.values_mut() {
+            if capture.input_epoch == self.input_epoch
+                && capture.thread_id == before.thread_id
+                && capture.text_hash == before_hash
+                && capture.cursor == before.cursor
+            {
+                capture.text_hash = after_hash;
+                capture.cursor = after.cursor;
+            }
+        }
     }
 
     fn verify<T>(
@@ -341,15 +644,29 @@ impl<L: Copy> ComposerControlState<L> {
         if lease.expected_hash != text_hash(&expected) {
             return WireResult::not_applied(ErrorCode::ExpectedMismatch);
         }
-        let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        };
-        if lease.thread_id != snapshot.thread_id {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        }
-        match target.verify_owned_text(lease.native, &expected) {
-            Ok(()) => WireResult::Verified,
-            Err(err) => WireResult::not_applied(map_lease_error(err)),
+        match &lease.state {
+            ExternalLeaseState::Draft { native } => {
+                let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                };
+                if lease.thread_id != snapshot.thread_id {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                }
+                match target.verify_owned_text(*native, &expected) {
+                    Ok(()) => WireResult::Verified,
+                    Err(err) => WireResult::not_applied(map_lease_error(err)),
+                }
+            }
+            ExternalLeaseState::SubmittedIntact { .. } => {
+                if target.thread_id().as_deref() == Some(lease.thread_id.as_str()) {
+                    WireResult::SubmittedIntact
+                } else {
+                    WireResult::not_applied(ErrorCode::ComposerUnavailable)
+                }
+            }
+            ExternalLeaseState::CorrectionPending { .. } => {
+                WireResult::not_applied(ErrorCode::LeaseUnavailable)
+            }
         }
     }
 
@@ -360,17 +677,32 @@ impl<L: Copy> ComposerControlState<L> {
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
             return WireResult::not_applied(ErrorCode::LeaseUnavailable);
         };
-        let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        };
-        if lease.thread_id != snapshot.thread_id {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        }
-        self.leases.remove(&lease_id);
-        self.lease_order.retain(|queued| *queued != lease_id);
-        match target.keep_owned_text(lease.native) {
-            Ok(()) => WireResult::Kept,
-            Err(err) => WireResult::not_applied(map_lease_error(err)),
+        match lease.state {
+            ExternalLeaseState::Draft { native } => {
+                let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                };
+                if lease.thread_id != snapshot.thread_id {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                }
+                self.leases.remove(&lease_id);
+                self.lease_order.retain(|queued| *queued != lease_id);
+                match target.keep_owned_text(native) {
+                    Ok(()) => WireResult::Kept,
+                    Err(err) => WireResult::not_applied(map_lease_error(err)),
+                }
+            }
+            ExternalLeaseState::SubmittedIntact { .. } => {
+                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                }
+                self.leases.remove(&lease_id);
+                self.lease_order.retain(|queued| *queued != lease_id);
+                WireResult::Kept
+            }
+            ExternalLeaseState::CorrectionPending { .. } => {
+                WireResult::not_applied(ErrorCode::LeaseUnavailable)
+            }
         }
     }
 
@@ -381,32 +713,99 @@ impl<L: Copy> ComposerControlState<L> {
         lease_id: Uuid,
         expected: String,
         replacement: String,
-    ) -> WireResult
+    ) -> CommandExecution
     where
         T: ComposerControlTarget<Lease = L>,
     {
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
-            return WireResult::not_applied(ErrorCode::LeaseUnavailable);
+            return CommandExecution::Complete(WireResult::not_applied(
+                ErrorCode::LeaseUnavailable,
+            ));
         };
         if lease.expected_hash != text_hash(&expected) {
             self.leases.remove(&lease_id);
             self.lease_order.retain(|queued| *queued != lease_id);
-            if target.thread_id().as_deref() == Some(lease.thread_id.as_str()) {
-                let _ = target.keep_owned_text(lease.native);
+            if target.thread_id().as_deref() == Some(lease.thread_id.as_str())
+                && let ExternalLeaseState::Draft { native } = lease.state
+            {
+                let _ = target.keep_owned_text(native);
             }
-            return WireResult::not_applied(ErrorCode::ExpectedMismatch);
+            return CommandExecution::Complete(WireResult::not_applied(
+                ErrorCode::ExpectedMismatch,
+            ));
         }
-        let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        };
-        if lease.thread_id != snapshot.thread_id {
-            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-        }
-        self.leases.remove(&lease_id);
-        self.lease_order.retain(|queued| *queued != lease_id);
-        match target.replace_owned_text(lease.native, &expected, &replacement) {
-            Ok(()) => WireResult::Replaced,
-            Err(err) => WireResult::not_applied(map_lease_error(err)),
+        match lease.state {
+            ExternalLeaseState::Draft { native } => {
+                let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ComposerUnavailable,
+                    ));
+                };
+                if lease.thread_id != snapshot.thread_id {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ComposerUnavailable,
+                    ));
+                }
+                self.leases.remove(&lease_id);
+                self.lease_order.retain(|queued| *queued != lease_id);
+                match target.replace_owned_text(native, &expected, &replacement) {
+                    Ok(()) => {
+                        self.rebase_matching_captures(target, &snapshot);
+                        CommandExecution::Complete(WireResult::Replaced)
+                    }
+                    Err(err) => {
+                        CommandExecution::Complete(WireResult::not_applied(map_lease_error(err)))
+                    }
+                }
+            }
+            ExternalLeaseState::SubmittedIntact { receipt } => {
+                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ComposerUnavailable,
+                    ));
+                }
+                if expected == replacement {
+                    self.leases.remove(&lease_id);
+                    self.lease_order.retain(|queued| *queued != lease_id);
+                    return CommandExecution::Complete(WireResult::Kept);
+                }
+                if receipt
+                    .submitted_text
+                    .get(receipt.range.clone())
+                    .is_none_or(|submitted| submitted != expected)
+                {
+                    self.leases.remove(&lease_id);
+                    self.lease_order.retain(|queued| *queued != lease_id);
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ExpectedMismatch,
+                    ));
+                }
+                let correction_id = Uuid::new_v4();
+                let context_key = format!("koenig_transcription_correction/{correction_id}");
+                let Some(context_value) = mechanical_correction_context(
+                    receipt.submission_id,
+                    &receipt.submitted_text,
+                    receipt.range.clone(),
+                    &expected,
+                    &replacement,
+                ) else {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::CorrectionUnavailable,
+                    ));
+                };
+                if let Some(stored) = self.leases.get_mut(&lease_id) {
+                    stored.state = ExternalLeaseState::CorrectionPending { receipt };
+                }
+                CommandExecution::Correct(PreparedCorrection {
+                    lease_id,
+                    thread_id: lease.thread_id,
+                    context_key,
+                    context_value,
+                })
+            }
+            ExternalLeaseState::CorrectionPending { .. } => {
+                CommandExecution::Complete(WireResult::not_applied(ErrorCode::LeaseUnavailable))
+            }
         }
     }
 
@@ -421,11 +820,237 @@ impl<L: Copy> ComposerControlState<L> {
             let Some(oldest) = self.leases.remove(&oldest_id) else {
                 continue;
             };
-            if oldest.thread_id == snapshot.thread_id {
-                let _ = target.keep_owned_text(oldest.native);
+            if oldest.thread_id == snapshot.thread_id
+                && let ExternalLeaseState::Draft { native } = oldest.state
+            {
+                let _ = target.keep_owned_text(native);
             }
         }
     }
+
+    fn note_submission_accepted_by_native(
+        &mut self,
+        thread_id: &str,
+        submission_id: Uuid,
+        submitted_text: Arc<str>,
+        native_leases: &[(L, Range<usize>)],
+    ) {
+        for lease in self.leases.values_mut() {
+            if lease.thread_id != thread_id {
+                continue;
+            }
+            let ExternalLeaseState::Draft { native } = &lease.state else {
+                continue;
+            };
+            let Some((_, range)) = native_leases
+                .iter()
+                .find(|(submitted_native, _)| submitted_native == native)
+            else {
+                continue;
+            };
+            if submitted_text
+                .get(range.clone())
+                .is_some_and(|submitted| text_hash(submitted) == lease.expected_hash)
+            {
+                lease.state = ExternalLeaseState::SubmittedIntact {
+                    receipt: SubmittedLeaseReceipt {
+                        submission_id,
+                        submitted_text: Arc::clone(&submitted_text),
+                        range: range.clone(),
+                    },
+                };
+            }
+        }
+    }
+}
+
+impl NativeComposerControlState {
+    pub(crate) fn note_submission_accepted(&mut self, submission: &NativeComposerSubmission) {
+        let native_leases = submission
+            .submitted_leases()
+            .iter()
+            .map(|lease| (lease.native, lease.range.clone()))
+            .collect::<Vec<_>>();
+        self.note_submission_accepted_by_native(
+            submission.thread_id(),
+            submission.submission_id(),
+            submission.submitted_text_arc(),
+            &native_leases,
+        );
+    }
+}
+
+fn mechanical_correction_context(
+    submission_id: Uuid,
+    submitted_text: &str,
+    lease_range: Range<usize>,
+    expected: &str,
+    replacement: &str,
+) -> Option<String> {
+    const CONTEXT_TOKENS: usize = 6;
+    const OLD_SNIPPET_MAX_CHARS: usize = 640;
+    const MAX_HUNK_LITERAL_BYTES: usize = 16 * 1024;
+    const MAX_CONTEXT_BYTES: usize = 48 * 1024;
+
+    let mut config = TextDiff::configure();
+    config.timeout(Duration::from_millis(100));
+    let diff = config.diff_words(expected, replacement);
+    let mut hunks = Vec::new();
+    for group in diff.grouped_ops(CONTEXT_TOKENS) {
+        let mut old = String::new();
+        let mut new = String::new();
+        let mut changed = false;
+        for operation in &group {
+            for change in diff.iter_changes(operation) {
+                match change.tag() {
+                    ChangeTag::Equal => {
+                        old.push_str(change.value());
+                        new.push_str(change.value());
+                    }
+                    ChangeTag::Delete => {
+                        changed = true;
+                        old.push_str(change.value());
+                    }
+                    ChangeTag::Insert => {
+                        changed = true;
+                        new.push_str(change.value());
+                    }
+                }
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let old_slice_start = group
+            .first()
+            .map(|operation| operation.old_range().start)
+            .expect("grouped diff hunk cannot be empty");
+        let old_start = diff.old_slices()[..old_slice_start]
+            .iter()
+            .map(|slice| slice.len())
+            .sum::<usize>();
+        hunks.push((old_start, old, new));
+    }
+
+    if hunks
+        .iter()
+        .any(|(_, old, new)| old.len() + new.len() > MAX_HUNK_LITERAL_BYTES)
+    {
+        let (old_start, old, new) = common_affix_hunk(expected, replacement);
+        if old.len() + new.len() > MAX_HUNK_LITERAL_BYTES {
+            return None;
+        }
+        hunks = vec![(old_start, old.to_string(), new.to_string())];
+    }
+
+    let mut rendered = format!(
+        "Automated mechanical transcription correction (application context, not a user \
+         message).\nTarget: the same-thread user submission acknowledged under internal receipt \
+         koenig-composer-{submission_id}, specifically Koenig-owned submitted-message bytes \
+         {}..{}. The receipt is audit metadata; the byte coordinates and exact old text are \
+         authoritative. Do not alter text outside that owned range.\nTreat only the exact \
+         replacements below as corrections to the prior message. The receiving agent may discern \
+         their semantic impact; Koenig asserts no edit beyond the enumerated mechanical \
+         replacements.",
+        lease_range.start, lease_range.end
+    );
+
+    for (index, (old_start, old, new)) in hunks.into_iter().enumerate() {
+        let local_old_end = old_start + old.len();
+        let submitted_old_start = lease_range.start + old_start;
+        let submitted_old_end = lease_range.start + local_old_end;
+        let occurrence = (!old.is_empty()).then(|| {
+            submitted_text
+                .match_indices(&old)
+                .take_while(|(position, _)| *position <= submitted_old_start)
+                .count()
+        });
+        let old_char_count = old.chars().count();
+        let old_rendered = compact_old_snippet(&old, OLD_SNIPPET_MAX_CHARS);
+        let old_rendered =
+            serde_json::to_string(&old_rendered).expect("serializing a string cannot fail");
+        let new = serde_json::to_string(&new).expect("serializing a string cannot fail");
+        if old.is_empty() {
+            rendered.push_str(&format!(
+                "\n\nHunk {}: insert at submitted-message byte {submitted_old_start}.\n- \
+                 \"\"\n+ {new}",
+                index + 1,
+            ));
+        } else if old_char_count <= OLD_SNIPPET_MAX_CHARS {
+            rendered.push_str(&format!(
+                "\n\nHunk {}: old bytes {old_start}..{old_end}; occurrence {occurrence} of this \
+                 exact old text in the submitted message.\n- {old_rendered}\n+ {new}",
+                index + 1,
+                old_start = submitted_old_start,
+                old_end = submitted_old_end,
+                occurrence = occurrence.expect("non-empty old text has an occurrence"),
+            ));
+        } else {
+            rendered.push_str(&format!(
+                "\n\nHunk {}: old bytes {old_start}..{old_end}; occurrence {occurrence} of this \
+                 old range in the submitted message. The old rendering elides its middle; the \
+                 byte range plus both anchors is authoritative.\n- {old_rendered}\n+ {new}",
+                index + 1,
+                old_start = submitted_old_start,
+                old_end = submitted_old_end,
+                occurrence = occurrence.expect("non-empty old text has an occurrence"),
+            ));
+        }
+        if rendered.len() > MAX_CONTEXT_BYTES {
+            return None;
+        }
+    }
+
+    Some(rendered)
+}
+
+fn common_affix_hunk<'a>(old: &'a str, new: &'a str) -> (usize, &'a str, &'a str) {
+    let mut prefix = old
+        .as_bytes()
+        .iter()
+        .zip(new.as_bytes())
+        .take_while(|(old_byte, new_byte)| old_byte == new_byte)
+        .count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix = prefix.saturating_sub(1);
+    }
+
+    let max_suffix = old.len().min(new.len()).saturating_sub(prefix);
+    let mut suffix = old
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(new.as_bytes().iter().rev())
+        .take(max_suffix)
+        .take_while(|(old_byte, new_byte)| old_byte == new_byte)
+        .count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix = suffix.saturating_sub(1);
+    }
+
+    (
+        prefix,
+        &old[prefix..old.len() - suffix],
+        &new[prefix..new.len() - suffix],
+    )
+}
+
+fn compact_old_snippet(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let side = max_chars.saturating_sub(3) / 2;
+    let head = value.chars().take(side).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(side)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head} … {tail}")
 }
 
 fn available_snapshot<T>(target: &T, app_overlay_active: bool) -> Option<ComposerSnapshot>
@@ -642,6 +1267,7 @@ enum ErrorCode {
     LeaseUnavailable,
     ExpectedMismatch,
     CursorConflict,
+    CorrectionUnavailable,
     UiUnavailable,
     UiTimeout,
 }
@@ -665,8 +1291,10 @@ enum WireResult {
         lease_id: Uuid,
     },
     Verified,
+    SubmittedIntact,
     Kept,
     Replaced,
+    Corrected,
     Error {
         code: ErrorCode,
         outcome: MutationOutcome,

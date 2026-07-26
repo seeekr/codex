@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QueuedInputAction;
+use crate::composer_control::NativeComposerSubmission;
 use codex_app_server_protocol::TextElement as AppServerTextElement;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::config_types::CollaborationMode;
@@ -61,6 +62,7 @@ pub(super) struct QueuedUserMessage {
     pub(super) user_message: UserMessage,
     pub(super) action: QueuedInputAction,
     pub(super) pending_pastes: Vec<(String, String)>,
+    pub(super) composer_submission: Option<NativeComposerSubmission>,
 }
 
 impl QueuedUserMessage {
@@ -69,11 +71,16 @@ impl QueuedUserMessage {
             user_message,
             action,
             pending_pastes: Vec::new(),
+            composer_submission: None,
         }
     }
 
     pub(super) fn into_user_message(self) -> UserMessage {
         self.user_message
+    }
+
+    pub(super) fn into_submission(self) -> (UserMessage, Option<NativeComposerSubmission>) {
+        (self.user_message, self.composer_submission)
     }
 }
 
@@ -124,7 +131,8 @@ pub(crate) struct ThreadInputState {
     pub(super) pending_steers: VecDeque<UserMessage>,
     pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
-    pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+    pub(super) pending_steer_composer_submissions: VecDeque<Option<NativeComposerSubmission>>,
+    pub(super) rejected_steers_queue: VecDeque<QueuedUserMessage>,
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
@@ -161,11 +169,12 @@ impl From<&str> for UserMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct PendingSteer {
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,
     pub(super) compare_key: PendingSteerCompareKey,
+    pub(super) composer_submission: Option<NativeComposerSubmission>,
 }
 
 pub(crate) fn create_initial_user_message(

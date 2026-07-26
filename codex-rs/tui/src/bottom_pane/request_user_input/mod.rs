@@ -1100,6 +1100,7 @@ impl RequestUserInputOverlay {
             InputResult::Submitted {
                 text,
                 text_elements,
+                ..
             }
             | InputResult::Queued {
                 text,

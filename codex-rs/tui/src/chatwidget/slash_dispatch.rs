@@ -904,6 +904,7 @@ impl ChatWidget {
         let QueuedUserMessage {
             user_message,
             pending_pastes,
+            composer_submission,
             ..
         } = queued_message;
         let UserMessage {
@@ -914,24 +915,30 @@ impl ChatWidget {
             mention_bindings,
         } = user_message;
         let Some((name, rest, rest_offset)) = parse_slash_name(&text) else {
-            self.submit_user_message(UserMessage {
-                text,
-                local_images,
-                remote_image_urls,
-                text_elements,
-                mention_bindings,
-            });
+            self.submit_user_message_with_composer_submission(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                composer_submission,
+            );
             return QueueDrain::Stop;
         };
 
         if name.contains('/') {
-            self.submit_user_message(UserMessage {
-                text,
-                local_images,
-                remote_image_urls,
-                text_elements,
-                mention_bindings,
-            });
+            self.submit_user_message_with_composer_submission(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                composer_submission,
+            );
             return QueueDrain::Stop;
         }
 
@@ -962,23 +969,29 @@ impl ChatWidget {
         }
 
         if !command.supports_inline_args() {
-            self.submit_user_message(UserMessage {
-                text,
-                local_images,
-                remote_image_urls,
-                text_elements,
-                mention_bindings,
-            });
+            self.submit_user_message_with_composer_submission(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                composer_submission,
+            );
             return QueueDrain::Stop;
         }
         let SlashCommandItem::Builtin(cmd) = command else {
-            self.submit_user_message(UserMessage {
-                text,
-                local_images,
-                remote_image_urls,
-                text_elements,
-                mention_bindings,
-            });
+            self.submit_user_message_with_composer_submission(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                composer_submission,
+            );
             return QueueDrain::Stop;
         };
 

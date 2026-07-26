@@ -33,6 +33,9 @@ use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::ThreadInputState;
+use crate::composer_control::CorrectionDispatchOutcome;
+use crate::composer_control::NativeComposerSubmission;
+use crate::composer_control::PendingComposerCorrection;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::split_command_string;
@@ -577,6 +580,9 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
+    /// Content-opaque composer receipts acknowledged by app-server. The outer UI loop drains this
+    /// into the native composer-control state after each serialized app event.
+    accepted_composer_submissions: VecDeque<NativeComposerSubmission>,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -1066,6 +1072,7 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
+            accepted_composer_submissions: VecDeque::new(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
@@ -1183,11 +1190,16 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     Some(request) = composer_control_rx.recv() => {
                         let app_overlay_active = app.overlay.is_some();
-                        composer_control_state.handle_ui_request(
+                        if let Some(correction) = composer_control_state.handle_ui_request(
                             request,
                             &mut app.chat_widget,
                             app_overlay_active,
-                        );
+                        ) {
+                            let outcome = app
+                                .dispatch_composer_correction(&mut app_server, &correction)
+                                .await;
+                            composer_control_state.finish_correction(correction, outcome);
+                        }
                         AppRunControl::Continue
                     }
                     active = async {
@@ -1232,6 +1244,9 @@ See the Codex keymap documentation for supported actions and examples."
                         AppRunControl::Continue
                     }
                 };
+                for submission in app.accepted_composer_submissions.drain(..) {
+                    composer_control_state.note_submission_accepted(&submission);
+                }
                 if App::should_stop_waiting_for_initial_session(
                     waiting_for_initial_session_configured,
                     app.primary_thread_id,
