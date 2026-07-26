@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::SubmittedComposerLease;
 use crate::bottom_pane::paste_burst::PasteBurst;
 use crate::bottom_pane::textarea::TextArea;
 use crate::bottom_pane::textarea::TextAreaState;
@@ -19,6 +20,7 @@ pub(super) struct DraftState {
     pub(super) disable_paste_burst: bool,
     pub(super) mention_bindings: HashMap<u64, ComposerMentionBinding>,
     pub(super) recent_submission_mention_bindings: Vec<MentionBinding>,
+    pub(super) recent_submission_composer_leases: Vec<SubmittedComposerLease>,
 }
 
 impl DraftState {
@@ -34,6 +36,7 @@ impl DraftState {
             disable_paste_burst: false,
             mention_bindings: HashMap::new(),
             recent_submission_mention_bindings: Vec::new(),
+            recent_submission_composer_leases: Vec::new(),
         }
     }
 }

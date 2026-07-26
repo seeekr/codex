@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 
 use super::PendingSteer;
 use super::QueuedUserMessage;
-use super::UserMessage;
 use super::UserMessageHistoryRecord;
 use super::user_message_preview_text;
 
@@ -30,7 +29,7 @@ pub(super) struct InputQueueState {
     /// A user turn has been submitted to core, but `TurnStarted` has not arrived yet.
     pub(super) user_turn_pending_start: bool,
     /// User messages that tried to steer a non-regular turn and must be retried first.
-    pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+    pub(super) rejected_steers_queue: VecDeque<QueuedUserMessage>,
     /// History records for rejected steers. Slash commands such as `/goal` can
     /// render history that differs from the text submitted to core, so this stays
     /// in lockstep with `rejected_steers_queue`, with missing entries treated as
@@ -100,6 +99,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::chatwidget::UserMessage;
 
     #[test]
     fn preview_keeps_queue_categories_separate() {
@@ -109,7 +109,7 @@ mod tests {
             .push_back(UserMessage::from("queued").into());
         state
             .rejected_steers_queue
-            .push_back(UserMessage::from("rejected"));
+            .push_back(UserMessage::from("rejected").into());
         state.pending_steers.push_back(PendingSteer {
             user_message: UserMessage::from("pending"),
             history_record: UserMessageHistoryRecord::UserMessageText,
@@ -117,6 +117,7 @@ mod tests {
                 message: "pending".to_string(),
                 image_count: 0,
             },
+            composer_submission: None,
         });
 
         assert_eq!(
@@ -137,7 +138,7 @@ mod tests {
             .push_back(UserMessage::from("queued").into());
         state
             .rejected_steers_queue
-            .push_back(UserMessage::from("rejected"));
+            .push_back(UserMessage::from("rejected").into());
         state.user_turn_pending_start = true;
         state.submit_pending_steers_after_interrupt = true;
 

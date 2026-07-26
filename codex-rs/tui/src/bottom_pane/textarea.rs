@@ -104,6 +104,12 @@ impl ComposerLeaseId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubmittedComposerLease {
+    pub(crate) id: ComposerLeaseId,
+    pub(crate) range: Range<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ComposerLeaseError {
@@ -149,6 +155,13 @@ impl ComposerLeases {
 
     fn clear(&mut self) {
         self.ranges.clear();
+    }
+
+    fn snapshots(&self) -> Vec<(ComposerLeaseId, Range<usize>)> {
+        self.ranges
+            .iter()
+            .map(|(id, range)| (*id, range.clone()))
+            .collect()
     }
 
     /// Rebase leases around an ordinary editor mutation and revoke every intersecting lease.
@@ -583,6 +596,15 @@ impl TextArea {
             return Err(ComposerLeaseError::ExpectedTextMismatch);
         }
         Ok(())
+    }
+
+    /// Return content-opaque snapshots of every still-intact producer lease.
+    ///
+    /// Submission preparation uses these ranges before clearing the textarea, then keeps only
+    /// ranges that survive its exact trim/expansion transform. No transcript bytes cross this
+    /// boundary.
+    pub(crate) fn composer_lease_snapshots(&self) -> Vec<(ComposerLeaseId, Range<usize>)> {
+        self.composer_leases.snapshots()
     }
 
     #[cfg(test)]

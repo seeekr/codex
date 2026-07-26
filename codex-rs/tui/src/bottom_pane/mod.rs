@@ -147,6 +147,7 @@ mod selection_tabs;
 mod textarea;
 pub(crate) use textarea::ComposerLeaseError;
 pub(crate) use textarea::ComposerLeaseId;
+pub(crate) use textarea::SubmittedComposerLease;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use hooks_browser_view::HooksBrowserView;
@@ -348,6 +349,10 @@ impl BottomPane {
         self.composer.take_recent_submission_mention_bindings()
     }
 
+    pub fn take_recent_submission_composer_leases(&mut self) -> Vec<SubmittedComposerLease> {
+        self.composer.take_recent_submission_composer_leases()
+    }
+
     /// Add a staged slash-command draft to the composer's local recall list.
     ///
     /// This should be called exactly once after `ChatWidget` dispatches a recognized command.
@@ -380,6 +385,7 @@ impl BottomPane {
         let _ = self.take_recent_submission_images_with_placeholders();
         let _ = self.take_remote_image_urls();
         let _ = self.take_recent_submission_mention_bindings();
+        let _ = self.take_recent_submission_composer_leases();
         let _ = self.take_mention_bindings();
     }
 

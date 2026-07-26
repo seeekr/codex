@@ -119,6 +119,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
@@ -10118,6 +10119,53 @@ async fn steer_input_returns_active_turn_id() {
 
     assert_eq!(turn_id, tc.sub_id);
     assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
+}
+
+#[tokio::test]
+async fn steer_input_accepts_application_context_without_user_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let turn_id = sess
+        .steer_input(
+            Vec::new(),
+            BTreeMap::from([(
+                "koenig_correction_test".to_string(),
+                AdditionalContextEntry {
+                    value: "replace parakeat with Parakeet".to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            )]),
+            Some(&tc.sub_id),
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect("context-only application steer should succeed");
+
+    assert_eq!(turn_id, tc.sub_id);
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "<koenig_correction_test>replace parakeat with \
+                       Parakeet</koenig_correction_test>"
+                    .to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })]
+    );
 }
 
 #[tokio::test]

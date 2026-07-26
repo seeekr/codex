@@ -69,15 +69,41 @@ impl ChatWidget {
         );
     }
 
+    pub(super) fn submit_user_message_with_composer_submission(
+        &mut self,
+        user_message: UserMessage,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+    ) {
+        let _accepted = self.submit_user_message_with_history_record_and_composer_submission(
+            user_message,
+            UserMessageHistoryRecord::UserMessageText,
+            composer_submission,
+        );
+    }
+
     pub(super) fn submit_user_message_with_history_record(
         &mut self,
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
     ) -> bool {
+        self.submit_user_message_with_history_record_and_composer_submission(
+            user_message,
+            history_record,
+            None,
+        )
+    }
+
+    pub(super) fn submit_user_message_with_history_record_and_composer_submission(
+        &mut self,
+        user_message: UserMessage,
+        history_record: UserMessageHistoryRecord,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+    ) -> bool {
         self.submit_user_message_with_history_and_shell_escape_policy(
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
+            composer_submission,
         )
         .0
     }
@@ -91,6 +117,7 @@ impl ChatWidget {
             user_message,
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
+            None,
         )
         .1
     }
@@ -100,12 +127,18 @@ impl ChatWidget {
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
     ) -> (bool, Option<AppCommand>) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
                 .queued_user_messages
-                .push_front(QueuedUserMessage::from(user_message));
+                .push_front(QueuedUserMessage {
+                    user_message,
+                    action: QueuedInputAction::Plain,
+                    pending_pastes: Vec::new(),
+                    composer_submission,
+                });
             self.input_queue
                 .queued_user_message_history_records
                 .push_front(history_record);
@@ -329,6 +362,7 @@ impl ChatWidget {
             },
             history_record: history_record.clone(),
             compare_key: Self::pending_steer_compare_key_from_items(&items),
+            composer_submission: composer_submission.clone(),
         });
         let personality = self
             .config
@@ -349,7 +383,8 @@ impl ChatWidget {
             /*final_output_json_schema*/ None,
             collaboration_mode,
             personality,
-        );
+        )
+        .with_composer_submission(composer_submission);
 
         if !self.submit_op(op.clone()) {
             return (false, None);

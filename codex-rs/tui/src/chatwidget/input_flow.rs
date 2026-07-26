@@ -16,8 +16,11 @@ impl ChatWidget {
             InputResult::Submitted {
                 text,
                 text_elements,
+                composer_leases,
             } => {
                 let user_message = self.user_message_from_submission(text, text_elements);
+                let composer_submission =
+                    self.native_composer_submission(&user_message.text, composer_leases);
                 if user_message.text.is_empty()
                     && user_message.local_images.is_empty()
                     && user_message.remote_image_urls.is_empty()
@@ -31,7 +34,12 @@ impl ChatWidget {
                     if self.only_user_shell_commands_running()
                         && !user_message.text.starts_with('!')
                     {
-                        self.queue_user_message(user_message);
+                        self.queue_user_message_with_options_and_submission(
+                            user_message,
+                            QueuedInputAction::Plain,
+                            Vec::new(),
+                            composer_submission,
+                        );
                         return;
                     }
                     // Submitted is emitted when user submits.
@@ -39,9 +47,17 @@ impl ChatWidget {
                     self.reasoning_buffer.clear();
                     self.full_reasoning_buffer.clear();
                     self.set_status_header(String::from("Working"));
-                    self.submit_user_message(user_message);
+                    self.submit_user_message_with_composer_submission(
+                        user_message,
+                        composer_submission,
+                    );
                 } else {
-                    self.queue_user_message(user_message);
+                    self.queue_user_message_with_options_and_submission(
+                        user_message,
+                        QueuedInputAction::Plain,
+                        Vec::new(),
+                        composer_submission,
+                    );
                 }
             }
             InputResult::Queued {
@@ -49,9 +65,17 @@ impl ChatWidget {
                 text_elements,
                 action,
                 pending_pastes,
+                composer_leases,
             } => {
                 let user_message = self.user_message_from_submission(text, text_elements);
-                self.queue_user_message_with_options(user_message, action, pending_pastes);
+                let composer_submission =
+                    self.native_composer_submission(&user_message.text, composer_leases);
+                self.queue_user_message_with_options_and_submission(
+                    user_message,
+                    action,
+                    pending_pastes,
+                    composer_submission,
+                );
             }
             InputResult::Command(cmd) => {
                 self.handle_slash_command_dispatch(cmd);
@@ -99,6 +123,21 @@ impl ChatWidget {
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
     ) {
+        self.queue_user_message_with_options_and_submission(
+            user_message,
+            action,
+            pending_pastes,
+            None,
+        );
+    }
+
+    fn queue_user_message_with_options_and_submission(
+        &mut self,
+        user_message: UserMessage,
+        action: QueuedInputAction,
+        pending_pastes: Vec<(String, String)>,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+    ) {
         if !self.is_session_configured()
             || self.is_user_turn_pending_or_running()
             || self.input_queue.suppress_queue_autosend
@@ -109,13 +148,14 @@ impl ChatWidget {
                     user_message,
                     action,
                     pending_pastes,
+                    composer_submission,
                 });
             self.input_queue
                 .queued_user_message_history_records
                 .push_back(UserMessageHistoryRecord::UserMessageText);
             self.refresh_pending_input_preview();
         } else {
-            self.submit_user_message(user_message);
+            self.submit_user_message_with_composer_submission(user_message, composer_submission);
         }
     }
 
@@ -134,10 +174,13 @@ impl ChatWidget {
             };
             match queued_message.action {
                 QueuedInputAction::Plain => {
-                    submitted_follow_up = self.submit_user_message_with_history_record(
-                        queued_message.into_user_message(),
-                        history_record,
-                    );
+                    let (user_message, composer_submission) = queued_message.into_submission();
+                    submitted_follow_up = self
+                        .submit_user_message_with_history_record_and_composer_submission(
+                            user_message,
+                            history_record,
+                            composer_submission,
+                        );
                     break;
                 }
                 QueuedInputAction::ParseSlash => {
@@ -163,6 +206,15 @@ impl ChatWidget {
 
     pub(super) fn is_user_turn_pending_or_running(&self) -> bool {
         self.input_queue.user_turn_pending_start || self.bottom_pane.is_task_running()
+    }
+
+    fn native_composer_submission(
+        &self,
+        submitted_text: &str,
+        leases: Vec<crate::bottom_pane::SubmittedComposerLease>,
+    ) -> Option<crate::composer_control::NativeComposerSubmission> {
+        let thread_id = self.thread_id?.to_string();
+        crate::composer_control::NativeComposerSubmission::new(thread_id, submitted_text, leases)
     }
 
     pub(super) fn only_user_shell_commands_running(&self) -> bool {
