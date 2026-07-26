@@ -149,6 +149,12 @@ enum ComposerCommand {
     },
 }
 
+impl ComposerCommand {
+    fn may_change_text(&self) -> bool {
+        matches!(self, Self::Insert { .. } | Self::Replace { .. })
+    }
+}
+
 struct Capture {
     thread_id: String,
     text_hash: [u8; 32],
@@ -619,9 +625,6 @@ fn validate_inserted_text(text: &str, allow_empty: bool) -> Result<(), ErrorCode
     if (!allow_empty && text.is_empty()) || text.len() > MAX_TEXT_BYTES {
         return Err(ErrorCode::InvalidText);
     }
-    if text.contains('\r') || text.contains('\n') {
-        return Err(ErrorCode::InvalidText);
-    }
     Ok(())
 }
 
@@ -803,6 +806,7 @@ fn handle_connection(
             return;
         }
     };
+    let may_change_text = command.may_change_text();
 
     let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
     let ui_request = ComposerControlRequest {
@@ -820,7 +824,10 @@ fn handle_connection(
     }
     let result = match reply_rx.recv_timeout(UI_REPLY_TIMEOUT) {
         Ok(result) => result,
-        Err(_) => WireResult::error(ErrorCode::UiTimeout, MutationOutcome::Unknown),
+        Err(_) if may_change_text => {
+            WireResult::error(ErrorCode::UiTimeout, MutationOutcome::Unknown)
+        }
+        Err(_) => WireResult::not_applied(ErrorCode::UiTimeout),
     };
     write_response(stream, instance_id, result);
 }
