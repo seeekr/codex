@@ -111,6 +111,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AdditionalContextEntry;
+use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -248,6 +249,7 @@ pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
+    ApplicationContextReceiptConflict { key: String },
     EmptyInput,
 }
 
@@ -274,6 +276,10 @@ impl SteerInputError {
                     }),
                 }
             }
+            Self::ApplicationContextReceiptConflict { key } => ErrorEvent {
+                message: format!("application context receipt `{key}` was reused with new content"),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
@@ -3912,12 +3918,39 @@ impl Session {
             }
         }
 
+        let application_context_only = !additional_context.is_empty()
+            && additional_context
+                .values()
+                .all(|entry| entry.kind == AdditionalContextKind::Application);
+        if input.is_empty() && !application_context_only {
+            return Err(SteerInputError::EmptyInput);
+        }
         let additional_context_input = {
             let mut state = self.state.lock().await;
-            state.additional_context.merge(additional_context)
+            if input.is_empty() {
+                state
+                    .additional_context
+                    .commit_application(additional_context)
+                    .map_err(
+                        |conflict| SteerInputError::ApplicationContextReceiptConflict {
+                            key: conflict.key,
+                        },
+                    )?
+            } else {
+                state.additional_context.merge(additional_context)
+            }
         };
-        if input.is_empty() && additional_context_input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
+        let committed_application_context = input.is_empty();
+        let additional_context_input = additional_context_input
+            .into_iter()
+            .map(ResponseItem::from)
+            .collect::<Vec<_>>();
+        if committed_application_context && !additional_context_input.is_empty() {
+            self.record_conversation_items(
+                active_task.turn_context.as_ref(),
+                &additional_context_input,
+            )
+            .await;
         }
 
         if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
@@ -3926,12 +3959,21 @@ impl Session {
                 .turn_metadata_state
                 .set_responsesapi_client_metadata(responsesapi_client_metadata);
         }
+        if committed_application_context && additional_context_input.is_empty() {
+            return Ok(active_turn_id.clone());
+        }
 
-        let mut pending_input = additional_context_input
-            .into_iter()
-            .map(ResponseItem::from)
-            .map(TurnInput::ResponseItem)
-            .collect::<Vec<_>>();
+        let mut pending_input = if committed_application_context {
+            (!additional_context_input.is_empty())
+                .then_some(TurnInput::CommittedApplicationContext)
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            additional_context_input
+                .into_iter()
+                .map(TurnInput::ResponseItem)
+                .collect::<Vec<_>>()
+        };
         if !input.is_empty() {
             pending_input.push(TurnInput::UserInput {
                 content: input,

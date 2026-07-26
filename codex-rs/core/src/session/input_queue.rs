@@ -16,6 +16,10 @@ pub(crate) enum TurnInput {
         client_id: Option<String>,
     },
     ResponseItem(ResponseItem),
+    /// A model-visible Application item that was durably recorded before it entered this queue.
+    ///
+    /// Its presence wakes the next sampling boundary; draining it must not record the item again.
+    CommittedApplicationContext,
     InterAgentCommunication(InterAgentCommunication),
 }
 

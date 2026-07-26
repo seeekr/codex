@@ -31,6 +31,7 @@ impl App {
         if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
             let mut steer_turn_id = turn_id;
             let mut retried_after_turn_mismatch = false;
+            let mut retried_after_transport = false;
             loop {
                 match app_server
                     .turn_steer_application_context(
@@ -66,6 +67,11 @@ impl App {
                                 return CorrectionDispatchOutcome::NotApplied;
                             }
                         }
+                    }
+                    Err(
+                        TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. },
+                    ) if !retried_after_transport => {
+                        retried_after_transport = true;
                     }
                     Err(
                         TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. },
@@ -653,6 +659,9 @@ impl App {
                 let client_user_message_id = composer_submission
                     .as_ref()
                     .map(NativeComposerSubmission::client_user_message_id);
+                let composer_receipt = composer_submission
+                    .as_ref()
+                    .map(NativeComposerSubmission::receipt_context);
                 let mut should_start_turn = true;
                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
                     let mut steer_turn_id = turn_id;
@@ -663,14 +672,17 @@ impl App {
                                 thread_id,
                                 steer_turn_id.clone(),
                                 client_user_message_id.clone(),
+                                composer_receipt.clone(),
                                 items.to_vec(),
                             )
                             .await
                         {
-                            Ok(_) => {
+                            Ok(response) => {
                                 if let Some(submission) = composer_submission {
-                                    self.accepted_composer_submissions
-                                        .push_back(submission.clone());
+                                    self.register_pending_composer_submission(
+                                        submission.clone(),
+                                        response.turn_id,
+                                    );
                                 }
                                 return Ok(true);
                             }
@@ -744,6 +756,7 @@ impl App {
                         .turn_start(
                             thread_id,
                             client_user_message_id,
+                            composer_receipt,
                             items.to_vec(),
                             cwd.clone(),
                             *approval_policy,
@@ -760,8 +773,10 @@ impl App {
                         )
                         .await?;
                     if let Some(submission) = composer_submission {
-                        self.accepted_composer_submissions
-                            .push_back(submission.clone());
+                        self.register_pending_composer_submission(
+                            submission.clone(),
+                            response.turn.id.clone(),
+                        );
                     }
                     if self.active_thread_id == Some(thread_id)
                         && self.chat_widget.thread_id() == Some(thread_id)
@@ -1524,6 +1539,11 @@ impl App {
         response: &ThreadRollbackResponse,
         origin: ThreadRollbackOrigin,
     ) {
+        self.pending_composer_submissions
+            .retain(|_, pending| pending.submission.thread_id() != thread_id.to_string());
+        self.composer_submission_transitions.push_back(
+            super::ComposerSubmissionTransition::InvalidateThread(thread_id.to_string()),
+        );
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             store.apply_thread_rollback(response);
@@ -1565,6 +1585,7 @@ impl App {
         );
         match event {
             ThreadBufferedEvent::Notification(notification) => {
+                self.note_composer_submission_notification(&notification);
                 self.cache_collab_receiver_threads_for_notification(&notification);
                 self.chat_widget
                     .handle_server_notification(notification, /*replay_kind*/ None);
@@ -1592,9 +1613,11 @@ impl App {
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
         match event {
-            ThreadBufferedEvent::Notification(notification) => self
-                .chat_widget
-                .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot)),
+            ThreadBufferedEvent::Notification(notification) => {
+                self.note_composer_submission_notification(&notification);
+                self.chat_widget
+                    .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot));
+            }
             ThreadBufferedEvent::Request(request) => self
                 .chat_widget
                 .handle_server_request(request, Some(ReplayKind::ThreadSnapshot)),
@@ -1604,6 +1627,62 @@ impl App {
             ThreadBufferedEvent::FeedbackSubmission(event) => {
                 self.handle_feedback_thread_event(event);
             }
+        }
+    }
+
+    fn register_pending_composer_submission(
+        &mut self,
+        submission: NativeComposerSubmission,
+        turn_id: String,
+    ) {
+        let client_id = submission.client_user_message_id();
+        self.pending_composer_submissions.insert(
+            client_id,
+            super::PendingComposerSubmissionCommit {
+                submission: submission.clone(),
+                turn_id,
+            },
+        );
+        self.composer_submission_transitions
+            .push_back(super::ComposerSubmissionTransition::Pending(submission));
+    }
+
+    fn note_composer_submission_notification(&mut self, notification: &ServerNotification) {
+        match notification {
+            ServerNotification::ItemCompleted(notification) => {
+                let ThreadItem::UserMessage {
+                    client_id: Some(client_id),
+                    ..
+                } = &notification.item
+                else {
+                    return;
+                };
+                let Some(pending) = self.pending_composer_submissions.remove(client_id) else {
+                    return;
+                };
+                self.composer_submission_transitions.push_back(
+                    super::ComposerSubmissionTransition::Committed(pending.submission),
+                );
+            }
+            ServerNotification::TurnCompleted(notification) => {
+                let abandoned_ids = self
+                    .pending_composer_submissions
+                    .iter()
+                    .filter_map(|(client_id, pending)| {
+                        (pending.turn_id == notification.turn.id
+                            && pending.submission.thread_id() == notification.thread_id)
+                            .then_some(client_id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for client_id in abandoned_ids {
+                    if let Some(pending) = self.pending_composer_submissions.remove(&client_id) {
+                        self.composer_submission_transitions.push_back(
+                            super::ComposerSubmissionTransition::Abandoned(pending.submission),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
