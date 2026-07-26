@@ -187,6 +187,66 @@ pub(super) fn reconstruct_correction_receipts(
     (receipts, conflicts)
 }
 
+pub(super) fn reconstruct_surviving_client_user_message_ids(
+    rollout_items: &[RolloutItem],
+) -> HashSet<String> {
+    #[derive(Default)]
+    struct UserBoundary {
+        client_id: Option<String>,
+        paired: bool,
+    }
+
+    fn pair_client_id(boundaries: &mut [UserBoundary], client_id: Option<&str>) {
+        let Some(boundary) = boundaries.last_mut() else {
+            return;
+        };
+        if boundary.paired {
+            // Mixed retained data can contain both history projections for the same immediately
+            // preceding boundary. The active history mode normally persists exactly one.
+            return;
+        }
+        boundary.client_id = client_id.map(str::to_string);
+        boundary.paired = true;
+    }
+
+    let mut boundaries = Vec::<UserBoundary>::new();
+    for item in rollout_items {
+        match item {
+            RolloutItem::ResponseItem(response_item) if is_user_turn_boundary(response_item) => {
+                boundaries.push(UserBoundary::default());
+            }
+            RolloutItem::InterAgentCommunication(_) => boundaries.push(UserBoundary {
+                client_id: None,
+                paired: true,
+            }),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                if let codex_protocol::items::TurnItem::UserMessage(user_message) = &event.item {
+                    pair_client_id(&mut boundaries, user_message.client_id.as_deref());
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) => {
+                pair_client_id(&mut boundaries, user_message.client_id.as_deref());
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                let drop_count = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+                boundaries.truncate(boundaries.len().saturating_sub(drop_count));
+            }
+            RolloutItem::Compacted(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::ResponseItem(_) => {}
+        }
+    }
+
+    boundaries
+        .into_iter()
+        .filter_map(|boundary| boundary.client_id)
+        .collect()
+}
+
 pub(super) fn deduplicate_correction_frames(
     history: Vec<ResponseItem>,
     conflicts: &mut HashSet<String>,

@@ -55,6 +55,154 @@ fn correction_message(id: Uuid, payload: &str) -> ResponseItem {
     }
 }
 
+fn turn_started(turn_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnStarted(
+        codex_protocol::protocol::TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        },
+    ))
+}
+
+fn completed_client_user_message(turn_id: &str, client_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ItemCompleted(
+        codex_protocol::protocol::ItemCompletedEvent {
+            thread_id: ThreadId::default(),
+            turn_id: turn_id.to_string(),
+            item: codex_protocol::items::TurnItem::UserMessage(
+                codex_protocol::items::UserMessageItem {
+                    id: format!("item-{client_id}"),
+                    client_id: Some(client_id.to_string()),
+                    content: Vec::new(),
+                },
+            ),
+            completed_at_ms: 0,
+        },
+    ))
+}
+
+fn legacy_client_user_message(client_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::UserMessage(
+        codex_protocol::protocol::UserMessageEvent {
+            client_id: Some(client_id.to_string()),
+            message: "legacy user projection".to_string(),
+            ..Default::default()
+        },
+    ))
+}
+
+fn inter_agent_message(text: &str) -> InterAgentCommunication {
+    InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("worker path"),
+        Vec::new(),
+        text.to_string(),
+        /*trigger_turn*/ true,
+    )
+}
+
+#[test]
+fn surviving_client_message_projection_rolls_back_only_the_latest_user_boundary() {
+    let rollout_items = vec![
+        turn_started("turn-1"),
+        RolloutItem::ResponseItem(user_message("initial")),
+        completed_client_user_message("turn-1", "initial-client-id"),
+        RolloutItem::ResponseItem(user_message("steer")),
+        completed_client_user_message("turn-1", "steer-client-id"),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(vec![assistant_message("compacted")]),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    assert_eq!(
+        rollout_reconstruction::reconstruct_surviving_client_user_message_ids(&rollout_items),
+        HashSet::from(["initial-client-id".to_string()])
+    );
+}
+
+#[test]
+fn surviving_client_message_projection_ignores_compaction_and_non_user_turns() {
+    let rollout_items = vec![
+        turn_started("turn-1"),
+        RolloutItem::ResponseItem(user_message("initial")),
+        completed_client_user_message("turn-1", "surviving-client-id"),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary without raw client ID".to_string(),
+            replacement_history: Some(vec![assistant_message("summary")]),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        turn_started("correction-only-turn"),
+    ];
+
+    assert_eq!(
+        rollout_reconstruction::reconstruct_surviving_client_user_message_ids(&rollout_items),
+        HashSet::from(["surviving-client-id".to_string()])
+    );
+}
+
+#[test]
+fn surviving_client_message_projection_pairs_legacy_user_event() {
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("initial")),
+        legacy_client_user_message("legacy-client-id"),
+    ];
+
+    assert_eq!(
+        rollout_reconstruction::reconstruct_surviving_client_user_message_ids(&rollout_items),
+        HashSet::from(["legacy-client-id".to_string()])
+    );
+}
+
+#[test]
+fn surviving_client_message_projection_counts_metadata_and_agent_message_once() {
+    let communication = inter_agent_message("follow-up task");
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("initial")),
+        completed_client_user_message("turn-1", "initial-client-id"),
+        RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+        RolloutItem::ResponseItem(communication.to_model_input_item()),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    assert_eq!(
+        rollout_reconstruction::reconstruct_surviving_client_user_message_ids(&rollout_items),
+        HashSet::from(["initial-client-id".to_string()])
+    );
+}
+
+#[test]
+fn surviving_client_message_projection_counts_typed_inter_agent_boundary() {
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("initial")),
+        completed_client_user_message("turn-1", "initial-client-id"),
+        RolloutItem::InterAgentCommunication(inter_agent_message("legacy follow-up task")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    assert_eq!(
+        rollout_reconstruction::reconstruct_surviving_client_user_message_ids(&rollout_items),
+        HashSet::from(["initial-client-id".to_string()])
+    );
+}
+
 #[test]
 fn correction_receipt_replay_is_compaction_independent_and_semantically_idempotent() {
     let id = Uuid::new_v4();
