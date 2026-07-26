@@ -1634,6 +1634,21 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn correction_intent_carrier_is_not_rendered_in_thread_history() {
+        let carrier = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+            codex_protocol::protocol::RawResponseItemEvent::correction_intent(
+                codex_protocol::protocol::CorrectionIntent {
+                    correction_id: "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+                    expected_client_user_message_id: "client-user-1".to_string(),
+                    payload: "Tori should be Tauri".to_string(),
+                },
+            ),
+        ));
+
+        assert!(build_turns_from_rollout_items(&[carrier]).is_empty());
+    }
+
+    #[test]
     fn builds_multiple_turns_with_reasoning_items() {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {

@@ -114,6 +114,10 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::ImageGenerationEnd(_)
         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
 
+        // Correction intents use a compatibility carrier that older Codex builds safely ignore.
+        // Only the typed sentinel shape is durable; ordinary raw events remain transient.
+        EventMsg::RawResponseItem(event) => event.persisted_correction_intent().is_some(),
+
         // Transient, non-durable events.
         EventMsg::Error(_)
         | EventMsg::GuardianAssessment(_)
@@ -137,7 +141,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::AgentReasoningSectionBreak(_)
-        | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::ExecCommandBegin(_)
@@ -172,5 +175,49 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabResumeBegin(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::protocol::CorrectionIntent;
+    use codex_protocol::protocol::RawResponseItemEvent;
+
+    fn correction_intent() -> CorrectionIntent {
+        CorrectionIntent {
+            correction_id: "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+            expected_client_user_message_id: "client-user-1".to_string(),
+            payload: "Tori should be Tauri".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_well_formed_correction_intent_raw_events_are_persisted() {
+        let valid =
+            EventMsg::RawResponseItem(RawResponseItemEvent::correction_intent(correction_intent()));
+        let ordinary = EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::Other,
+            correction_intent: None,
+        });
+        let malformed = EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "not a sentinel".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            correction_intent: Some(correction_intent()),
+        });
+
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            assert!(should_persist_event_msg(&valid, history_mode));
+            assert!(!should_persist_event_msg(&ordinary, history_mode));
+            assert!(!should_persist_event_msg(&malformed, history_mode));
+        }
     }
 }

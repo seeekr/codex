@@ -341,3 +341,23 @@ fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
         .map(|(offset, _)| byte_index.saturating_add(offset))
         .unwrap_or(text.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::CorrectionIntent;
+    use codex_protocol::protocol::RawResponseItemEvent;
+
+    #[test]
+    fn correction_intent_payload_is_not_conversation_text() {
+        let item = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+            RawResponseItemEvent::correction_intent(CorrectionIntent {
+                correction_id: "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+                expected_client_user_message_id: "client-user-1".to_string(),
+                payload: "Tori should be Tauri".to_string(),
+            }),
+        ));
+
+        assert!(conversation_text_from_item(&item).is_none());
+    }
+}

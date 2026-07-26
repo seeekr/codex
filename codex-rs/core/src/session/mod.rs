@@ -3172,7 +3172,10 @@ impl Session {
         for item in items {
             self.send_event(
                 turn_context,
-                EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
+                EventMsg::RawResponseItem(RawResponseItemEvent {
+                    item: item.clone(),
+                    correction_intent: None,
+                }),
             )
             .await;
         }
