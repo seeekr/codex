@@ -281,6 +281,7 @@ pub(crate) struct PendingComposerCorrection {
     lease_id: Uuid,
     thread_id: String,
     correction_id: Uuid,
+    expected_client_user_message_id: String,
     payload: String,
     reply: SyncSender<WireResult>,
 }
@@ -292,6 +293,10 @@ impl PendingComposerCorrection {
 
     pub(crate) fn correction_id(&self) -> Uuid {
         self.correction_id
+    }
+
+    pub(crate) fn expected_client_user_message_id(&self) -> &str {
+        &self.expected_client_user_message_id
     }
 
     pub(crate) fn payload(&self) -> &str {
@@ -331,6 +336,7 @@ struct PreparedCorrection {
     lease_id: Uuid,
     thread_id: String,
     correction_id: Uuid,
+    expected_client_user_message_id: String,
     payload: String,
 }
 
@@ -482,6 +488,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 lease_id: correction.lease_id,
                 thread_id: correction.thread_id,
                 correction_id: correction.correction_id,
+                expected_client_user_message_id: correction.expected_client_user_message_id,
                 payload: correction.payload,
                 reply,
             }),
@@ -859,6 +866,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     ));
                 }
                 let correction_id = Uuid::new_v4();
+                let expected_client_user_message_id =
+                    format!("koenig-composer-{}", receipt.submission_id);
                 let Some(payload) = mechanical_correction_context(
                     receipt.submission_id,
                     &receipt.submitted_text,
@@ -883,10 +892,12 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     lease_id,
                     thread_id: lease.thread_id,
                     correction_id,
+                    expected_client_user_message_id,
                     payload,
                 })
             }
             ExternalLeaseState::CorrectionPending {
+                receipt,
                 correction_id,
                 expected: pending_expected,
                 replacement: pending_replacement,
@@ -907,6 +918,10 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     lease_id,
                     thread_id: lease.thread_id,
                     correction_id,
+                    expected_client_user_message_id: format!(
+                        "koenig-composer-{}",
+                        receipt.submission_id
+                    ),
                     payload,
                 })
             }

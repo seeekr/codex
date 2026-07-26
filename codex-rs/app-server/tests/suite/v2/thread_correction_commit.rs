@@ -10,6 +10,8 @@ use codex_app_server_protocol::ThreadCorrectionCommitResponse;
 use codex_app_server_protocol::ThreadCorrectionCommitStatus;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::RolloutRecorder;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -23,12 +25,12 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[tokio::test]
 async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_once(
+    let first_response_mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
-            responses::ev_response_created("resp-correction"),
-            responses::ev_assistant_message("msg-correction-answer", "Done"),
-            responses::ev_completed("resp-correction"),
+            responses::ev_response_created("resp-target"),
+            responses::ev_assistant_message("msg-target-answer", "Ready"),
+            responses::ev_completed("resp-target"),
         ]),
     )
     .await;
@@ -54,6 +56,38 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_response)?;
 
+    let target_client_user_message_id = "client-message-to-correct".to_string();
+    let target_request = app
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: Some(target_client_user_message_id.clone()),
+            input: vec![V2UserInput::Text {
+                text: "Use parakeat".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_response_message(RequestId::Integer(target_request)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    assert_eq!(first_response_mock.requests().len(), 1);
+
+    let correction_response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-correction"),
+        responses::ev_assistant_message("msg-correction-answer", "Done"),
+        responses::ev_completed("resp-correction"),
+    ]))
+    .set_delay(std::time::Duration::from_millis(500));
+    let response_mock = responses::mount_response_once(&server, correction_response).await;
+
     let correction_id = Uuid::new_v4().to_string();
     let correction_frame_id = format!(
         "msg_correction_{}",
@@ -63,6 +97,7 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     let params = ThreadCorrectionCommitParams {
         thread_id: thread.id.clone(),
         correction_id: correction_id.clone(),
+        expected_client_user_message_id: target_client_user_message_id.clone(),
         payload: payload.clone(),
     };
     let first_request = app
@@ -75,7 +110,7 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     .await??;
     assert_eq!(
         to_response::<ThreadCorrectionCommitResponse>(first_response)?.status,
-        ThreadCorrectionCommitStatus::Committed
+        ThreadCorrectionCommitStatus::Queued
     );
 
     let retry_request = app.send_thread_correction_commit_request(params).await?;
@@ -86,13 +121,14 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     .await??;
     assert_eq!(
         to_response::<ThreadCorrectionCommitResponse>(retry_response)?.status,
-        ThreadCorrectionCommitStatus::AlreadyCommitted
+        ThreadCorrectionCommitStatus::Queued
     );
 
     let conflict_request = app
         .send_thread_correction_commit_request(ThreadCorrectionCommitParams {
             thread_id: thread.id.clone(),
             correction_id,
+            expected_client_user_message_id: target_client_user_message_id,
             payload: "different payload".to_string(),
         })
         .await?;

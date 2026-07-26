@@ -123,6 +123,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+#[cfg(test)]
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
@@ -254,7 +255,7 @@ pub enum SteerInputError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrectionCommitStatus {
-    Committed,
+    Queued,
     AlreadyCommitted,
 }
 
@@ -790,6 +791,7 @@ impl Codex {
     pub async fn commit_correction(
         &self,
         correction_id: String,
+        expected_client_user_message_id: String,
         payload: String,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<CorrectionCommitStatus> {
@@ -804,6 +806,7 @@ impl Codex {
             id: id.clone(),
             op: Op::CommitCorrection {
                 correction_id,
+                expected_client_user_message_id,
                 payload,
             },
             client_user_message_id: None,
@@ -1467,8 +1470,13 @@ impl Session {
     ) -> Option<PreviousTurnSettings> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
+            surviving_client_user_message_ids,
+            correction_intents,
             correction_receipts,
             correction_receipt_conflicts,
+            correction_integrity_failure,
+            processed_correction_ids,
+            correction_auto_start_suppressed,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1484,12 +1492,26 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
+        let correction_integrity_event = correction_integrity_failure.clone();
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
+            state.surviving_client_user_message_ids = surviving_client_user_message_ids;
+            state.correction_intents = correction_intents;
+            state.persisted_correction_intent_ids = state
+                .correction_intents
+                .iter()
+                .filter_map(|intent| {
+                    let frame =
+                        Session::validate_correction(&intent.correction_id, intent.payload.clone())
+                            .ok()?;
+                    correction::correction_frame_id(&frame).map(str::to_string)
+                })
+                .collect();
             state.correction_receipts = correction_receipts;
             state.correction_receipt_conflicts = correction_receipt_conflicts;
-            state.correction_intents.clear();
+            state.processed_correction_ids = processed_correction_ids;
+            state.correction_auto_start_suppressed = correction_auto_start_suppressed;
             if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
@@ -1504,6 +1526,16 @@ impl Session {
                 },
             );
             state.set_previous_turn_settings(previous_turn_settings.clone());
+        }
+        if let Some(message) = correction_integrity_event {
+            self.send_event(
+                turn_context,
+                EventMsg::Error(ErrorEvent {
+                    message,
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            )
+            .await;
         }
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
@@ -3175,6 +3207,7 @@ impl Session {
                 EventMsg::RawResponseItem(RawResponseItemEvent {
                     item: item.clone(),
                     correction_intent: None,
+                    corrections_sampled: None,
                 }),
             )
             .await;
@@ -3558,7 +3591,13 @@ impl Session {
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
-        state.clone_history()
+        let mut history = state.clone_history();
+        let projected = correction::project_correction_acks(
+            history.raw_items().to_vec(),
+            &state.processed_correction_ids,
+        );
+        history.replace_prompt_projection(projected);
+        history
     }
 
     pub(crate) async fn current_window_id(&self) -> String {
@@ -3886,6 +3925,13 @@ impl Session {
         let response_item = self.response_item_from_user_input(input.to_vec());
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
+        if let Some(client_id) = client_id.as_ref() {
+            self.state
+                .lock()
+                .await
+                .surviving_client_user_message_ids
+                .insert(client_id.clone());
+        }
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);
@@ -4043,9 +4089,7 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let had_active_turn = self.active_turn.lock().await.is_some();
-        self.abort_all_tasks(TurnAbortReason::Interrupted).await;
-        if !had_active_turn {
+        if !self.interrupt_all_tasks().await {
             self.cancel_mcp_startup().await;
         }
     }

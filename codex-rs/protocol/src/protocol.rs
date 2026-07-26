@@ -578,6 +578,7 @@ pub enum Op {
     /// same payload is idempotent; reusing it with different content is rejected.
     CommitCorrection {
         correction_id: String,
+        expected_client_user_message_id: String,
         payload: String,
     },
 
@@ -1817,12 +1818,21 @@ pub struct CorrectionIntent {
     pub payload: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionsSampled {
+    pub correction_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 pub struct RawResponseItemEvent {
     pub item: ResponseItem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub correction_intent: Option<CorrectionIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub corrections_sampled: Option<CorrectionsSampled>,
 }
 
 impl RawResponseItemEvent {
@@ -1830,12 +1840,27 @@ impl RawResponseItemEvent {
         Self {
             item: ResponseItem::Other,
             correction_intent: Some(intent),
+            corrections_sampled: None,
+        }
+    }
+
+    pub fn corrections_sampled(correction_ids: Vec<String>) -> Self {
+        Self {
+            item: ResponseItem::Other,
+            correction_intent: None,
+            corrections_sampled: Some(CorrectionsSampled { correction_ids }),
         }
     }
 
     pub fn persisted_correction_intent(&self) -> Option<&CorrectionIntent> {
-        matches!(&self.item, ResponseItem::Other)
+        (matches!(&self.item, ResponseItem::Other) && self.corrections_sampled.is_none())
             .then_some(self.correction_intent.as_ref())
+            .flatten()
+    }
+
+    pub fn persisted_corrections_sampled(&self) -> Option<&CorrectionsSampled> {
+        (matches!(&self.item, ResponseItem::Other) && self.correction_intent.is_none())
+            .then_some(self.corrections_sampled.as_ref())
             .flatten()
     }
 }
@@ -6270,6 +6295,31 @@ mod tests {
         let ordinary: RawResponseItemEvent =
             serde_json::from_value(json!({"item": {"type": "other"}}))?;
         assert!(ordinary.correction_intent.is_none());
+        assert!(ordinary.corrections_sampled.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn corrections_sampled_carrier_is_legacy_deserializable() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyRawResponseItemEvent {
+            item: ResponseItem,
+        }
+
+        let event = RawResponseItemEvent::corrections_sampled(vec![
+            "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+        ]);
+        let value = serde_json::to_value(&event)?;
+
+        assert_eq!(value["item"], json!({"type": "other"}));
+        assert_eq!(
+            value["corrections_sampled"],
+            json!({
+                "correctionIds": ["b7754d6f-f4df-4cfe-8621-8b735d348fb3"],
+            })
+        );
+        let legacy = serde_json::from_value::<LegacyRawResponseItemEvent>(value)?;
+        assert_eq!(legacy.item, ResponseItem::Other);
         Ok(())
     }
 }

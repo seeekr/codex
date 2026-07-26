@@ -32,6 +32,8 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    /// Ephemeral Stop ordering across taskless startup and terminal publication.
+    pub(crate) interrupt_pending: bool,
     /// Present while a task owner is preparing lifecycle state before installing the running task.
     ///
     /// Replacing work waits for this publication boundary instead of clearing or reusing an
@@ -100,6 +102,7 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            interrupt_pending: false,
             startup_done: None,
             terminal_done: None,
         }
@@ -144,6 +147,9 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    pub(crate) correction_only_turn: bool,
+    pub(crate) normal_sampling_attempted: bool,
+    pub(crate) completed_normal_sampling: bool,
 }
 
 pub(crate) struct PendingRequestPermissions {
@@ -153,6 +159,15 @@ pub(crate) struct PendingRequestPermissions {
 }
 
 impl TurnState {
+    pub(crate) fn begin_normal_sampling(&mut self) {
+        self.normal_sampling_attempted = true;
+        self.completed_normal_sampling = false;
+    }
+
+    pub(crate) fn complete_normal_sampling(&mut self) {
+        self.completed_normal_sampling = true;
+    }
+
     pub(crate) fn insert_pending_approval(
         &mut self,
         key: String,

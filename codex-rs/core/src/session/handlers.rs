@@ -773,10 +773,13 @@ pub(super) async fn submission_loop(
                 }
                 Op::CommitCorrection {
                     correction_id,
+                    expected_client_user_message_id,
                     payload,
                 } => {
                     let submission_id = sub.id;
-                    let result = sess.commit_correction(correction_id, payload).await;
+                    let result = sess
+                        .commit_correction(correction_id, expected_client_user_message_id, payload)
+                        .await;
                     sess.resolve_correction_commit(&submission_id, result).await;
                     false
                 }

@@ -1767,6 +1767,41 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 }
 
 #[tokio::test]
+async fn record_initial_history_surfaces_correction_integrity_failure_once() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    let invalid_intent = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+        codex_protocol::protocol::RawResponseItemEvent::correction_intent(
+            codex_protocol::protocol::CorrectionIntent {
+                correction_id: "not-a-uuid".to_string(),
+                expected_client_user_message_id: "target-client-id".to_string(),
+                payload: "Tori should be Tauri".to_string(),
+            },
+        ),
+    ));
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(vec![invalid_intent]),
+            rollout_path: Some(PathBuf::from("/tmp/correction-integrity.jsonl")),
+        }))
+        .await;
+
+    let event = rx.recv().await.expect("correction integrity error");
+    assert!(matches!(
+        event.msg,
+        EventMsg::Error(ErrorEvent {
+            message,
+            codex_error_info: Some(CodexErrorInfo::Other),
+        }) if message.contains("invalid durable intent")
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "replay must surface one aggregated correction integrity error"
+    );
+}
+
+#[tokio::test]
 async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing_turn_id() {
     let (session, turn_context) = make_session_and_context().await;
     let fresh_item = user_message("fresh");
@@ -9252,6 +9287,123 @@ impl SessionTask for CompletingTask {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompletingSamplingStateTask {
+    previous_attempt_completed: bool,
+    latest_attempt_completed: bool,
+}
+
+impl SessionTask for CompletingSamplingStateTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.completing_sampling_state"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let sess = session.clone_session();
+        let turn_state = sess
+            .input_queue
+            .turn_state_for_sub_id(&sess.active_turn, &ctx.sub_id)
+            .await
+            .expect("sampling-state task must own the active turn");
+        let mut turn_state = turn_state.lock().await;
+        if self.previous_attempt_completed {
+            turn_state.begin_normal_sampling();
+            turn_state.complete_normal_sampling();
+        }
+        turn_state.begin_normal_sampling();
+        if self.latest_attempt_completed {
+            turn_state.complete_normal_sampling();
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompletingKindTask {
+    kind: TaskKind,
+}
+
+impl SessionTask for CompletingKindTask {
+    fn kind(&self) -> TaskKind {
+        self.kind
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.completing_kind"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelfAbortingTask;
+
+impl SessionTask for SelfAbortingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.self_aborting"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        Err(CodexErr::TurnAborted)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeferredNeverEndingTask;
+
+impl SessionTask for DeferredNeverEndingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.deferred_never_ending"
+    }
+
+    fn defers_steer_until_turn_started(&self) -> bool {
+        true
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -11177,11 +11329,793 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     Ok(())
 }
 
+const TEST_CORRECTION_TARGET: &str = "test-correction-target";
+
+async fn seed_test_correction_target(session: &Session) {
+    session
+        .state
+        .lock()
+        .await
+        .surviving_client_user_message_ids
+        .insert(TEST_CORRECTION_TARGET.to_string());
+}
+
+async fn wait_for_correction_frame(session: &Session) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .any(|item| correction::correction_frame_id(item).is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued correction should reach model-visible history");
+}
+
+async fn wait_until_stop_observes_publication(session: &Session) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.interrupt_pending)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Stop should observe the in-progress publication");
+}
+
+async fn replayed_correction_auto_start_suppressed(
+    session: &Session,
+    turn_context: &TurnContext,
+) -> bool {
+    session.flush_rollout().await.expect("flush test rollout");
+    let stored = session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load test rollout");
+    session
+        .reconstruct_history_from_rollout(turn_context, &stored.items)
+        .await
+        .correction_auto_start_suppressed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_stop_keeps_late_commit_idle_until_successful_shell_work_resumes() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    session.interrupt_task().await;
+    assert!(
+        session.state.lock().await.correction_auto_start_suppressed,
+        "Stop observed against active work must suppress correction-only starts"
+    );
+
+    let correction_id = Uuid::new_v4().to_string();
+    assert_eq!(
+        session
+            .commit_correction(
+                correction_id,
+                TEST_CORRECTION_TARGET.to_string(),
+                "Tori should be Tauri".to_string(),
+            )
+            .await
+            .expect("late correction queues after Stop"),
+        CorrectionCommitStatus::Queued
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.has_pending_corrections().await);
+
+    handlers::run_user_shell_command(&session, "shell-resume".to_string(), "true".to_string())
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .any(|item| correction::correction_frame_id(item).is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful non-sampling shell work must schedule the queued correction");
+    assert!(!session.state.lock().await.correction_auto_start_suppressed);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_failed_latest_sampling_attempt_does_not_auto_retry() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
+    session.suppress_correction_auto_start().await;
+    session
+        .commit_correction(
+            Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "Tori should be Tauri".to_string(),
+        )
+        .await
+        .expect("queue correction while automatic work is suppressed");
+    session.allow_correction_auto_start().await;
+
+    let turn_context = session
+        .new_default_turn_with_sub_id("failed-latest-sample".to_string())
+        .await;
+    session
+        .spawn_task(
+            turn_context,
+            Vec::new(),
+            CompletingSamplingStateTask {
+                previous_attempt_completed: true,
+                latest_attempt_completed: false,
+            },
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed sampling task must reach terminal idle state");
+    assert!(session.has_pending_corrections().await);
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .clone_history()
+            .raw_items()
+            .iter()
+            .all(|item| correction::correction_frame_id(item).is_none()),
+        "a failed latest sampling attempt must not recursively start correction work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_user_input_real_work_clears_stop() {
+    let (user_session, user_turn, _rx) = make_session_and_context_with_rx().await;
+    user_session
+        .spawn_task(
+            Arc::clone(&user_turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    user_session.interrupt_task().await;
+    assert!(
+        user_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "Stop observed against active work must suppress correction-only starts"
+    );
+    assert!(user_session.active_turn.lock().await.is_none());
+
+    handlers::user_input_or_turn(
+        &user_session,
+        "user-resume".to_string(),
+        Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "resume".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        },
+        Some("client-user-resume".to_string()),
+    )
+    .await;
+    assert!(
+        !user_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    user_session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_review_real_work_clears_stop() {
+    let (review_session, review_turn, _rx) = make_session_and_context_with_rx().await;
+    review_session.suppress_correction_auto_start().await;
+    handlers::review(
+        &review_session,
+        &review_turn.config,
+        "review-resume".to_string(),
+        codex_protocol::protocol::ReviewRequest {
+            target: codex_protocol::protocol::ReviewTarget::Custom {
+                instructions: "review".to_string(),
+            },
+            user_facing_hint: None,
+        },
+    )
+    .await;
+    assert!(
+        !review_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    review_session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_compact_real_work_clears_stop() {
+    let (compact_session, _compact_turn, _rx) = make_session_and_context_with_rx().await;
+    compact_session.suppress_correction_auto_start().await;
+    handlers::compact(&compact_session, "compact-resume".to_string()).await;
+    assert!(
+        !compact_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    compact_session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_trigger_turn_real_work_clears_stop() {
+    let (trigger_session, _turn, _rx) = make_session_and_context_with_rx().await;
+    trigger_session.suppress_correction_auto_start().await;
+    handlers::inter_agent_communication(
+        &trigger_session,
+        "trigger-resume".to_string(),
+        InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::root(),
+            Vec::new(),
+            "trigger real work".to_string(),
+            /*trigger_turn*/ true,
+        ),
+    )
+    .await;
+    assert!(
+        !trigger_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "trigger-turn mailbox work must resume correction auto-start"
+    );
+    trigger_session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_idle_extension_real_work_clears_stop() {
+    let (extension_session, _turn, _rx) = make_session_and_context_with_rx().await;
+    extension_session.suppress_correction_auto_start().await;
+    extension_session
+        .try_start_turn_if_idle(vec![user_message("idle extension real work")])
+        .await
+        .expect("idle extension work should reserve an idle turn");
+    assert!(
+        !extension_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "idle extension work must resume correction auto-start"
+    );
+    extension_session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_truly_idle_stop_does_not_latch() {
+    let (idle_session, _turn, _rx) = make_session_and_context_with_rx().await;
+    idle_session.interrupt_task().await;
+    assert!(
+        !idle_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "truly idle Stop must not latch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_stop_waits_for_startup_publication_before_latching() {
+    let (mut task_session, replay_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut task_session).await;
+    let task_session = Arc::new(task_session);
+    let reservation = task_session
+        .reserve_real_work_start()
+        .await
+        .expect("real-work reservation");
+    assert!(
+        !task_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    let stop_session = Arc::clone(&task_session);
+    let stop = tokio::spawn(async move {
+        stop_session.interrupt_task().await;
+    });
+    wait_until_stop_observes_publication(&task_session).await;
+    assert!(
+        !task_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "taskless startup is not yet a durable interrupted turn"
+    );
+
+    let context = task_session
+        .new_default_turn_with_sub_id("startup-publishes-task".to_string())
+        .await;
+    assert!(
+        task_session
+            .start_reserved_task(reservation, context, Vec::new(), CompletingTask,)
+            .await
+    );
+    timeout(Duration::from_secs(2), stop)
+        .await
+        .expect("Stop must finish after task publication")
+        .expect("Stop task must not panic");
+    assert!(task_session.active_turn.lock().await.is_none());
+    assert!(
+        task_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    assert!(
+        replayed_correction_auto_start_suppressed(&task_session, &replay_context).await,
+        "published task interruption must reconstruct the live suppression latch"
+    );
+
+    for release_reservation in [true, false] {
+        let (mut idle_session, replay_context) = make_session_and_context().await;
+        attach_in_memory_thread_store(&mut idle_session).await;
+        let replay_context = Arc::new(replay_context);
+        let idle_session = Arc::new(idle_session);
+        idle_session
+            .spawn_task(
+                Arc::clone(&replay_context),
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: true,
+                },
+            )
+            .await;
+        idle_session.interrupt_task().await;
+        assert!(
+            idle_session
+                .state
+                .lock()
+                .await
+                .correction_auto_start_suppressed
+        );
+
+        let reservation = idle_session
+            .reserve_real_work_start()
+            .await
+            .expect("real-work reservation");
+        assert!(
+            idle_session
+                .state
+                .lock()
+                .await
+                .correction_auto_start_suppressed,
+            "taskless real-work reservation must preserve the prior Stop latch"
+        );
+        let stop_session = Arc::clone(&idle_session);
+        let stop = tokio::spawn(async move {
+            stop_session.interrupt_task().await;
+        });
+        wait_until_stop_observes_publication(&idle_session).await;
+        if release_reservation {
+            idle_session.release_task_start(&reservation).await;
+        } else {
+            drop(reservation);
+        }
+        timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("Stop must finish after startup cancellation")
+            .expect("Stop task must not panic");
+        assert!(idle_session.active_turn.lock().await.is_none());
+        assert!(
+            idle_session
+                .state
+                .lock()
+                .await
+                .correction_auto_start_suppressed
+        );
+        assert!(
+            replayed_correction_auto_start_suppressed(&idle_session, &replay_context).await,
+            "released or abandoned startup must preserve replayed prior suppression"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_stop_waits_for_terminal_publication_before_latching() {
+    let (mut idle_session, replay_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut idle_session).await;
+    let terminal_done = Arc::new(crate::state::TaskPublication::new());
+    let terminal = ActiveTurn {
+        terminal_done: Some(Arc::clone(&terminal_done)),
+        ..Default::default()
+    };
+    *idle_session.active_turn.lock().await = Some(terminal);
+    let idle_session = Arc::new(idle_session);
+    let stop_session = Arc::clone(&idle_session);
+    let stop = tokio::spawn(async move {
+        stop_session.interrupt_task().await;
+    });
+    wait_until_stop_observes_publication(&idle_session).await;
+    assert!(
+        idle_session
+            .publish_turn_terminal_and_reserve_correction(&terminal_done, false)
+            .await
+            .is_none()
+    );
+    timeout(Duration::from_secs(2), stop)
+        .await
+        .expect("Stop must finish after terminal publication")
+        .expect("Stop task must not panic");
+    assert!(
+        !idle_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    assert!(
+        !replayed_correction_auto_start_suppressed(&idle_session, &replay_context).await,
+        "terminal-to-idle Stop must remain unsuppressed after replay"
+    );
+
+    let (mut correction_session, replay_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut correction_session).await;
+    seed_test_correction_target(&correction_session).await;
+    let correction_session = Arc::new(correction_session);
+    correction_session.suppress_correction_auto_start().await;
+    correction_session
+        .commit_correction(
+            Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "Tori should be Tauri".to_string(),
+        )
+        .await
+        .expect("queue correction before terminal transition");
+    correction_session.allow_correction_auto_start().await;
+    let terminal_done = Arc::new(crate::state::TaskPublication::new());
+    let terminal = ActiveTurn {
+        terminal_done: Some(Arc::clone(&terminal_done)),
+        ..Default::default()
+    };
+    *correction_session.active_turn.lock().await = Some(terminal);
+    let stop_session = Arc::clone(&correction_session);
+    let stop = tokio::spawn(async move {
+        stop_session.interrupt_task().await;
+    });
+    wait_until_stop_observes_publication(&correction_session).await;
+    let reservation = correction_session
+        .publish_turn_terminal_and_reserve_correction(&terminal_done, true)
+        .await
+        .expect("terminal publication must reserve pending correction work");
+    assert!(
+        !correction_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed,
+        "taskless correction startup is not yet a durable interrupted turn"
+    );
+    let context = correction_session
+        .new_default_turn_with_sub_id("terminal-reserves-correction".to_string())
+        .await;
+    assert!(
+        correction_session
+            .start_reserved_task(
+                reservation,
+                context,
+                vec![TurnInput::CommittedCorrection],
+                CompletingTask,
+            )
+            .await
+    );
+    timeout(Duration::from_secs(2), stop)
+        .await
+        .expect("Stop must finish after correction task publication")
+        .expect("Stop task must not panic");
+    assert!(
+        correction_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    assert!(
+        replayed_correction_auto_start_suppressed(&correction_session, &replay_context).await,
+        "terminal-to-correction interruption must reconstruct the live suppression latch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_all_interrupted_task_terminal_paths_match_replay() {
+    let (mut guardian_session, guardian_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut guardian_session).await;
+    let guardian_context = Arc::new(guardian_context);
+    let guardian_session = Arc::new(guardian_session);
+    guardian_session
+        .spawn_task(
+            Arc::clone(&guardian_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    assert!(
+        guardian_session
+            .abort_turn_if_active(&guardian_context.sub_id, TurnAbortReason::Interrupted,)
+            .await
+    );
+    assert!(
+        guardian_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    assert!(
+        replayed_correction_auto_start_suppressed(&guardian_session, &guardian_context).await,
+        "guardian-style interruption must reconstruct the live suppression latch"
+    );
+
+    let (mut self_abort_session, self_abort_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut self_abort_session).await;
+    let self_abort_context = Arc::new(self_abort_context);
+    let self_abort_session = Arc::new(self_abort_session);
+    self_abort_session
+        .spawn_task(
+            Arc::clone(&self_abort_context),
+            Vec::new(),
+            SelfAbortingTask,
+        )
+        .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if self_abort_session.active_turn.lock().await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("self-aborting task must reach terminal idle state");
+    assert!(
+        self_abort_session
+            .state
+            .lock()
+            .await
+            .correction_auto_start_suppressed
+    );
+    assert!(
+        replayed_correction_auto_start_suppressed(&self_abort_session, &self_abort_context).await,
+        "self-aborted task must reconstruct the live suppression latch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_only_turn_rejects_immediate_user_input_into_a_normal_turn() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
+    session.suppress_correction_auto_start().await;
+    session
+        .commit_correction(
+            Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "Tori should be Tauri".to_string(),
+        )
+        .await
+        .expect("queue durable correction");
+    session.allow_correction_auto_start().await;
+
+    let reservation = session
+        .reserve_task_start()
+        .await
+        .expect("correction-only reservation");
+    let correction_context = session
+        .new_default_turn_with_sub_id("correction-background".to_string())
+        .await;
+    assert!(
+        session
+            .start_reserved_task(
+                reservation,
+                Arc::clone(&correction_context),
+                vec![TurnInput::CommittedCorrection],
+                DeferredNeverEndingTask,
+            )
+            .await
+    );
+    session
+        .publish_turn_started_for_steering(&correction_context.sub_id)
+        .await;
+    assert!(
+        !session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .is_some_and(|task| task.accepts_steer),
+        "correction-only work must never accept user steering"
+    );
+
+    handlers::user_input_or_turn(
+        &session,
+        "normal-user-turn".to_string(),
+        Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "this must reach a normal turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        },
+        Some("client-normal-user-turn".to_string()),
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .any(|item| {
+                    matches!(
+                        item,
+                        ResponseItem::Message { role, content, .. }
+                            if role == "user"
+                                && content.iter().any(|content| matches!(
+                                    content,
+                                    ContentItem::InputText { text }
+                                        if text == "this must reach a normal turn"
+                                ))
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("immediate user input must be recorded by the replacement normal turn");
+    assert!(session.has_pending_corrections().await);
+    let active_turn_state = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|active_turn| Arc::clone(&active_turn.turn_state));
+    if let Some(active_turn_state) = active_turn_state {
+        assert!(
+            !active_turn_state.lock().await.correction_only_turn,
+            "the user input must run on a normal turn"
+        );
+    }
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_successful_review_and_compact_work_schedule_queued_correction() {
+    for (kind, sub_id) in [
+        (TaskKind::Review, "review-resumes-correction"),
+        (TaskKind::Compact, "compact-resumes-correction"),
+    ] {
+        let (mut session, _turn_context) = make_session_and_context().await;
+        attach_in_memory_thread_store(&mut session).await;
+        let session = Arc::new(session);
+        seed_test_correction_target(session.as_ref()).await;
+        session.suppress_correction_auto_start().await;
+        assert_eq!(
+            session
+                .commit_correction(
+                    Uuid::new_v4().to_string(),
+                    TEST_CORRECTION_TARGET.to_string(),
+                    "Tori should be Tauri".to_string(),
+                )
+                .await
+                .expect("queue correction while automatic work is suppressed"),
+            CorrectionCommitStatus::Queued
+        );
+
+        let turn_context = session
+            .new_default_turn_with_sub_id(sub_id.to_string())
+            .await;
+        session
+            .spawn_task(turn_context, Vec::new(), CompletingKindTask { kind })
+            .await;
+
+        wait_for_correction_frame(session.as_ref()).await;
+        assert!(!session.state.lock().await.correction_auto_start_suppressed);
+        session.abort_all_tasks(TurnAbortReason::Replaced).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_active_turn() {
     let (mut session, turn_context) = make_session_and_context().await;
     let store = attach_in_memory_thread_store(&mut session).await;
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
     let turn_context = Arc::new(turn_context);
     session
         .spawn_task(
@@ -11198,19 +12132,27 @@ async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_activ
     let payload = "mechanically replace parakeat with Parakeet".to_string();
     assert_eq!(
         session
-            .commit_correction(correction_id.clone(), payload.clone())
+            .commit_correction(
+                correction_id.clone(),
+                TEST_CORRECTION_TARGET.to_string(),
+                payload.clone(),
+            )
             .await
             .expect("first correction commit"),
-        CorrectionCommitStatus::Committed
+        CorrectionCommitStatus::Queued
     );
     let calls_after_commit = store.calls().await;
 
     assert_eq!(
         session
-            .commit_correction(correction_id.clone(), payload.clone())
+            .commit_correction(
+                correction_id.clone(),
+                TEST_CORRECTION_TARGET.to_string(),
+                payload.clone(),
+            )
             .await
             .expect("idempotent correction retry"),
-        CorrectionCommitStatus::AlreadyCommitted
+        CorrectionCommitStatus::Queued
     );
     assert_eq!(
         store.calls().await.append_items,
@@ -11222,6 +12164,27 @@ async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_activ
         .get_pending_input(&session.active_turn)
         .await;
     assert_eq!(pending, vec![TurnInput::CommittedCorrection]);
+
+    let sampling = session
+        .sampling_input_with_pending_corrections(turn_context.as_ref())
+        .await
+        .expect("materialize queued correction into the exact sampling snapshot");
+    assert_eq!(sampling.correction_ids, vec![correction_id.clone()]);
+    session
+        .persist_sampled_corrections(&sampling.correction_ids)
+        .await
+        .expect("persist sampled proof");
+    assert_eq!(
+        session
+            .commit_correction(
+                correction_id.clone(),
+                TEST_CORRECTION_TARGET.to_string(),
+                payload.clone(),
+            )
+            .await
+            .expect("retry after sampled proof"),
+        CorrectionCommitStatus::AlreadyCommitted
+    );
 
     let history = session.clone_history().await;
     let correction_frames = history
@@ -11241,7 +12204,11 @@ async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_activ
     );
 
     let conflict = session
-        .commit_correction(correction_id, "different payload".to_string())
+        .commit_correction(
+            correction_id,
+            TEST_CORRECTION_TARGET.to_string(),
+            "different payload".to_string(),
+        )
         .await
         .expect_err("same correction id with different payload must conflict");
     assert!(
@@ -11255,10 +12222,15 @@ async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_activ
 async fn correction_commit_failure_retains_intent_and_never_acknowledges() {
     let (session, _turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
     let correction_id = Uuid::new_v4().to_string();
 
     let first = session
-        .commit_correction(correction_id.clone(), "original payload".to_string())
+        .commit_correction(
+            correction_id.clone(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "original payload".to_string(),
+        )
         .await
         .expect_err("a correction without persistent thread history must fail");
     assert!(matches!(first, CodexErr::InvalidRequest(_)));
@@ -11270,7 +12242,11 @@ async fn correction_commit_failure_retains_intent_and_never_acknowledges() {
     }
 
     let conflict = session
-        .commit_correction(correction_id, "changed after ambiguous failure".to_string())
+        .commit_correction(
+            correction_id,
+            TEST_CORRECTION_TARGET.to_string(),
+            "changed after ambiguous failure".to_string(),
+        )
         .await
         .expect_err("an uncertain correction id cannot be rebound");
     assert!(
@@ -11278,7 +12254,11 @@ async fn correction_commit_failure_retains_intent_and_never_acknowledges() {
     );
 
     let oversized = session
-        .commit_correction(Uuid::new_v4().to_string(), "token ".repeat(2_000))
+        .commit_correction(
+            Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "token ".repeat(2_000),
+        )
         .await
         .expect_err("core must enforce its correction payload token cap");
     assert!(
@@ -11292,11 +12272,13 @@ async fn correction_retry_crosses_turn_started_boundary_without_preceding_the_tu
     let (mut session, turn_context) = make_session_and_context().await;
     attach_in_memory_thread_store(&mut session).await;
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
+    let turn_context = Arc::new(turn_context);
     let task_published = Arc::new(Barrier::new(2));
     let allow_turn_started = Arc::new(Barrier::new(2));
     session
         .spawn_task(
-            Arc::new(turn_context),
+            Arc::clone(&turn_context),
             Vec::new(),
             RegularStartBoundaryTask {
                 task_published: Arc::clone(&task_published),
@@ -11310,14 +12292,16 @@ async fn correction_retry_crosses_turn_started_boundary_without_preceding_the_tu
     let payload = "replace parakeat with Parakeet".to_string();
     let before_turn_started = timeout(
         Duration::from_millis(100),
-        session.commit_correction(correction_id.clone(), payload.clone()),
+        session.commit_correction(
+            correction_id.clone(),
+            TEST_CORRECTION_TARGET.to_string(),
+            payload.clone(),
+        ),
     )
     .await
     .expect("pre-TurnStarted correction outcome must be immediate")
-    .expect_err("a published task cannot accept correction before TurnStarted");
-    assert!(
-        matches!(before_turn_started, CodexErr::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    .expect("a published task must durably queue correction before TurnStarted");
+    assert_eq!(before_turn_started, CorrectionCommitStatus::Queued);
     assert!(
         !session
             .clone_history()
@@ -11349,11 +12333,19 @@ async fn correction_retry_crosses_turn_started_boundary_without_preceding_the_tu
 
     assert_eq!(
         session
-            .commit_correction(correction_id, payload)
+            .commit_correction(
+                correction_id.clone(),
+                TEST_CORRECTION_TARGET.to_string(),
+                payload,
+            )
             .await
             .expect("same correction identity should commit after TurnStarted"),
-        CorrectionCommitStatus::Committed
+        CorrectionCommitStatus::Queued
     );
+    session
+        .sampling_input_with_pending_corrections(turn_context.as_ref())
+        .await
+        .expect("sampling after TurnStarted must materialize the queued correction");
     let stored = session
         .services
         .live_thread
@@ -11386,6 +12378,7 @@ async fn correction_retry_crosses_turn_started_boundary_without_preceding_the_tu
 async fn concurrent_spawn_waits_for_task_start_reservation_instead_of_overwriting_it() {
     let (session, reserved_context) = make_session_and_context().await;
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
     let reserved_context = Arc::new(reserved_context);
     let replacement_context = session
         .new_default_turn_with_sub_id("replacement-turn".to_string())
@@ -11640,8 +12633,10 @@ async fn injection_records_instead_of_queueing_into_non_consuming_turn_transitio
         internal_chat_message_metadata_passthrough: None,
     };
     let terminal_done = Arc::new(crate::state::TaskPublication::new());
-    let mut terminal = ActiveTurn::default();
-    terminal.terminal_done = Some(terminal_done);
+    let terminal = ActiveTurn {
+        terminal_done: Some(terminal_done),
+        ..Default::default()
+    };
     *session.active_turn.lock().await = Some(terminal);
     let rejected = session
         .inject_if_running(vec![terminal_item.clone()])
@@ -11668,6 +12663,7 @@ async fn correction_commit_never_blocks_on_nonregular_or_closing_turns() {
     let (mut session, turn_context) = make_session_and_context().await;
     attach_in_memory_thread_store(&mut session).await;
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
     session
         .spawn_task(
             Arc::new(turn_context),
@@ -11683,17 +12679,15 @@ async fn correction_commit_never_blocks_on_nonregular_or_closing_turns() {
         Duration::from_millis(100),
         session.commit_correction(
             Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
             "review-time correction".to_string(),
         ),
     )
     .await
-    .expect("review-time rejection must be immediate")
-    .expect_err("review-time correction must be definitely unavailable");
-    assert!(matches!(review_result, CodexErr::InvalidRequest(_)));
-    assert!(
-        session.state.lock().await.correction_intents.is_empty(),
-        "a definite rejection must not poison later correction identities"
-    );
+    .expect("review-time queueing must be immediate")
+    .expect("review-time correction must queue durably");
+    assert_eq!(review_result, CorrectionCommitStatus::Queued);
+    assert_eq!(session.state.lock().await.correction_intents.len(), 1);
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let closing_context = session
@@ -11722,19 +12716,18 @@ async fn correction_commit_never_blocks_on_nonregular_or_closing_turns() {
         Duration::from_millis(100),
         session.commit_correction(
             Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
             "closing-time correction".to_string(),
         ),
     )
     .await
-    .expect("closing-time ambiguity must be immediate")
-    .expect_err("closing turn cannot accept a correction yet");
-    assert!(
-        matches!(closing_result, CodexErr::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    .expect("closing-time queueing must be immediate")
+    .expect("closing turn must queue the correction durably");
+    assert_eq!(closing_result, CorrectionCommitStatus::Queued);
     assert_eq!(
         session.state.lock().await.correction_intents.len(),
-        1,
-        "an ambiguous closing-turn result must retain the stable intent for retry"
+        2,
+        "review and closing corrections must both remain durably queued"
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
@@ -11745,26 +12738,28 @@ async fn correction_commit_retries_after_closing_turn_into_new_turn_segment() {
     let (mut session, _turn_context) = make_session_and_context().await;
     attach_in_memory_thread_store(&mut session).await;
     let closing_done = Arc::new(crate::state::TaskPublication::new());
-    let mut closing = ActiveTurn::default();
-    closing.terminal_done = Some(Arc::clone(&closing_done));
+    let closing = ActiveTurn {
+        terminal_done: Some(Arc::clone(&closing_done)),
+        ..Default::default()
+    };
     *session.active_turn.lock().await = Some(closing);
     let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
 
     let correction_id = Uuid::new_v4().to_string();
-    assert!(
-        matches!(
-            timeout(
-                Duration::from_millis(100),
-                session.commit_correction(
-                    correction_id.clone(),
-                    "post-terminal correction".to_string(),
-                ),
-            )
-            .await
-            .expect("closing-turn response must be immediate"),
-            Err(CodexErr::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
-        ),
-        "a closing turn must produce a retryable ambiguous result"
+    assert_eq!(
+        timeout(
+            Duration::from_millis(100),
+            session.commit_correction(
+                correction_id.clone(),
+                TEST_CORRECTION_TARGET.to_string(),
+                "post-terminal correction".to_string(),
+            ),
+        )
+        .await
+        .expect("closing-turn response must be immediate")
+        .expect("closing-turn correction must queue durably"),
+        CorrectionCommitStatus::Queued
     );
 
     *session.active_turn.lock().await = None;
@@ -11772,22 +12767,38 @@ async fn correction_commit_retries_after_closing_turn_into_new_turn_segment() {
     assert_eq!(
         timeout(
             Duration::from_secs(2),
-            session.commit_correction(correction_id, "post-terminal correction".to_string(),),
+            session.commit_correction(
+                correction_id,
+                TEST_CORRECTION_TARGET.to_string(),
+                "post-terminal correction".to_string(),
+            ),
         )
         .await
         .expect("correction commit should resume after terminal publication")
         .expect("correction should commit"),
-        CorrectionCommitStatus::Committed
+        CorrectionCommitStatus::Queued
     );
 
-    let stored = session
-        .services
-        .live_thread
-        .as_ref()
-        .expect("live thread")
-        .load_history(/*include_archived*/ false)
-        .await
-        .expect("load persisted history");
+    let stored = timeout(Duration::from_secs(2), async {
+        loop {
+            let stored = session
+                .services
+                .live_thread
+                .as_ref()
+                .expect("live thread")
+                .load_history(/*include_archived*/ false)
+                .await
+                .expect("load persisted history");
+            if stored.items.iter().any(|item| {
+                matches!(item, RolloutItem::ResponseItem(frame) if correction::correction_frame_id(frame).is_some())
+            }) {
+                break stored;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued correction must materialize in its correction-only turn");
     let turn_started_index = stored
         .items
         .iter()

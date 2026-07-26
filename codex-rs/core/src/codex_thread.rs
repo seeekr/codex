@@ -278,11 +278,13 @@ impl CodexThread {
     pub async fn commit_correction(
         &self,
         correction_id: String,
+        expected_client_user_message_id: String,
         payload: String,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<crate::CorrectionCommitStatus> {
         let op = Op::CommitCorrection {
             correction_id: correction_id.clone(),
+            expected_client_user_message_id: expected_client_user_message_id.clone(),
             payload: payload.clone(),
         };
         self.codex
@@ -292,7 +294,12 @@ impl CodexThread {
             .ensure_execution_capacity_for_op(self.session_configured.thread_id, &op)
             .await?;
         self.codex
-            .commit_correction(correction_id, payload, trace)
+            .commit_correction(
+                correction_id,
+                expected_client_user_message_id,
+                payload,
+                trace,
+            )
             .await
     }
 

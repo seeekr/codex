@@ -645,6 +645,7 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
             lease_id: correction.lease_id,
             thread_id: correction.thread_id,
             correction_id: correction.correction_id,
+            expected_client_user_message_id: correction.expected_client_user_message_id,
             payload: correction.payload,
             reply,
         },
@@ -694,6 +695,7 @@ fn submitted_correction_retries_definite_rejection_or_ambiguity_without_identity
                 lease_id: correction.lease_id,
                 thread_id: correction.thread_id,
                 correction_id: correction.correction_id,
+                expected_client_user_message_id: correction.expected_client_user_message_id,
                 payload: correction.payload,
                 reply,
             },
@@ -770,6 +772,7 @@ fn stale_correction_completion_does_not_mutate_a_newer_generation() {
         let first = pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
         let first_thread_id = first.thread_id.clone();
         let first_correction_id = first.correction_id;
+        let first_expected_client_user_message_id = first.expected_client_user_message_id.clone();
         let first_payload = first.payload.clone();
         let (first_reply, first_reply_rx) = std::sync::mpsc::sync_channel(1);
         state.finish_correction(
@@ -777,6 +780,7 @@ fn stale_correction_completion_does_not_mutate_a_newer_generation() {
                 lease_id,
                 thread_id: first.thread_id,
                 correction_id: first.correction_id,
+                expected_client_user_message_id: first.expected_client_user_message_id,
                 payload: first.payload,
                 reply: first_reply,
             },
@@ -796,6 +800,7 @@ fn stale_correction_completion_does_not_mutate_a_newer_generation() {
                 lease_id,
                 thread_id: first_thread_id,
                 correction_id: first_correction_id,
+                expected_client_user_message_id: first_expected_client_user_message_id,
                 payload: first_payload,
                 reply: stale_reply,
             },
@@ -824,6 +829,7 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
     let correction = pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
     let thread_id = correction.thread_id.clone();
     let correction_id = correction.correction_id;
+    let expected_client_user_message_id = correction.expected_client_user_message_id.clone();
     let payload = correction.payload.clone();
     let (rejected_reply, rejected_reply_rx) = std::sync::mpsc::sync_channel(1);
     state.finish_correction(
@@ -831,6 +837,7 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
             lease_id,
             thread_id: correction.thread_id,
             correction_id,
+            expected_client_user_message_id: correction.expected_client_user_message_id,
             payload: correction.payload,
             reply: rejected_reply,
         },
@@ -844,6 +851,7 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
             lease_id,
             thread_id,
             correction_id,
+            expected_client_user_message_id,
             payload,
             reply: ack_reply,
         },

@@ -65,7 +65,7 @@ impl Session {
             ));
         }
 
-        let Some(reservation) = self.reserve_task_start().await else {
+        let Some(reservation) = self.reserve_real_work_start().await else {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::Busy,
                 input,

@@ -1,7 +1,9 @@
 use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
+use codex_protocol::protocol::CorrectionIntent;
 use codex_protocol::protocol::SessionContextWindow;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -9,8 +11,13 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
+    pub(super) surviving_client_user_message_ids: HashSet<String>,
+    pub(super) correction_intents: Vec<CorrectionIntent>,
     pub(super) correction_receipts: BTreeMap<String, ResponseItem>,
     pub(super) correction_receipt_conflicts: HashSet<String>,
+    pub(super) correction_integrity_failure: Option<String>,
+    pub(super) processed_correction_ids: HashSet<String>,
+    pub(super) correction_auto_start_suppressed: bool,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -187,6 +194,204 @@ pub(super) fn reconstruct_correction_receipts(
     (receipts, conflicts)
 }
 
+type ReconstructedCorrectionState = (
+    Vec<CorrectionIntent>,
+    BTreeMap<String, ResponseItem>,
+    HashSet<String>,
+    HashSet<String>,
+    Option<String>,
+);
+
+fn reconstruct_correction_state(
+    rollout_items: &[RolloutItem],
+    surviving_client_user_message_ids: &HashSet<String>,
+) -> ReconstructedCorrectionState {
+    let (legacy_receipts, legacy_conflicts) = reconstruct_correction_receipts(rollout_items);
+    let mut intent_by_id = BTreeMap::<String, CorrectionIntent>::new();
+    let mut intent_order = Vec::<String>::new();
+    let mut typed_ids = HashSet::<String>::new();
+    let mut conflicts = HashSet::<String>::new();
+    let mut integrity_failures = BTreeSet::<String>::new();
+
+    for item in rollout_items {
+        let RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) = item else {
+            continue;
+        };
+        let Some(intent) = event.persisted_correction_intent() else {
+            continue;
+        };
+        let Ok(expected_frame) =
+            Session::validate_correction(&intent.correction_id, intent.payload.clone())
+        else {
+            tracing::warn!(
+                correction_id = intent.correction_id,
+                "ignored invalid durable correction intent during rollout replay"
+            );
+            integrity_failures.insert("invalid durable intent".to_string());
+            continue;
+        };
+        let Some(stable_id) = correction::correction_frame_id(&expected_frame).map(str::to_string)
+        else {
+            integrity_failures.insert("invalid durable intent".to_string());
+            continue;
+        };
+        let Ok(correction_id) = Uuid::parse_str(&intent.correction_id) else {
+            integrity_failures.insert("invalid durable intent".to_string());
+            continue;
+        };
+        let canonical_intent = CorrectionIntent {
+            correction_id: correction_id.to_string(),
+            expected_client_user_message_id: intent.expected_client_user_message_id.clone(),
+            payload: intent.payload.clone(),
+        };
+        typed_ids.insert(stable_id.clone());
+        match intent_by_id.get(&stable_id) {
+            Some(existing) if existing != &canonical_intent => {
+                integrity_failures
+                    .insert("correction identity reused with different data".to_string());
+                conflicts.insert(stable_id);
+            }
+            Some(_) => {}
+            None => {
+                intent_by_id.insert(stable_id.clone(), canonical_intent);
+                intent_order.push(stable_id);
+            }
+        }
+    }
+
+    let correction_intents = intent_order
+        .iter()
+        .filter_map(|stable_id| intent_by_id.get(stable_id).cloned())
+        .collect::<Vec<_>>();
+    let surviving_by_id = correction_intents
+        .iter()
+        .filter(|intent| {
+            surviving_client_user_message_ids.contains(&intent.expected_client_user_message_id)
+        })
+        .filter_map(|intent| {
+            let frame =
+                Session::validate_correction(&intent.correction_id, intent.payload.clone()).ok()?;
+            Some((
+                correction::correction_frame_id(&frame)?.to_string(),
+                (intent, frame),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut receipts = legacy_receipts
+        .into_iter()
+        .filter(|(stable_id, _)| !typed_ids.contains(stable_id))
+        .collect::<BTreeMap<_, _>>();
+    conflicts.extend(
+        legacy_conflicts
+            .into_iter()
+            .filter(|stable_id| !typed_ids.contains(stable_id)),
+    );
+    if !conflicts.is_empty() {
+        integrity_failures.insert("conflicting durable correction frame".to_string());
+    }
+    for item in rollout_items {
+        let RolloutItem::ResponseItem(frame) = item else {
+            continue;
+        };
+        let Some(stable_id) = correction::correction_frame_id(frame) else {
+            continue;
+        };
+        if !typed_ids.contains(stable_id) {
+            continue;
+        }
+        let Some((_, expected_frame)) = surviving_by_id.get(stable_id) else {
+            continue;
+        };
+        if conflicts.contains(stable_id) {
+            continue;
+        }
+        if !correction::correction_frames_have_same_payload(frame, expected_frame) {
+            integrity_failures.insert("correction frame does not match its intent".to_string());
+            conflicts.insert(stable_id.to_string());
+            continue;
+        }
+        match receipts.get(stable_id) {
+            Some(existing) if !correction::correction_frames_have_same_payload(existing, frame) => {
+                integrity_failures.insert("conflicting durable correction frame".to_string());
+                conflicts.insert(stable_id.to_string());
+            }
+            Some(_) => {}
+            None => {
+                receipts.insert(stable_id.to_string(), frame.clone());
+            }
+        }
+    }
+
+    let integrity_failure = (!integrity_failures.is_empty()).then(|| {
+        format!(
+            "one or more durable corrections were not applied: {}",
+            integrity_failures
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    });
+    (
+        correction_intents,
+        receipts,
+        conflicts,
+        typed_ids,
+        integrity_failure,
+    )
+}
+
+fn reconstruct_processed_correction_ids(
+    rollout_items: &[RolloutItem],
+    typed_correction_ids: &HashSet<String>,
+    correction_receipts: &BTreeMap<String, ResponseItem>,
+    correction_receipt_conflicts: &HashSet<String>,
+) -> HashSet<String> {
+    rollout_items
+        .iter()
+        .filter_map(|item| {
+            let RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) = item else {
+                return None;
+            };
+            event.persisted_corrections_sampled()
+        })
+        .flat_map(|sampled| sampled.correction_ids.iter())
+        .filter_map(|correction_id| Uuid::parse_str(correction_id).ok())
+        .map(correction::correction_frame_stable_id)
+        .filter(|stable_id| {
+            typed_correction_ids.contains(stable_id)
+                && correction_receipts.contains_key(stable_id)
+                && !correction_receipt_conflicts.contains(stable_id)
+        })
+        .collect()
+}
+
+fn reconstruct_correction_auto_start_suppressed(rollout_items: &[RolloutItem]) -> bool {
+    let mut suppressed = false;
+    for item in rollout_items {
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnAborted(aborted))
+                if aborted.reason == codex_protocol::protocol::TurnAbortReason::Interrupted =>
+            {
+                suppressed = true;
+            }
+            RolloutItem::EventMsg(EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_)) => {
+                suppressed = false;
+            }
+            RolloutItem::EventMsg(EventMsg::EnteredReviewMode(_)) => {
+                suppressed = false;
+            }
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                if matches!(&event.item, TurnItem::EnteredReviewMode(_)) =>
+            {
+                suppressed = false;
+            }
+            _ => {}
+        }
+    }
+    suppressed
+}
+
 pub(super) fn reconstruct_surviving_client_user_message_ids(
     rollout_items: &[RolloutItem],
 ) -> HashSet<String> {
@@ -311,8 +516,23 @@ impl Session {
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
         let mut window = None;
-        let (correction_receipts, mut correction_receipt_conflicts) =
-            reconstruct_correction_receipts(rollout_items);
+        let surviving_client_user_message_ids =
+            reconstruct_surviving_client_user_message_ids(rollout_items);
+        let (
+            correction_intents,
+            correction_receipts,
+            mut correction_receipt_conflicts,
+            typed_correction_ids,
+            correction_integrity_failure,
+        ) = reconstruct_correction_state(rollout_items, &surviving_client_user_message_ids);
+        let mut processed_correction_ids = reconstruct_processed_correction_ids(
+            rollout_items,
+            &typed_correction_ids,
+            &correction_receipts,
+            &correction_receipt_conflicts,
+        );
+        let correction_auto_start_suppressed =
+            reconstruct_correction_auto_start_suppressed(rollout_items);
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
         let mut pending_rollback_turns = 0usize;
@@ -535,7 +755,30 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    let anchored_corrections = history
+                        .raw_items()
+                        .iter()
+                        .filter(|frame| {
+                            let Some(stable_id) = correction::correction_frame_id(frame) else {
+                                return false;
+                            };
+                            typed_correction_ids.contains(stable_id)
+                                && !correction_receipt_conflicts.contains(stable_id)
+                                && correction_receipts.get(stable_id).is_some_and(|receipt| {
+                                    correction::correction_frames_have_same_payload(receipt, frame)
+                                })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
                     history.drop_last_n_user_turns(rollback.num_turns);
+                    // Typed correction frames are anchored to their explicit target rather than
+                    // to whichever later instruction boundary happened to be current when they
+                    // were sampled. Re-record any eligible frame that positional rollback removed
+                    // at the rollback cut, before later rollout items are replayed.
+                    history.record_items(
+                        anchored_corrections.iter(),
+                        turn_context.model_info.truncation_policy.into(),
+                    );
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
@@ -599,14 +842,49 @@ impl Session {
             previous_id: None,
             id: None,
         });
-        let history = deduplicate_correction_frames(
+        let conflicts_before_history = correction_receipt_conflicts.clone();
+        let mut history = deduplicate_correction_frames(
             history.into_raw_items(),
             &mut correction_receipt_conflicts,
         );
+        let found_history_conflict = correction_receipt_conflicts
+            .iter()
+            .any(|stable_id| !conflicts_before_history.contains(stable_id));
+        let correction_integrity_failure = if found_history_conflict {
+            Some(match correction_integrity_failure {
+                Some(existing) => {
+                    format!("{existing}; conflicting reconstructed correction frame")
+                }
+                None => "one or more durable corrections were not applied: conflicting \
+                         reconstructed correction frame"
+                    .to_string(),
+            })
+        } else {
+            correction_integrity_failure
+        };
+        processed_correction_ids
+            .retain(|stable_id| !correction_receipt_conflicts.contains(stable_id));
+        history.retain(|item| {
+            let Some(stable_id) = correction::correction_frame_id(item) else {
+                return true;
+            };
+            if !typed_correction_ids.contains(stable_id) {
+                return true;
+            }
+            !correction_receipt_conflicts.contains(stable_id)
+                && correction_receipts.get(stable_id).is_some_and(|receipt| {
+                    correction::correction_frames_have_same_payload(receipt, item)
+                })
+        });
         RolloutReconstruction {
             history,
+            surviving_client_user_message_ids,
+            correction_intents,
             correction_receipts,
             correction_receipt_conflicts,
+            correction_integrity_failure,
+            processed_correction_ids,
+            correction_auto_start_suppressed,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,

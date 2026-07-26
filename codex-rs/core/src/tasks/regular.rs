@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use codex_protocol::models::ResponseItem;
-use tokio::sync::Mutex;
-use tokio::sync::oneshot;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
@@ -19,31 +17,12 @@ use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskResult;
 
-struct CorrectionPreflight {
-    frame: ResponseItem,
-    result: oneshot::Sender<codex_protocol::error::Result<()>>,
-}
-
 #[derive(Default)]
-pub(crate) struct RegularTask {
-    correction_preflight: Mutex<Option<CorrectionPreflight>>,
-}
+pub(crate) struct RegularTask;
 
 impl RegularTask {
     pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn with_correction(
-        frame: ResponseItem,
-    ) -> (Self, oneshot::Receiver<codex_protocol::error::Result<()>>) {
-        let (result, receiver) = oneshot::channel();
-        (
-            Self {
-                correction_preflight: Mutex::new(Some(CorrectionPreflight { frame, result })),
-            },
-            receiver,
-        )
+        Self
     }
 }
 
@@ -82,24 +61,6 @@ impl SessionTask for RegularTask {
         sess.send_event(ctx.as_ref(), event).await;
         sess.publish_turn_started_for_steering(&ctx.sub_id).await;
 
-        // Idle correction commits enter the durable turn segment only after TurnStarted and
-        // before the first model request. The RPC waiter is released only after append, flush, and
-        // live-history installation all succeed.
-        if let Some(preflight) = self.correction_preflight.lock().await.take() {
-            match sess
-                .persist_and_install_correction(ctx.as_ref(), preflight.frame)
-                .await
-            {
-                Ok(()) => {
-                    let _ = preflight.result.send(Ok(()));
-                }
-                Err(error) => {
-                    let _ = preflight.result.send(Err(error));
-                    return Ok(None);
-                }
-            }
-        }
-
         let prewarmed_client_session = async {
             sess.set_server_reasoning_included(/*included*/ false).await;
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
@@ -126,6 +87,7 @@ impl SessionTask for RegularTask {
                 cancellation_token.child_token(),
             )
             .instrument(run_turn_span.clone())
+            .boxed()
             .await?;
             if sess.close_regular_turn_steering_if_idle(&ctx.sub_id).await {
                 return Ok(last_agent_message);

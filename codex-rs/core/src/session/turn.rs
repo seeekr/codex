@@ -268,20 +268,29 @@ pub(crate) async fn run_turn(
             }
 
             // Construct the input that we will send to the model.
-            let sampling_request_input: Vec<ResponseItem> = async {
-                sess.clone_history()
-                    .await
-                    .for_prompt(&turn_context.model_info.input_modalities)
-            }
-            .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
-            .await;
+            let correction_sampling_input = sess
+                .sampling_input_with_pending_corrections(turn_context.as_ref())
+                .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
+                .boxed()
+                .await?;
+            let super::correction::CorrectionSamplingInput {
+                input: sampling_request_input,
+                correction_ids: sampled_correction_ids,
+            } = correction_sampling_input;
 
             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
-            run_sampling_request(
+            let turn_state = sess
+                .input_queue
+                .turn_state_for_sub_id(&sess.active_turn, &turn_context.sub_id)
+                .await;
+            if let Some(turn_state) = &turn_state {
+                turn_state.lock().await.begin_normal_sampling();
+            }
+            let result = run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
                 Arc::clone(&turn_extension_data),
@@ -291,7 +300,16 @@ pub(crate) async fn run_turn(
                 sampling_request_input,
                 cancellation_token.child_token(),
             )
-            .await
+            .boxed()
+            .await;
+            if result.is_ok() {
+                sess.persist_sampled_corrections(&sampled_correction_ids)
+                    .await?;
+                if let Some(turn_state) = turn_state {
+                    turn_state.lock().await.complete_normal_sampling();
+                }
+            }
+            result
         }
         .await;
         match sampling_request_result {
@@ -450,7 +468,8 @@ pub(crate) async fn run_turn(
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;
-                // let the user continue the conversation
+                // Let the user continue the conversation. The turn-state sampling markers retain
+                // the failed request outcome for correction scheduling.
                 break;
             }
         }

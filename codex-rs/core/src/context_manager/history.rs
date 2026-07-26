@@ -148,6 +148,14 @@ impl ContextManager {
         &self.items
     }
 
+    /// Replaces only the transient model-input projection on a cloned history.
+    ///
+    /// Unlike [`Self::replace`], this deliberately preserves reference context, token state, and
+    /// the world-state baseline because the caller is not changing canonical conversation state.
+    pub(crate) fn replace_prompt_projection(&mut self, items: Vec<ResponseItem>) {
+        self.items = items;
+    }
+
     /// Returns raw items in the history and consumes the snapshot.
     pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
         self.items
