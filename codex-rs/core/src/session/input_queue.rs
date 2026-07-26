@@ -16,10 +16,10 @@ pub(crate) enum TurnInput {
         client_id: Option<String>,
     },
     ResponseItem(ResponseItem),
-    /// A model-visible Application item that was durably recorded before it entered this queue.
+    /// A model-visible correction frame that was durably recorded before it entered this queue.
     ///
     /// Its presence wakes the next sampling boundary; draining it must not record the item again.
-    CommittedApplicationContext,
+    CommittedCorrection,
     InterAgentCommunication(InterAgentCommunication),
 }
 
@@ -120,9 +120,8 @@ impl InputQueue {
         })
     }
 
-    /// Clear any pending waiters and input buffered for the current turn.
-    pub(crate) async fn clear_pending(&self, active_turn: &ActiveTurn) {
-        let mut turn_state = active_turn.turn_state.lock().await;
+    pub(crate) async fn clear_pending_for_turn_state(&self, turn_state: &Mutex<TurnState>) {
+        let mut turn_state = turn_state.lock().await;
         turn_state.clear_pending_waiters();
         turn_state.pending_input.items.clear();
     }
@@ -257,6 +256,10 @@ impl InputQueue {
 }
 
 impl TurnInputQueue {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     fn has_user_input(&self) -> bool {
         self.items
             .iter()

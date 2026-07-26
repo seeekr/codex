@@ -16,6 +16,7 @@ mod responses_metadata;
 mod responses_retry;
 pub(crate) mod session;
 pub use responses_metadata::CodexResponsesMetadata;
+pub use session::CorrectionCommitStatus;
 pub use session::SteerInputError;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;

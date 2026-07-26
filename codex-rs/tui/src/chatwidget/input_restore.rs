@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use super::user_messages::merge_user_messages_with_history_record_and_source_texts;
 use super::user_messages::remap_colliding_paste_placeholders;
 use super::*;
 
@@ -85,20 +86,22 @@ impl ChatWidget {
                 rejected_messages.len(),
                 UserMessageHistoryRecord::UserMessageText,
             );
-            let (message, history_record) = merge_user_messages_with_history_record(
-                rejected_messages
-                    .iter()
-                    .zip(history_records)
-                    .map(|(queued, history_record)| (queued.user_message.clone(), history_record))
-                    .collect::<Vec<_>>(),
-            );
+            let submissions = rejected_messages
+                .iter()
+                .map(|message| message.composer_submission.clone())
+                .collect::<Vec<_>>();
+            let (message, history_record, remapped_source_texts) =
+                merge_user_messages_with_history_record_and_source_texts(
+                    rejected_messages
+                        .iter()
+                        .zip(history_records)
+                        .map(|(queued, history_record)| {
+                            (queued.user_message.clone(), history_record)
+                        })
+                        .collect::<Vec<_>>(),
+                );
             let composer_submission = NativeComposerSubmission::merge_parts(
-                rejected_messages.iter().map(|message| {
-                    (
-                        message.user_message.text.clone(),
-                        message.composer_submission.clone(),
-                    )
-                }),
+                remapped_source_texts.into_iter().zip(submissions),
                 &message.text,
             );
             Some((
@@ -204,24 +207,21 @@ impl ChatWidget {
                 .pending_steers
                 .drain(..)
                 .collect::<Vec<_>>();
-            let submission_parts = pending_steers
+            let submissions = pending_steers
                 .iter()
-                .map(|pending| {
-                    (
-                        pending.user_message.text.clone(),
-                        pending.composer_submission.clone(),
-                    )
-                })
+                .map(|pending| pending.composer_submission.clone())
                 .collect::<Vec<_>>();
             let pending_messages = pending_steers
                 .into_iter()
                 .map(|pending| (pending.user_message, pending.history_record))
                 .collect::<Vec<_>>();
             if !pending_messages.is_empty() {
-                let (user_message, history_record) =
-                    merge_user_messages_with_history_record(pending_messages);
-                let composer_submission =
-                    NativeComposerSubmission::merge_parts(submission_parts, &user_message.text);
+                let (user_message, history_record, remapped_source_texts) =
+                    merge_user_messages_with_history_record_and_source_texts(pending_messages);
+                let composer_submission = NativeComposerSubmission::merge_parts(
+                    remapped_source_texts.into_iter().zip(submissions),
+                    &user_message.text,
+                );
                 self.submit_user_message_with_history_record_and_composer_submission(
                     user_message,
                     history_record,

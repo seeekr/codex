@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +32,46 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    /// Present while a task owner is preparing lifecycle state before installing the running task.
+    ///
+    /// Replacing work waits for this publication boundary instead of clearing or reusing an
+    /// ownerless-looking reservation.
+    pub(crate) startup_done: Option<Arc<TaskPublication>>,
+    /// Published only after the task's terminal event has been emitted and flushed.
+    pub(crate) terminal_done: Option<Arc<TaskPublication>>,
+}
+
+pub(crate) struct TaskPublication {
+    abandoned: AtomicBool,
+    done: Arc<Notify>,
+}
+
+impl TaskPublication {
+    pub(crate) fn new() -> Self {
+        Self {
+            abandoned: AtomicBool::new(false),
+            done: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+        self.done.notify_waiters();
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn notified(
+        self: &Arc<Self>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        Arc::clone(&self.done).notified_owned()
+    }
+
+    pub(crate) fn publish(&self) {
+        self.done.notify_waiters();
+    }
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -58,6 +100,8 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            startup_done: None,
+            terminal_done: None,
         }
     }
 }
@@ -71,7 +115,10 @@ pub(crate) enum TaskKind {
 
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
+    pub(crate) terminal_done: Arc<TaskPublication>,
     pub(crate) kind: TaskKind,
+    /// Cleared atomically with the final empty pending-input check.
+    pub(crate) accepts_steer: bool,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: AbortOnDropHandle<()>,

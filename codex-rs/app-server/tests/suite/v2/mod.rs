@@ -64,6 +64,7 @@ mod selected_environment;
 mod skills_list;
 mod sleep;
 mod thread_archive;
+mod thread_correction_commit;
 mod thread_delete;
 mod thread_fork;
 mod thread_inject_items;

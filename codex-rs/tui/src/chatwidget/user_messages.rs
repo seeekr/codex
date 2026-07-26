@@ -483,10 +483,28 @@ pub(super) fn user_message_display_for_history(
     )
 }
 
+#[cfg(test)]
 pub(super) fn merge_user_messages_with_history_record(
     messages: Vec<(UserMessage, UserMessageHistoryRecord)>,
 ) -> (UserMessage, UserMessageHistoryRecord) {
+    let (message, history_record, _) =
+        merge_user_messages_with_history_record_and_source_texts(messages);
+    (message, history_record)
+}
+
+/// Merge messages while retaining each segment's post-normalization text.
+///
+/// Composer provenance was captured before attachment placeholders were globally renumbered.
+/// Callers that merge provenance in parallel with messages need these remapped source strings so
+/// owned byte ranges can be rebased instead of being silently discarded by an exact-text check.
+pub(super) fn merge_user_messages_with_history_record_and_source_texts(
+    messages: Vec<(UserMessage, UserMessageHistoryRecord)>,
+) -> (UserMessage, UserMessageHistoryRecord, Vec<String>) {
     let messages = remap_user_messages_with_history_records(messages);
+    let source_texts = messages
+        .iter()
+        .map(|(message, _)| message.text.clone())
+        .collect::<Vec<_>>();
     let history_record = if messages
         .iter()
         .all(|(_, record)| *record == UserMessageHistoryRecord::UserMessageText)
@@ -526,10 +544,8 @@ pub(super) fn merge_user_messages_with_history_record(
         })
     };
 
-    (
-        merge_remapped_user_messages(messages.into_iter().map(|(message, _)| message)),
-        history_record,
-    )
+    let message = merge_remapped_user_messages(messages.into_iter().map(|(message, _)| message));
+    (message, history_record, source_texts)
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use codex_protocol::models::ResponseItem;
+use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
@@ -16,12 +19,31 @@ use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskResult;
 
+struct CorrectionPreflight {
+    frame: ResponseItem,
+    result: oneshot::Sender<codex_protocol::error::Result<()>>,
+}
+
 #[derive(Default)]
-pub(crate) struct RegularTask;
+pub(crate) struct RegularTask {
+    correction_preflight: Mutex<Option<CorrectionPreflight>>,
+}
 
 impl RegularTask {
     pub(crate) fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub(crate) fn with_correction(
+        frame: ResponseItem,
+    ) -> (Self, oneshot::Receiver<codex_protocol::error::Result<()>>) {
+        let (result, receiver) = oneshot::channel();
+        (
+            Self {
+                correction_preflight: Mutex::new(Some(CorrectionPreflight { frame, result })),
+            },
+            receiver,
+        )
     }
 }
 
@@ -32,6 +54,10 @@ impl SessionTask for RegularTask {
 
     fn span_name(&self) -> &'static str {
         "session_task.turn"
+    }
+
+    fn defers_steer_until_turn_started(&self) -> bool {
+        true
     }
 
     async fn run(
@@ -46,15 +72,35 @@ impl SessionTask for RegularTask {
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
+        let event = EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: ctx.sub_id.clone(),
+            trace_id: ctx.trace_id.clone(),
+            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+            model_context_window: ctx.model_context_window(),
+            collaboration_mode_kind: ctx.collaboration_mode.mode,
+        });
+        sess.send_event(ctx.as_ref(), event).await;
+        sess.publish_turn_started_for_steering(&ctx.sub_id).await;
+
+        // Idle correction commits enter the durable turn segment only after TurnStarted and
+        // before the first model request. The RPC waiter is released only after append, flush, and
+        // live-history installation all succeed.
+        if let Some(preflight) = self.correction_preflight.lock().await.take() {
+            match sess
+                .persist_and_install_correction(ctx.as_ref(), preflight.frame)
+                .await
+            {
+                Ok(()) => {
+                    let _ = preflight.result.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = preflight.result.send(Err(error));
+                    return Ok(None);
+                }
+            }
+        }
+
         let prewarmed_client_session = async {
-            let event = EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: ctx.sub_id.clone(),
-                trace_id: ctx.trace_id.clone(),
-                started_at: ctx.turn_timing_state.started_at_unix_secs().await,
-                model_context_window: ctx.model_context_window(),
-                collaboration_mode_kind: ctx.collaboration_mode.mode,
-            });
-            sess.send_event(ctx.as_ref(), event).await;
             sess.set_server_reasoning_included(/*included*/ false).await;
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
                 .await
@@ -81,7 +127,7 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
-            if !sess.input_queue.has_pending_input(&sess.active_turn).await {
+            if sess.close_regular_turn_steering_if_idle(&ctx.sub_id).await {
                 return Ok(last_agent_message);
             }
             next_input = Vec::new();

@@ -111,7 +111,6 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AdditionalContextEntry;
-use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -202,6 +201,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
+mod correction;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -249,8 +249,13 @@ pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
-    ApplicationContextReceiptConflict { key: String },
     EmptyInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionCommitStatus {
+    Committed,
+    AlreadyCommitted,
 }
 
 impl SteerInputError {
@@ -276,10 +281,6 @@ impl SteerInputError {
                     }),
                 }
             }
-            Self::ApplicationContextReceiptConflict { key } => ErrorEvent {
-                message: format!("application context receipt `{key}` was reused with new content"),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-            },
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
@@ -784,6 +785,39 @@ impl Codex {
         };
         self.submit_with_id(sub).await?;
         Ok(id)
+    }
+
+    pub async fn commit_correction(
+        &self,
+        correction_id: String,
+        payload: String,
+        trace: Option<W3cTraceContext>,
+    ) -> CodexResult<CorrectionCommitStatus> {
+        let id = new_submission_id();
+        let (result_tx, result_rx) = oneshot::channel();
+        self.session
+            .pending_correction_commits
+            .lock()
+            .await
+            .insert(id.clone(), result_tx);
+        let sub = Submission {
+            id: id.clone(),
+            op: Op::CommitCorrection {
+                correction_id,
+                payload,
+            },
+            client_user_message_id: None,
+            trace,
+        };
+        if let Err(error) = self.submit_with_id(sub).await {
+            self.session
+                .pending_correction_commits
+                .lock()
+                .await
+                .remove(&id);
+            return Err(error);
+        }
+        result_rx.await.map_err(|_| CodexErr::InternalAgentDied)?
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
@@ -1433,6 +1467,8 @@ impl Session {
     ) -> Option<PreviousTurnSettings> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
+            correction_receipts,
+            correction_receipt_conflicts,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1451,6 +1487,9 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
+            state.correction_receipts = correction_receipts;
+            state.correction_receipt_conflicts = correction_receipt_conflicts;
+            state.correction_intents.clear();
             if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
@@ -3893,6 +3932,9 @@ impl Session {
         let Some(active_task) = active_turn.task.as_ref() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
+        if !active_task.accepts_steer {
+            return Err(SteerInputError::NoActiveTurn(input));
+        }
         let active_turn_id = &active_task.turn_context.sub_id;
 
         if let Some(expected_turn_id) = expected_turn_id
@@ -3918,39 +3960,12 @@ impl Session {
             }
         }
 
-        let application_context_only = !additional_context.is_empty()
-            && additional_context
-                .values()
-                .all(|entry| entry.kind == AdditionalContextKind::Application);
-        if input.is_empty() && !application_context_only {
-            return Err(SteerInputError::EmptyInput);
-        }
         let additional_context_input = {
             let mut state = self.state.lock().await;
-            if input.is_empty() {
-                state
-                    .additional_context
-                    .commit_application(additional_context)
-                    .map_err(
-                        |conflict| SteerInputError::ApplicationContextReceiptConflict {
-                            key: conflict.key,
-                        },
-                    )?
-            } else {
-                state.additional_context.merge(additional_context)
-            }
+            state.additional_context.merge(additional_context)
         };
-        let committed_application_context = input.is_empty();
-        let additional_context_input = additional_context_input
-            .into_iter()
-            .map(ResponseItem::from)
-            .collect::<Vec<_>>();
-        if committed_application_context && !additional_context_input.is_empty() {
-            self.record_conversation_items(
-                active_task.turn_context.as_ref(),
-                &additional_context_input,
-            )
-            .await;
+        if input.is_empty() && additional_context_input.is_empty() {
+            return Err(SteerInputError::EmptyInput);
         }
 
         if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
@@ -3959,21 +3974,11 @@ impl Session {
                 .turn_metadata_state
                 .set_responsesapi_client_metadata(responsesapi_client_metadata);
         }
-        if committed_application_context && additional_context_input.is_empty() {
-            return Ok(active_turn_id.clone());
-        }
-
-        let mut pending_input = if committed_application_context {
-            (!additional_context_input.is_empty())
-                .then_some(TurnInput::CommittedApplicationContext)
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            additional_context_input
-                .into_iter()
-                .map(TurnInput::ResponseItem)
-                .collect::<Vec<_>>()
-        };
+        let mut pending_input = additional_context_input
+            .into_iter()
+            .map(ResponseItem::from)
+            .map(TurnInput::ResponseItem)
+            .collect::<Vec<_>>();
         if !input.is_empty() {
             pending_input.push(TurnInput::UserInput {
                 content: input,
@@ -3987,6 +3992,39 @@ impl Session {
             )
             .await;
         Ok(active_turn_id.clone())
+    }
+
+    /// Close a regular turn to new steering atomically with its final pending-input check.
+    ///
+    /// A concurrent steer either queues before this transition and forces another sample, or sees
+    /// the closed boundary and waits for the next real turn.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the active-turn and pending-input checks form one sampling-boundary transition"
+    )]
+    pub(crate) async fn close_regular_turn_steering_if_idle(&self, turn_id: &str) -> bool {
+        // Preserve the established mailbox behavior before atomically closing turn-local
+        // steering. The second check under the active-turn lock below closes the correction/user
+        // input race at the final sampling boundary.
+        if self.input_queue.has_pending_input(&self.active_turn).await {
+            return false;
+        }
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return true;
+        };
+        let Some(active_task) = active_turn.task.as_mut() else {
+            return true;
+        };
+        if active_task.turn_context.sub_id != turn_id {
+            return true;
+        }
+        let turn_state = active_turn.turn_state.lock().await;
+        if !turn_state.pending_input.is_empty() {
+            return false;
+        }
+        active_task.accepts_steer = false;
+        true
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {

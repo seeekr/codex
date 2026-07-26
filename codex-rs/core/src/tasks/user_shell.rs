@@ -76,6 +76,10 @@ impl SessionTask for UserShellCommandTask {
         "session_task.user_shell"
     }
 
+    fn defers_steer_until_turn_started(&self) -> bool {
+        true
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -123,6 +127,9 @@ pub(crate) async fn execute_user_shell_command(
             collaboration_mode_kind: turn_context.collaboration_mode.mode,
         });
         session.send_event(turn_context.as_ref(), event).await;
+        session
+            .publish_turn_started_for_steering(&turn_context.sub_id)
+            .await;
     }
 
     let Some((turn_environment, environment_shell)) = turn_context

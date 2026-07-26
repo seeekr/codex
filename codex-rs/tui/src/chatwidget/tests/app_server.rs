@@ -1,4 +1,6 @@
 use super::*;
+use crate::bottom_pane::ComposerLeaseId;
+use crate::bottom_pane::SubmittedComposerLease;
 use pretty_assertions::assert_eq;
 
 fn thread_settings_for_test(
@@ -158,6 +160,42 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     assert_eq!(model, "faster-model");
     assert_matches!(turn, Op::UserTurn { .. });
     assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Additional safety checks"));
+}
+
+#[tokio::test]
+async fn safety_buffering_does_not_offer_lossy_retry_for_native_composer_input() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (thread_id, turn_id, mut turn) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    let AppCommand::UserTurn {
+        composer_submission,
+        ..
+    } = &mut turn
+    else {
+        panic!("expected user turn");
+    };
+    *composer_submission = NativeComposerSubmission::new(
+        thread_id.to_string(),
+        "Explain the request",
+        vec![SubmittedComposerLease {
+            id: ComposerLeaseId::for_test(1),
+            range: 0..7,
+        }],
+    );
+    chat.record_safety_buffering_turn(turn_id.to_string(), &turn);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        /*replay_kind*/ None,
+    );
+
+    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Additional safety checks"));
+    assert!(!popup.contains("Retry with a faster model"));
 }
 
 #[tokio::test]

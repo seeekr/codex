@@ -103,6 +103,7 @@ impl AgentExecutionLimiter {
 
 fn op_starts_turn(op: &Op) -> bool {
     matches!(op, Op::UserInput { .. })
+        || matches!(op, Op::CommitCorrection { .. })
         || matches!(op, Op::InterAgentCommunication { communication } if communication.trigger_turn)
 }
 

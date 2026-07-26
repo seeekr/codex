@@ -904,61 +904,6 @@ impl AppServerSession {
             .await
     }
 
-    pub(crate) async fn turn_start_application_context(
-        &mut self,
-        thread_id: ThreadId,
-        context_key: String,
-        context_value: String,
-    ) -> std::result::Result<TurnStartResponse, TypedRequestError> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::TurnStart {
-                request_id,
-                params: TurnStartParams {
-                    thread_id: thread_id.to_string(),
-                    input: Vec::new(),
-                    additional_context: Some(HashMap::from([(
-                        context_key,
-                        AdditionalContextEntry {
-                            value: context_value,
-                            kind: AdditionalContextKind::Application,
-                        },
-                    )])),
-                    ..TurnStartParams::default()
-                },
-            })
-            .await
-    }
-
-    pub(crate) async fn turn_steer_application_context(
-        &mut self,
-        thread_id: ThreadId,
-        turn_id: String,
-        context_key: String,
-        context_value: String,
-    ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::TurnSteer {
-                request_id,
-                params: TurnSteerParams {
-                    thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
-                    input: Vec::new(),
-                    responsesapi_client_metadata: None,
-                    additional_context: Some(HashMap::from([(
-                        context_key,
-                        AdditionalContextEntry {
-                            value: context_value,
-                            kind: AdditionalContextKind::Application,
-                        },
-                    )])),
-                    expected_turn_id: turn_id,
-                },
-            })
-            .await
-    }
-
     pub(crate) async fn thread_set_name(
         &mut self,
         thread_id: ThreadId,

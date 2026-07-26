@@ -3,6 +3,7 @@
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -30,6 +31,15 @@ pub(crate) struct SessionState {
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
+    /// Surviving durable correction frames keyed by their stable response-item ID.
+    pub(crate) correction_receipts: BTreeMap<String, ResponseItem>,
+    /// Stable IDs that appeared with more than one canonical payload in surviving rollout state.
+    pub(crate) correction_receipt_conflicts: HashSet<String>,
+    /// Correction intents retained across an ambiguous append/flush failure in this process.
+    ///
+    /// Retrying the same payload is safe; reusing its ID for different content must stay a
+    /// conflict even when persistence may have written the first frame before returning an error.
+    pub(crate) correction_intents: BTreeMap<String, ResponseItem>,
     /// Settings used by the latest regular user turn, used for turn-to-turn
     /// model/realtime handling on subsequent regular turns (including full-context
     /// reinjection after resume or `/compact`).
@@ -67,6 +77,9 @@ impl SessionState {
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
+            correction_receipts: BTreeMap::new(),
+            correction_receipt_conflicts: HashSet::new(),
+            correction_intents: BTreeMap::new(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             startup_prewarm: None,

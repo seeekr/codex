@@ -541,6 +541,48 @@ fn submission_receipt_is_xml_safe_and_unambiguously_names_the_following_message(
 }
 
 #[test]
+fn merged_submission_rebases_image_placeholder_edits_outside_owned_text() {
+    let original = "[Image #9] parakeat";
+    let owned_start = original.find("parakeat").expect("owned text");
+    let submission = NativeComposerSubmission::new(
+        "synthetic-thread".to_string(),
+        original,
+        vec![SubmittedComposerLease {
+            id: ComposerLeaseId::for_test(1),
+            range: owned_start..owned_start + "parakeat".len(),
+        }],
+    )
+    .expect("submission");
+    let remapped = "[Image #10] parakeat";
+
+    let merged =
+        NativeComposerSubmission::merge_parts([(remapped.to_string(), Some(submission))], remapped)
+            .expect("placeholder edit outside the lease should preserve provenance");
+    let rebased = &merged.leases[0].range;
+    assert_eq!(merged.submitted_text.as_ref(), remapped);
+    assert_eq!(merged.submitted_text.get(rebased.clone()), Some("parakeat"));
+    assert_eq!(rebased.start, owned_start + 1);
+
+    let placeholder_submission = NativeComposerSubmission::new(
+        "synthetic-thread".to_string(),
+        original,
+        vec![SubmittedComposerLease {
+            id: ComposerLeaseId::for_test(2),
+            range: 0.."[Image #9]".len(),
+        }],
+    )
+    .expect("placeholder submission");
+    assert!(
+        NativeComposerSubmission::merge_parts(
+            [(remapped.to_string(), Some(placeholder_submission))],
+            remapped,
+        )
+        .is_none(),
+        "normalization intersecting owned text must fail closed"
+    );
+}
+
+#[test]
 fn cleared_or_edited_draft_without_acceptance_is_not_submitted() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
@@ -585,19 +627,15 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
         "Parakeet result",
     );
     assert_eq!(correction.thread_id, "synthetic-thread");
+    assert_eq!(correction.correction_id.get_version_num(), 4);
     assert!(
         correction
-            .context_key
-            .starts_with("koenig_transcription_correction_")
-    );
-    assert!(
-        correction
-            .context_value
+            .payload
             .contains(&format!("koenig-composer-{submission_id}"))
     );
     assert!(
         correction
-            .context_value
+            .payload
             .contains("application context, not a user message")
     );
 
@@ -606,8 +644,8 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
         PendingComposerCorrection {
             lease_id: correction.lease_id,
             thread_id: correction.thread_id,
-            context_key: correction.context_key,
-            context_value: correction.context_value,
+            correction_id: correction.correction_id,
+            payload: correction.payload,
             reply,
         },
         CorrectionDispatchOutcome::Acknowledged,
@@ -633,18 +671,10 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
 }
 
 #[test]
-fn submitted_correction_known_rejection_is_retryable_but_ack_loss_is_terminal() {
-    for (outcome, expected_outcome, remains_submitted) in [
-        (
-            CorrectionDispatchOutcome::NotApplied,
-            MutationOutcome::NotApplied,
-            true,
-        ),
-        (
-            CorrectionDispatchOutcome::Unknown,
-            MutationOutcome::Unknown,
-            false,
-        ),
+fn submitted_correction_retries_definite_rejection_or_ambiguity_without_identity_loss() {
+    for (outcome, remains_submitted) in [
+        (CorrectionDispatchOutcome::NotApplied, true),
+        (CorrectionDispatchOutcome::Unknown, false),
     ] {
         let mut state = ComposerControlState::<u64>::new();
         let mut target = FakeTarget::new("");
@@ -656,24 +686,31 @@ fn submitted_correction_known_rejection_is_retryable_but_ack_loss_is_terminal() 
         target.leases.clear();
         let correction =
             pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
+        let original_correction_id = correction.correction_id;
+        let original_payload = correction.payload.clone();
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         state.finish_correction(
             PendingComposerCorrection {
                 lease_id: correction.lease_id,
                 thread_id: correction.thread_id,
-                context_key: correction.context_key,
-                context_value: correction.context_value,
+                correction_id: correction.correction_id,
+                payload: correction.payload,
                 reply,
             },
             outcome,
         );
-        assert!(matches!(
-            reply_rx.recv().expect("correction reply"),
-            WireResult::Error {
-                code: ErrorCode::CorrectionUnavailable,
-                outcome,
-            } if std::mem::discriminant(&outcome) == std::mem::discriminant(&expected_outcome)
-        ));
+        let reply = reply_rx.recv().expect("correction reply");
+        if remains_submitted {
+            assert!(matches!(
+                reply,
+                WireResult::Error {
+                    code: ErrorCode::CorrectionUnavailable,
+                    outcome: MutationOutcome::NotApplied,
+                }
+            ));
+        } else {
+            assert!(matches!(reply, WireResult::CorrectionPending));
+        }
         let verify = state.execute(
             ComposerCommand::Verify {
                 lease_id,
@@ -692,8 +729,145 @@ fn submitted_correction_known_rejection_is_retryable_but_ack_loss_is_terminal() 
                     ..
                 }
             ));
+            let retry =
+                pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
+            assert_eq!(retry.correction_id, original_correction_id);
+            assert_eq!(retry.payload, original_payload);
+            assert!(matches!(
+                state.prepare_command(
+                    ComposerCommand::Replace {
+                        lease_id,
+                        expected: "parakeat".to_string(),
+                        replacement: "different correction".to_string(),
+                    },
+                    &mut target,
+                    /*app_overlay_active*/ false,
+                ),
+                CommandExecution::Complete(WireResult::Error {
+                    code: ErrorCode::LeaseUnavailable,
+                    outcome: MutationOutcome::NotApplied,
+                })
+            ));
         }
     }
+}
+
+#[test]
+fn stale_correction_completion_does_not_mutate_a_newer_generation() {
+    for stale_outcome in [
+        CorrectionDispatchOutcome::Acknowledged,
+        CorrectionDispatchOutcome::NotApplied,
+    ] {
+        let mut state = ComposerControlState::<u64>::new();
+        let mut target = FakeTarget::new("");
+        let capture_id = capture(&mut state, &mut target);
+        let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
+        mark_submitted(&mut state, &target, &[lease_id]);
+        target.text.clear();
+        target.cursor = 0;
+        target.leases.clear();
+
+        let first = pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
+        let first_thread_id = first.thread_id.clone();
+        let first_correction_id = first.correction_id;
+        let first_payload = first.payload.clone();
+        let (first_reply, first_reply_rx) = std::sync::mpsc::sync_channel(1);
+        state.finish_correction(
+            PendingComposerCorrection {
+                lease_id,
+                thread_id: first.thread_id,
+                correction_id: first.correction_id,
+                payload: first.payload,
+                reply: first_reply,
+            },
+            CorrectionDispatchOutcome::NotApplied,
+        );
+        let _ = first_reply_rx.recv().expect("first correction reply");
+
+        let second =
+            pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet v2");
+        assert_ne!(second.correction_id, first_correction_id);
+        let second_correction_id = second.correction_id;
+        let second_payload = second.payload.clone();
+
+        let (stale_reply, stale_reply_rx) = std::sync::mpsc::sync_channel(1);
+        state.finish_correction(
+            PendingComposerCorrection {
+                lease_id,
+                thread_id: first_thread_id,
+                correction_id: first_correction_id,
+                payload: first_payload,
+                reply: stale_reply,
+            },
+            stale_outcome,
+        );
+        let _ = stale_reply_rx.recv().expect("stale correction reply");
+
+        let retry =
+            pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet v2");
+        assert_eq!(retry.correction_id, second_correction_id);
+        assert_eq!(retry.payload, second_payload);
+    }
+}
+
+#[test]
+fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
+    mark_submitted(&mut state, &target, &[lease_id]);
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+
+    let correction = pending_correction(&mut state, &mut target, lease_id, "parakeat", "Parakeet");
+    let thread_id = correction.thread_id.clone();
+    let correction_id = correction.correction_id;
+    let payload = correction.payload.clone();
+    let (rejected_reply, rejected_reply_rx) = std::sync::mpsc::sync_channel(1);
+    state.finish_correction(
+        PendingComposerCorrection {
+            lease_id,
+            thread_id: correction.thread_id,
+            correction_id,
+            payload: correction.payload,
+            reply: rejected_reply,
+        },
+        CorrectionDispatchOutcome::NotApplied,
+    );
+    let _ = rejected_reply_rx.recv().expect("rejected correction reply");
+
+    let (ack_reply, ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    state.finish_correction(
+        PendingComposerCorrection {
+            lease_id,
+            thread_id,
+            correction_id,
+            payload,
+            reply: ack_reply,
+        },
+        CorrectionDispatchOutcome::Acknowledged,
+    );
+    assert!(matches!(
+        ack_reply_rx.recv().expect("acknowledged correction reply"),
+        WireResult::Corrected
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "parakeat".to_string(),
+                replacement: "Parakeet v2".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
 }
 
 #[test]
@@ -759,21 +933,21 @@ fn submitted_locator_is_global_and_never_claims_unowned_prefix_suffix_or_other_l
         "parakeat",
         "Parakeet",
     );
-    assert!(first.context_value.contains(&format!(
+    assert!(first.payload.contains(&format!(
         "Koenig-owned submitted-message bytes {}..{}",
         first_range.start, first_range.end
     )));
-    assert!(first.context_value.contains(&format!(
+    assert!(first.payload.contains(&format!(
         "Hunk 1: old bytes {}..{}",
         first_range.start, first_range.end
     )));
-    assert!(second.context_value.contains(&format!(
+    assert!(second.payload.contains(&format!(
         "Koenig-owned submitted-message bytes {}..{}",
         second_range.start, second_range.end
     )));
-    assert!(second.context_value.contains("occurrence 4"));
-    assert!(!first.context_value.contains("prefix parakeat"));
-    assert!(!first.context_value.contains("| suffix"));
+    assert!(second.payload.contains("occurrence 4"));
+    assert!(!first.payload.contains("prefix parakeat"));
+    assert!(!first.payload.contains("| suffix"));
     assert_eq!(
         submitted_text.get(first_range),
         Some("parakeat"),
@@ -885,6 +1059,35 @@ fn long_correction_context_uses_only_the_changed_core_or_fails_closed() {
         )
         .is_none(),
         "an unbounded changed core must be rejected instead of reproduced"
+    );
+}
+
+#[test]
+fn many_small_hunks_fail_before_the_real_additional_context_budget_would_truncate() {
+    let spacer = (0..16)
+        .map(|index| format!("stable{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected = (0..80)
+        .map(|index| format!("bad{index} {spacer}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let replacement = (0..80)
+        .map(|index| format!("good{index} {spacer}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        mechanical_correction_context(
+            Uuid::new_v4(),
+            &expected,
+            0..expected.len(),
+            &expected,
+            &replacement,
+        )
+        .is_none(),
+        "many bounded hunks must fail closed before AdditionalContext silently truncates at the \
+         shared token boundary"
     );
 }
 
@@ -1029,6 +1232,21 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
         wrong_version.into_command(instance_id),
         Err(ErrorCode::UnsupportedVersion)
     ));
+
+    assert_eq!(
+        serde_json::to_value(WireResponse {
+            protocol_version: PROTOCOL_VERSION,
+            instance_id,
+            result: WireResult::SubmissionPending,
+        })
+        .expect("wire response"),
+        serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "instanceId": instance_id,
+            "status": "submission_pending",
+        }),
+        "slow-final clients receive a typed retryable status, not a target error"
+    );
 }
 
 #[test]
