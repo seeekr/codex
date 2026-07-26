@@ -406,7 +406,7 @@ fn unavailable_surfaces_and_expired_ui_requests_do_not_mutate() {
 }
 
 #[test]
-fn wire_validation_is_strict_and_rejects_submit_shaped_text() {
+fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
     let instance_id = Uuid::new_v4();
     let capture_id = Uuid::new_v4();
     let request: WireRequest = serde_json::from_value(serde_json::json!({
@@ -419,7 +419,7 @@ fn wire_validation_is_strict_and_rejects_submit_shaped_text() {
     .expect("wire request");
     assert!(matches!(
         request.into_command(instance_id),
-        Err(ErrorCode::InvalidText)
+        Ok(ComposerCommand::Insert { text, .. }) if text == "line\nsubmit"
     ));
 
     assert!(
@@ -442,6 +442,33 @@ fn wire_validation_is_strict_and_rejects_submit_shaped_text() {
         wrong_version.into_command(instance_id),
         Err(ErrorCode::UnsupportedVersion)
     ));
+}
+
+#[test]
+fn only_insert_and_replace_can_have_unknown_ui_timeout_text_effects() {
+    let capture = ComposerCommand::Capture;
+    let insert = ComposerCommand::Insert {
+        capture_id: Uuid::new_v4(),
+        text: "fast".to_string(),
+    };
+    let verify = ComposerCommand::Verify {
+        lease_id: Uuid::new_v4(),
+        expected: "fast".to_string(),
+    };
+    let keep = ComposerCommand::Keep {
+        lease_id: Uuid::new_v4(),
+    };
+    let replace = ComposerCommand::Replace {
+        lease_id: Uuid::new_v4(),
+        expected: "fast".to_string(),
+        replacement: "final".to_string(),
+    };
+
+    assert!(!capture.may_change_text());
+    assert!(insert.may_change_text());
+    assert!(!verify.may_change_text());
+    assert!(!keep.may_change_text());
+    assert!(replace.may_change_text());
 }
 
 #[cfg(unix)]
