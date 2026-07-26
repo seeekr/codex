@@ -203,6 +203,30 @@ fn surviving_client_message_projection_counts_typed_inter_agent_boundary() {
     );
 }
 
+#[tokio::test]
+async fn correction_intent_carrier_is_not_model_history() {
+    let (session, turn_context) = make_session_and_context().await;
+    let user = user_message("dictated text");
+    let carrier = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+        codex_protocol::protocol::RawResponseItemEvent::correction_intent(
+            codex_protocol::protocol::CorrectionIntent {
+                correction_id: "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+                expected_client_user_message_id: "client-user-1".to_string(),
+                payload: "Tori should be Tauri".to_string(),
+            },
+        ),
+    ));
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(
+            &turn_context,
+            &[RolloutItem::ResponseItem(user.clone()), carrier],
+        )
+        .await;
+
+    assert_eq!(reconstructed.history, vec![user]);
+}
+
 #[test]
 fn correction_receipt_replay_is_compaction_independent_and_semantically_idempotent() {
     let id = Uuid::new_v4();

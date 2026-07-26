@@ -1809,9 +1809,35 @@ impl CodexErrorInfo {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionIntent {
+    pub correction_id: String,
+    pub expected_client_user_message_id: String,
+    pub payload: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 pub struct RawResponseItemEvent {
     pub item: ResponseItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub correction_intent: Option<CorrectionIntent>,
+}
+
+impl RawResponseItemEvent {
+    pub fn correction_intent(intent: CorrectionIntent) -> Self {
+        Self {
+            item: ResponseItem::Other,
+            correction_intent: Some(intent),
+        }
+    }
+
+    pub fn persisted_correction_intent(&self) -> Option<&CorrectionIntent> {
+        matches!(&self.item, ResponseItem::Other)
+            .then_some(self.correction_intent.as_ref())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -6213,5 +6239,37 @@ mod tests {
                 .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
+    }
+
+    #[test]
+    fn correction_intent_carrier_is_legacy_deserializable() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyRawResponseItemEvent {
+            item: ResponseItem,
+        }
+
+        let event = RawResponseItemEvent::correction_intent(CorrectionIntent {
+            correction_id: "b7754d6f-f4df-4cfe-8621-8b735d348fb3".to_string(),
+            expected_client_user_message_id: "client-user-1".to_string(),
+            payload: "Tori should be Tauri".to_string(),
+        });
+        let value = serde_json::to_value(&event)?;
+
+        assert_eq!(value["item"], json!({"type": "other"}));
+        assert_eq!(
+            value["correction_intent"],
+            json!({
+                "correctionId": "b7754d6f-f4df-4cfe-8621-8b735d348fb3",
+                "expectedClientUserMessageId": "client-user-1",
+                "payload": "Tori should be Tauri",
+            })
+        );
+        let legacy = serde_json::from_value::<LegacyRawResponseItemEvent>(value)?;
+        assert_eq!(legacy.item, ResponseItem::Other);
+
+        let ordinary: RawResponseItemEvent =
+            serde_json::from_value(json!({"item": {"type": "other"}}))?;
+        assert!(ordinary.correction_intent.is_none());
+        Ok(())
     }
 }
