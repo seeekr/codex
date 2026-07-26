@@ -21,6 +21,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use similar::ChangeTag;
+use similar::DiffTag;
 use similar::TextDiff;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -161,15 +162,12 @@ impl NativeComposerSubmission {
                 return None;
             }
             if let Some(submission) = submission {
-                if submission.submitted_text.as_ref() != text {
-                    return None;
-                }
                 match thread_id.as_deref() {
                     None => thread_id = Some(submission.thread_id.clone()),
                     Some(existing) if existing == submission.thread_id => {}
                     Some(_) => return None,
                 }
-                for lease in submission.leases {
+                for lease in rebase_submission_leases(&submission, &text)? {
                     leases.push(NativeSubmittedLease {
                         native: lease.native,
                         range: lease.range.start + offset..lease.range.end + offset,
@@ -275,15 +273,15 @@ pub(crate) struct ComposerControlRequest {
     reply: SyncSender<WireResult>,
 }
 
-/// Application-context correction ready for the async app-server acknowledgement boundary.
+/// Correction ready for the async app-server acknowledgement boundary.
 ///
 /// This type carries transcript-derived context and therefore deliberately has no `Debug`
 /// implementation.
 pub(crate) struct PendingComposerCorrection {
     lease_id: Uuid,
     thread_id: String,
-    context_key: String,
-    context_value: String,
+    correction_id: Uuid,
+    payload: String,
     reply: SyncSender<WireResult>,
 }
 
@@ -292,12 +290,12 @@ impl PendingComposerCorrection {
         &self.thread_id
     }
 
-    pub(crate) fn context_key(&self) -> &str {
-        &self.context_key
+    pub(crate) fn correction_id(&self) -> Uuid {
+        self.correction_id
     }
 
-    pub(crate) fn context_value(&self) -> &str {
-        &self.context_value
+    pub(crate) fn payload(&self) -> &str {
+        &self.payload
     }
 }
 
@@ -332,8 +330,8 @@ enum ComposerCommand {
 struct PreparedCorrection {
     lease_id: Uuid,
     thread_id: String,
-    context_key: String,
-    context_value: String,
+    correction_id: Uuid,
+    payload: String,
 }
 
 enum CommandExecution {
@@ -355,10 +353,22 @@ struct Capture {
 }
 
 enum ExternalLeaseState<L> {
-    Draft { native: L },
-    SubmissionPending { receipt: SubmittedLeaseReceipt },
-    SubmittedIntact { receipt: SubmittedLeaseReceipt },
-    CorrectionPending { receipt: SubmittedLeaseReceipt },
+    Draft {
+        native: L,
+    },
+    SubmissionPending {
+        receipt: SubmittedLeaseReceipt,
+    },
+    SubmittedIntact {
+        receipt: SubmittedLeaseReceipt,
+    },
+    CorrectionPending {
+        receipt: SubmittedLeaseReceipt,
+        correction_id: Uuid,
+        expected: String,
+        replacement: String,
+        payload: String,
+    },
 }
 
 #[derive(Clone)]
@@ -378,8 +388,18 @@ impl<L: Copy> Clone for ExternalLeaseState<L> {
             Self::SubmittedIntact { receipt } => Self::SubmittedIntact {
                 receipt: receipt.clone(),
             },
-            Self::CorrectionPending { receipt } => Self::CorrectionPending {
+            Self::CorrectionPending {
+                receipt,
+                correction_id,
+                expected,
+                replacement,
+                payload,
+            } => Self::CorrectionPending {
                 receipt: receipt.clone(),
+                correction_id: *correction_id,
+                expected: expected.clone(),
+                replacement: replacement.clone(),
+                payload: payload.clone(),
             },
         }
     }
@@ -461,8 +481,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             CommandExecution::Correct(correction) => Some(PendingComposerCorrection {
                 lease_id: correction.lease_id,
                 thread_id: correction.thread_id,
-                context_key: correction.context_key,
-                context_value: correction.context_value,
+                correction_id: correction.correction_id,
+                payload: correction.payload,
                 reply,
             }),
         }
@@ -475,14 +495,30 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     ) {
         let result = match outcome {
             CorrectionDispatchOutcome::Acknowledged => {
-                self.leases.remove(&pending.lease_id);
-                self.lease_order
-                    .retain(|queued| *queued != pending.lease_id);
+                let is_superseded = self.leases.get(&pending.lease_id).is_some_and(|lease| {
+                    matches!(
+                        &lease.state,
+                        ExternalLeaseState::CorrectionPending {
+                            correction_id,
+                            ..
+                        } if *correction_id != pending.correction_id
+                    )
+                });
+                if !is_superseded {
+                    self.leases.remove(&pending.lease_id);
+                    self.lease_order
+                        .retain(|queued| *queued != pending.lease_id);
+                }
                 WireResult::Corrected
             }
             CorrectionDispatchOutcome::NotApplied => {
                 if let Some(lease) = self.leases.get_mut(&pending.lease_id)
-                    && let ExternalLeaseState::CorrectionPending { receipt } = &lease.state
+                    && let ExternalLeaseState::CorrectionPending {
+                        receipt,
+                        correction_id,
+                        ..
+                    } = &lease.state
+                    && *correction_id == pending.correction_id
                 {
                     lease.state = ExternalLeaseState::SubmittedIntact {
                         receipt: receipt.clone(),
@@ -490,12 +526,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
                 WireResult::not_applied(ErrorCode::CorrectionUnavailable)
             }
-            CorrectionDispatchOutcome::Unknown => {
-                self.leases.remove(&pending.lease_id);
-                self.lease_order
-                    .retain(|queued| *queued != pending.lease_id);
-                WireResult::error(ErrorCode::CorrectionUnavailable, MutationOutcome::Unknown)
-            }
+            CorrectionDispatchOutcome::Unknown => WireResult::CorrectionPending,
         };
         let _ = pending.reply.send(result);
     }
@@ -514,7 +545,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             CommandExecution::Complete(result) => result,
             CommandExecution::Correct(correction) => {
                 if let Some(lease) = self.leases.get_mut(&correction.lease_id)
-                    && let ExternalLeaseState::CorrectionPending { receipt } = &lease.state
+                    && let ExternalLeaseState::CorrectionPending { receipt, .. } = &lease.state
                 {
                     lease.state = ExternalLeaseState::SubmittedIntact {
                         receipt: receipt.clone(),
@@ -751,6 +782,11 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             ));
         };
         if lease.expected_hash != text_hash(&expected) {
+            if matches!(lease.state, ExternalLeaseState::CorrectionPending { .. }) {
+                return CommandExecution::Complete(WireResult::not_applied(
+                    ErrorCode::LeaseUnavailable,
+                ));
+            }
             self.leases.remove(&lease_id);
             self.lease_order.retain(|queued| *queued != lease_id);
             if target.thread_id().as_deref() == Some(lease.thread_id.as_str())
@@ -823,9 +859,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     ));
                 }
                 let correction_id = Uuid::new_v4();
-                let context_key =
-                    format!("koenig_transcription_correction_{}", correction_id.simple());
-                let Some(context_value) = mechanical_correction_context(
+                let Some(payload) = mechanical_correction_context(
                     receipt.submission_id,
                     &receipt.submitted_text,
                     receipt.range.clone(),
@@ -837,17 +871,44 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     ));
                 };
                 if let Some(stored) = self.leases.get_mut(&lease_id) {
-                    stored.state = ExternalLeaseState::CorrectionPending { receipt };
+                    stored.state = ExternalLeaseState::CorrectionPending {
+                        receipt,
+                        correction_id,
+                        expected,
+                        replacement,
+                        payload: payload.clone(),
+                    };
                 }
                 CommandExecution::Correct(PreparedCorrection {
                     lease_id,
                     thread_id: lease.thread_id,
-                    context_key,
-                    context_value,
+                    correction_id,
+                    payload,
                 })
             }
-            ExternalLeaseState::CorrectionPending { .. } => {
-                CommandExecution::Complete(WireResult::not_applied(ErrorCode::LeaseUnavailable))
+            ExternalLeaseState::CorrectionPending {
+                correction_id,
+                expected: pending_expected,
+                replacement: pending_replacement,
+                payload,
+                ..
+            } => {
+                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::ComposerUnavailable,
+                    ));
+                }
+                if expected != pending_expected || replacement != pending_replacement {
+                    return CommandExecution::Complete(WireResult::not_applied(
+                        ErrorCode::LeaseUnavailable,
+                    ));
+                }
+                CommandExecution::Correct(PreparedCorrection {
+                    lease_id,
+                    thread_id: lease.thread_id,
+                    correction_id,
+                    payload,
+                })
             }
         }
     }
@@ -977,6 +1038,82 @@ impl NativeComposerControlState {
     }
 }
 
+/// Rebase owned ranges across deterministic message normalization such as image-placeholder
+/// renumbering. Any edit that intersects owned text fails closed, and each rebased range must
+/// still contain the exact originally owned bytes.
+fn rebase_submission_leases(
+    submission: &NativeComposerSubmission,
+    remapped_text: &str,
+) -> Option<Vec<NativeSubmittedLease>> {
+    if submission.submitted_text.as_ref() == remapped_text {
+        return Some(submission.leases.clone());
+    }
+
+    #[derive(Clone)]
+    struct Edit {
+        old: Range<usize>,
+        new_len: usize,
+    }
+
+    let diff = TextDiff::from_chars(submission.submitted_text.as_ref(), remapped_text);
+    let old_slices = diff.old_slices();
+    let new_slices = diff.new_slices();
+    let old_prefix = old_slices
+        .iter()
+        .scan(0usize, |offset, slice| {
+            let current = *offset;
+            *offset += slice.len();
+            Some(current)
+        })
+        .chain(std::iter::once(submission.submitted_text.len()))
+        .collect::<Vec<_>>();
+    let new_prefix = new_slices
+        .iter()
+        .scan(0usize, |offset, slice| {
+            let current = *offset;
+            *offset += slice.len();
+            Some(current)
+        })
+        .chain(std::iter::once(remapped_text.len()))
+        .collect::<Vec<_>>();
+    let edits = diff
+        .ops()
+        .iter()
+        .filter(|operation| operation.tag() != DiffTag::Equal)
+        .map(|operation| {
+            let old = operation.old_range();
+            let new = operation.new_range();
+            Edit {
+                old: old_prefix[old.start]..old_prefix[old.end],
+                new_len: new_prefix[new.end] - new_prefix[new.start],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    submission
+        .leases
+        .iter()
+        .map(|lease| {
+            let mut shift = 0isize;
+            for edit in &edits {
+                if edit.old.end <= lease.range.start {
+                    shift += edit.new_len as isize
+                        - (edit.old.end.saturating_sub(edit.old.start)) as isize;
+                } else if edit.old.start < lease.range.end {
+                    return None;
+                }
+            }
+            let range = lease.range.start.checked_add_signed(shift)?
+                ..lease.range.end.checked_add_signed(shift)?;
+            let expected = submission.submitted_text.get(lease.range.clone())?;
+            (remapped_text.get(range.clone()) == Some(expected)).then_some(NativeSubmittedLease {
+                native: lease.native,
+                range,
+            })
+        })
+        .collect()
+}
+
 fn mechanical_correction_context(
     submission_id: Uuid,
     submitted_text: &str,
@@ -1017,10 +1154,10 @@ fn mechanical_correction_context(
         if !changed {
             continue;
         }
-        let old_slice_start = group
-            .first()
-            .map(|operation| operation.old_range().start)
-            .expect("grouped diff hunk cannot be empty");
+        let Some(old_slice_start) = group.first().map(|operation| operation.old_range().start)
+        else {
+            continue;
+        };
         let old_start = diff.old_slices()[..old_slice_start]
             .iter()
             .map(|slice| slice.len())
@@ -1056,17 +1193,22 @@ fn mechanical_correction_context(
         let local_old_end = old_start + old.len();
         let submitted_old_start = lease_range.start + old_start;
         let submitted_old_end = lease_range.start + local_old_end;
-        let occurrence = (!old.is_empty()).then(|| {
+        let occurrence = if old.is_empty() {
+            0
+        } else {
             submitted_text
                 .match_indices(&old)
                 .take_while(|(position, _)| *position <= submitted_old_start)
                 .count()
-        });
+        };
         let old_char_count = old.chars().count();
         let old_rendered = compact_old_snippet(&old, OLD_SNIPPET_MAX_CHARS);
-        let old_rendered =
-            serde_json::to_string(&old_rendered).expect("serializing a string cannot fail");
-        let new = serde_json::to_string(&new).expect("serializing a string cannot fail");
+        let Ok(old_rendered) = serde_json::to_string(&old_rendered) else {
+            return None;
+        };
+        let Ok(new) = serde_json::to_string(&new) else {
+            return None;
+        };
         if old.is_empty() {
             rendered.push_str(&format!(
                 "\n\nHunk {}: insert at submitted-message byte {submitted_old_start}.\n- \
@@ -1080,7 +1222,7 @@ fn mechanical_correction_context(
                 index + 1,
                 old_start = submitted_old_start,
                 old_end = submitted_old_end,
-                occurrence = occurrence.expect("non-empty old text has an occurrence"),
+                occurrence = occurrence,
             ));
         } else {
             rendered.push_str(&format!(
@@ -1090,7 +1232,7 @@ fn mechanical_correction_context(
                 index + 1,
                 old_start = submitted_old_start,
                 old_end = submitted_old_end,
-                occurrence = occurrence.expect("non-empty old text has an occurrence"),
+                occurrence = occurrence,
             ));
         }
         if truncate_middle_with_token_budget(&rendered, MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS)
@@ -1394,7 +1536,13 @@ enum WireResult {
         lease_id: Uuid,
     },
     Verified,
+    /// The matching user message has not committed to model history yet. No lease state or text
+    /// was changed; retry the same operation with the same lease after the commit transition.
     SubmissionPending,
+    /// The dedicated correction commit may have reached durable model history, but its
+    /// acknowledgement was ambiguous. Retry the exact same replacement with this lease; the
+    /// retained correction identity makes that retry idempotent.
+    CorrectionPending,
     SubmittedIntact,
     Kept,
     Replaced,

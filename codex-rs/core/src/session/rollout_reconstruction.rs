@@ -9,6 +9,8 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
+    pub(super) correction_receipts: BTreeMap<String, ResponseItem>,
+    pub(super) correction_receipt_conflicts: HashSet<String>,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -109,6 +111,114 @@ fn finalize_active_segment<'a>(
     }
 }
 
+/// Reconstruct the correction receipt ledger independently from prompt-history compaction.
+///
+/// A receipt belongs to the latest surviving real user/instruction turn. Rollback removes the
+/// newest segments and makes the preceding surviving segment current again; only a correction
+/// with no surviving turn is standalone. This mirrors prompt-tail rollback without letting
+/// compaction erase the idempotency ledger.
+pub(super) fn reconstruct_correction_receipts(
+    rollout_items: &[RolloutItem],
+) -> (BTreeMap<String, ResponseItem>, HashSet<String>) {
+    let mut standalone = Vec::new();
+    let mut turn_segments: Vec<Vec<ResponseItem>> = Vec::new();
+    let mut current_segment = None;
+
+    for item in rollout_items {
+        match item {
+            RolloutItem::ResponseItem(response_item) => {
+                if is_user_turn_boundary(response_item) {
+                    turn_segments.push(Vec::new());
+                    current_segment = Some(turn_segments.len() - 1);
+                }
+                if super::correction::correction_frame_id(response_item).is_some() {
+                    if let Some(segment) =
+                        current_segment.and_then(|index| turn_segments.get_mut(index))
+                    {
+                        segment.push(response_item.clone());
+                    } else {
+                        standalone.push(response_item.clone());
+                    }
+                }
+            }
+            RolloutItem::InterAgentCommunication(_) => {
+                turn_segments.push(Vec::new());
+                current_segment = Some(turn_segments.len() - 1);
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                let drop_count = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+                turn_segments.truncate(turn_segments.len().saturating_sub(drop_count));
+                current_segment = turn_segments.len().checked_sub(1);
+            }
+            RolloutItem::Compacted(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+        }
+    }
+
+    let mut receipts = BTreeMap::new();
+    let mut conflicts = HashSet::new();
+    for frame in standalone
+        .into_iter()
+        .chain(turn_segments.into_iter().flatten())
+    {
+        let Some(stable_id) = super::correction::correction_frame_id(&frame) else {
+            continue;
+        };
+        match receipts.get(stable_id) {
+            Some(existing)
+                if !super::correction::correction_frames_have_same_payload(existing, &frame) =>
+            {
+                tracing::error!(
+                    correction_id = stable_id,
+                    "conflicting durable correction frames found during rollout replay"
+                );
+                conflicts.insert(stable_id.to_string());
+            }
+            Some(_) => {}
+            None => {
+                receipts.insert(stable_id.to_string(), frame);
+            }
+        }
+    }
+    (receipts, conflicts)
+}
+
+pub(super) fn deduplicate_correction_frames(
+    history: Vec<ResponseItem>,
+    conflicts: &mut HashSet<String>,
+) -> Vec<ResponseItem> {
+    let mut first_by_id = BTreeMap::<String, ResponseItem>::new();
+    history
+        .into_iter()
+        .filter(|frame| {
+            let Some(stable_id) = super::correction::correction_frame_id(frame) else {
+                return true;
+            };
+            match first_by_id.get(stable_id) {
+                Some(existing)
+                    if !super::correction::correction_frames_have_same_payload(existing, frame) =>
+                {
+                    tracing::error!(
+                        correction_id = stable_id,
+                        "conflicting correction duplicate omitted from model history"
+                    );
+                    conflicts.insert(stable_id.to_string());
+                    false
+                }
+                Some(_) => false,
+                None => {
+                    first_by_id.insert(stable_id.to_string(), frame.clone());
+                    true
+                }
+            }
+        })
+        .collect()
+}
+
 impl Session {
     pub(super) async fn reconstruct_history_from_rollout(
         &self,
@@ -141,6 +251,8 @@ impl Session {
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
         let mut window = None;
+        let (correction_receipts, mut correction_receipt_conflicts) =
+            reconstruct_correction_receipts(rollout_items);
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
         let mut pending_rollback_turns = 0usize;
@@ -427,8 +539,14 @@ impl Session {
             previous_id: None,
             id: None,
         });
+        let history = deduplicate_correction_frames(
+            history.into_raw_items(),
+            &mut correction_receipt_conflicts,
+        );
         RolloutReconstruction {
-            history: history.into_raw_items(),
+            history,
+            correction_receipts,
+            correction_receipt_conflicts,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,

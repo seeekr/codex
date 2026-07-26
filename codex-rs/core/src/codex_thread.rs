@@ -275,6 +275,27 @@ impl CodexThread {
             .await
     }
 
+    pub async fn commit_correction(
+        &self,
+        correction_id: String,
+        payload: String,
+        trace: Option<W3cTraceContext>,
+    ) -> CodexResult<crate::CorrectionCommitStatus> {
+        let op = Op::CommitCorrection {
+            correction_id: correction_id.clone(),
+            payload: payload.clone(),
+        };
+        self.codex
+            .session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_op(self.session_configured.thread_id, &op)
+            .await?;
+        self.codex
+            .commit_correction(correction_id, payload, trace)
+            .await
+    }
+
     /// Persist whether this thread is eligible for future memory generation.
     pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
         self.codex.set_thread_memory_mode(mode).await

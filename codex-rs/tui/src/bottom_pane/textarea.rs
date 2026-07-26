@@ -158,14 +158,26 @@ impl ComposerLeases {
     }
 
     fn insert(&mut self, range: Range<usize>) -> ComposerLeaseId {
+        let sequence = match self.next_id.checked_add(1) {
+            Some(next_id) => {
+                let sequence = self.next_id;
+                self.next_id = next_id;
+                sequence
+            }
+            None => {
+                // Rotate the generation before reusing sequence numbers. Existing leases are
+                // invalid across a generation change, so even this practically unreachable
+                // rollover cannot alias an older lease.
+                self.generation = Uuid::new_v4();
+                self.ranges.clear();
+                self.next_id = 2;
+                1
+            }
+        };
         let id = ComposerLeaseId {
             generation: self.generation,
-            sequence: self.next_id,
+            sequence,
         };
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("composer lease id space exhausted");
         self.ranges.insert(id, range);
         id
     }

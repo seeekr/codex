@@ -17348,6 +17348,13 @@
         "title": "ThreadCompactStartResponse",
         "type": "object"
       },
+      "ThreadCorrectionCommitStatus": {
+        "enum": [
+          "committed",
+          "alreadyCommitted"
+        ],
+        "type": "string"
+      },
       "ThreadDeleteParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {

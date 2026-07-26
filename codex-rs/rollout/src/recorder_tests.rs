@@ -593,6 +593,81 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 }
 
 #[tokio::test]
+async fn writer_recovery_removes_partial_jsonl_tail_before_retry() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    std::fs::write(&rollout_path, br#"{"timestamp":"partial"#)?;
+    let read_only_file = std::fs::OpenOptions::new().read(true).open(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(tokio::fs::File::from_std(read_only_file)),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+        AgentMessageEvent {
+            message: "survives-partial-write-recovery".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ))]);
+
+    state.flush().await?;
+
+    let (items, _thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 1);
+    assert!(matches!(
+        items.as_slice(),
+        [RolloutItem::EventMsg(EventMsg::AgentMessage(event))]
+            if event.message == "survives-partial-write-recovery"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn writer_retries_tail_repair_on_next_flush_after_repair_failure() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    std::fs::create_dir(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        /*file*/ None,
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+        AgentMessageEvent {
+            message: "survives-repair-retry".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ))]);
+
+    state
+        .flush()
+        .await
+        .expect_err("a directory cannot be repaired as a JSONL file");
+    std::fs::remove_dir(&rollout_path)?;
+    std::fs::write(&rollout_path, br#"{"timestamp":"partial"#)?;
+
+    state.flush().await?;
+    let (items, _thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 1);
+    assert!(matches!(
+        items.as_slice(),
+        [RolloutItem::EventMsg(EventMsg::AgentMessage(event))]
+            if event.message == "survives-repair-retry"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

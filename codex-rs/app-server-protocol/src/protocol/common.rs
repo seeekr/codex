@@ -660,6 +660,13 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadInjectItemsResponse,
     },
+    #[experimental("thread/correction/commit")]
+    /// Durably commit one idempotent model-visible correction frame.
+    ThreadCorrectionCommit => "thread/correction/commit" {
+        params: v2::ThreadCorrectionCommitParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadCorrectionCommitResponse,
+    },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,
         serialization: global_shared_read("config"),

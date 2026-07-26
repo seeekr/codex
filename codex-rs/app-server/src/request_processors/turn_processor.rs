@@ -181,6 +181,45 @@ impl TurnRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn thread_correction_commit(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadCorrectionCommitParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (_, thread) = self
+            .load_thread(&params.thread_id)
+            .await
+            .inspect_err(|error| {
+                self.track_error_response(request_id, error, /*error_type*/ None);
+            })?;
+        self.ensure_direct_input_allowed(request_id, thread.as_ref())
+            .await?;
+        let status = thread
+            .commit_correction(
+                params.correction_id,
+                params.payload,
+                self.request_trace_context(request_id).await,
+            )
+            .await
+            .map_err(|error| {
+                let error = match error {
+                    CodexErr::InvalidRequest(message) => invalid_request(message),
+                    error => internal_error(format!("failed to commit correction: {error}")),
+                };
+                self.track_error_response(request_id, &error, /*error_type*/ None);
+                error
+            })?;
+        let status = match status {
+            codex_core::CorrectionCommitStatus::Committed => {
+                ThreadCorrectionCommitStatus::Committed
+            }
+            codex_core::CorrectionCommitStatus::AlreadyCommitted => {
+                ThreadCorrectionCommitStatus::AlreadyCommitted
+            }
+        };
+        Ok(Some(ThreadCorrectionCommitResponse { status }.into()))
+    }
+
     pub(crate) async fn thread_settings_update(
         &self,
         request_id: &ConnectionRequestId,
@@ -941,11 +980,6 @@ impl TurnRequestProcessor {
                             Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
                         )
                     }
-                    SteerInputError::ApplicationContextReceiptConflict { key } => (
-                        format!("application context receipt `{key}` was reused with new content"),
-                        None,
-                        None,
-                    ),
                     SteerInputError::EmptyInput => (
                         "input must not be empty".to_string(),
                         None,

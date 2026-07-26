@@ -43,6 +43,129 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+fn correction_message(id: Uuid, payload: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some(format!("msg_correction_{}", id.simple())),
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: payload.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[test]
+fn correction_receipt_replay_is_compaction_independent_and_semantically_idempotent() {
+    let id = Uuid::new_v4();
+    let correction = correction_message(id, "replace parakeat with Parakeet");
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("dictated text")),
+        RolloutItem::ResponseItem(correction.clone()),
+        RolloutItem::Compacted(CompactedItem {
+            message: "compacted".to_string(),
+            replacement_history: Some(vec![user_message("summary without correction frame")]),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::ResponseItem(correction.clone()),
+    ];
+
+    let (receipts, conflicts) =
+        rollout_reconstruction::reconstruct_correction_receipts(&rollout_items);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts.get(correction.id().unwrap()), Some(&correction));
+    assert!(conflicts.is_empty());
+
+    let mut history_conflicts = HashSet::new();
+    let deduplicated = rollout_reconstruction::deduplicate_correction_frames(
+        vec![correction.clone(), correction],
+        &mut history_conflicts,
+    );
+    assert_eq!(deduplicated.len(), 1);
+    assert!(history_conflicts.is_empty());
+}
+
+#[test]
+fn correction_receipt_replay_conflicts_only_for_surviving_frames() {
+    let id = Uuid::new_v4();
+    let first = correction_message(id, "first payload");
+    let second = correction_message(id, "different payload");
+    let surviving = vec![
+        RolloutItem::ResponseItem(user_message("dictated text")),
+        RolloutItem::ResponseItem(first.clone()),
+        RolloutItem::ResponseItem(second.clone()),
+    ];
+    let (_, conflicts) = rollout_reconstruction::reconstruct_correction_receipts(&surviving);
+    assert_eq!(conflicts, HashSet::from([first.id().unwrap().to_string()]));
+
+    let rolled_back = surviving
+        .into_iter()
+        .chain(std::iter::once(RolloutItem::EventMsg(
+            EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
+                num_turns: 1,
+            }),
+        )))
+        .collect::<Vec<_>>();
+    let (receipts, conflicts) =
+        rollout_reconstruction::reconstruct_correction_receipts(&rolled_back);
+    assert!(receipts.is_empty());
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn correction_receipt_replay_restores_surviving_segment_after_rollback() {
+    let id = Uuid::new_v4();
+    let correction = correction_message(id, "payload");
+    let rollback = || {
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        ))
+    };
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("u1")),
+        RolloutItem::ResponseItem(user_message("u2")),
+        RolloutItem::ResponseItem(correction.clone()),
+        rollback(),
+        RolloutItem::ResponseItem(correction),
+        rollback(),
+    ];
+
+    let (receipts, conflicts) =
+        rollout_reconstruction::reconstruct_correction_receipts(&rollout_items);
+    assert!(receipts.is_empty());
+    assert!(conflicts.is_empty());
+}
+
+#[tokio::test]
+async fn reconstruct_history_rollback_then_reapply_keeps_one_correction_frame_and_receipt() {
+    let (session, turn_context) = make_session_and_context().await;
+    let id = Uuid::new_v4();
+    let correction = correction_message(id, "replace parakeat with Parakeet");
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_message("dictated text")),
+        RolloutItem::ResponseItem(correction.clone()),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+        RolloutItem::ResponseItem(correction.clone()),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(reconstructed.history, vec![correction.clone()]);
+    assert_eq!(
+        reconstructed
+            .correction_receipts
+            .get(correction.id().unwrap()),
+        Some(&correction)
+    );
+    assert!(reconstructed.correction_receipt_conflicts.is_empty());
+}
+
 fn inter_agent_assistant_message(text: &str) -> ResponseItem {
     let communication = InterAgentCommunication::new(
         AgentPath::root(),

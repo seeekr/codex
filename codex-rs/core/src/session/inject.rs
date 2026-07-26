@@ -3,8 +3,6 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::ActiveTurn;
-use crate::state::TurnState;
 use crate::tasks::RegularTask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
@@ -22,7 +20,12 @@ impl Session {
     ) -> Result<(), Vec<ResponseItem>> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
-            Some(active_turn) => {
+            Some(active_turn)
+                if active_turn
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.accepts_steer) =>
+            {
                 self.input_queue
                     .extend_pending_input_for_turn_state(
                         active_turn.turn_state.as_ref(),
@@ -31,7 +34,7 @@ impl Session {
                     .await;
                 Ok(())
             }
-            None => Err(input),
+            Some(_) | None => Err(input),
         }
     }
 
@@ -62,20 +65,15 @@ impl Session {
             ));
         }
 
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return Err(TryStartTurnIfIdleError::new(
-                    TryStartTurnIfIdleRejectionReason::Busy,
-                    input,
-                ));
-            }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+        let Some(reservation) = self.reserve_task_start().await else {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
         };
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.release_task_start(&reservation).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -87,7 +85,7 @@ impl Session {
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
         if turn_context.collaboration_mode.mode == ModeKind::Plan {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.release_task_start(&reservation).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -97,46 +95,26 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.release_task_start(&reservation).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
-        }
 
         self.input_queue
             .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
+                reservation.turn_state.as_ref(),
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
             )
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        assert!(
+            self.start_reserved_task(reservation, turn_context, Vec::new(), RegularTask::new())
+                .await,
+            "idle-injection task-start reservation must remain owned until task publication"
+        );
         Ok(())
-    }
-
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
-        {
-            *active_turn_guard = None;
-        }
     }
 
     /// Injects items into active work, or records them without starting a turn.

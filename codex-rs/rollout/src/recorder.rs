@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::Error as IoError;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1542,6 +1545,49 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// Remove only an incomplete trailing JSONL record before retrying a failed append.
+///
+/// `write_all` can fail after writing a prefix. Reopening in append mode without repairing that
+/// suffix would concatenate the full retry onto malformed JSON and let a later flush report
+/// success even though replay cannot recover the item. A trailing newline proves the prior record
+/// reached its complete line boundary, so that case is deliberately left untouched.
+fn truncate_incomplete_jsonl_tail(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let path = compression::materialize_rollout_for_append_blocking(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    const SCAN_CHUNK_BYTES: u64 = 8 * 1024;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(SCAN_CHUNK_BYTES);
+        let mut chunk = vec![0u8; usize::try_from(end - start).unwrap_or(usize::MAX)];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        if let Some(last_newline) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            file.set_len(start + u64::try_from(last_newline).unwrap_or(u64::MAX) + 1)?;
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)
+}
+
 /// Mutable state owned by the background rollout writer.
 ///
 /// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
@@ -1663,6 +1709,9 @@ impl RolloutWriterState {
             .as_ref()
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
+        // Every reopen repairs a possibly partial append first. If repair itself fails, the writer
+        // remains closed and the next barrier retries repair instead of bypassing it.
+        truncate_incomplete_jsonl_tail(path)?;
         let file = open_log_file(path)?;
         self.writer = Some(JsonlWriter {
             file: tokio::fs::File::from_std(file),

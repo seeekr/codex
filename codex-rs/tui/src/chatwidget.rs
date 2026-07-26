@@ -440,6 +440,7 @@ use self::user_messages::UserMessageHistoryRecord;
 use self::user_messages::app_server_text_elements;
 pub(crate) use self::user_messages::create_initial_user_message;
 use self::user_messages::merge_user_messages;
+#[cfg(test)]
 use self::user_messages::merge_user_messages_with_history_record;
 #[cfg(test)]
 use self::user_messages::remap_placeholders_for_message;

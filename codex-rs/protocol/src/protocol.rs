@@ -572,6 +572,15 @@ pub enum Op {
         thread_settings: ThreadSettingsOverrides,
     },
 
+    /// Durably commit one model-visible correction frame and wake model processing.
+    ///
+    /// `correction_id` is a stable UUID supplied by the producer. Retrying the same UUID with the
+    /// same payload is idempotent; reusing it with different content is rejected.
+    CommitCorrection {
+        correction_id: String,
+        payload: String,
+    },
+
     /// Apply persistent thread-settings overrides without starting a turn.
     ///
     /// This uses the same submission queue as turn starts so app-server can
@@ -877,6 +886,7 @@ impl Op {
             Self::RealtimeConversationClose => "realtime_conversation_close",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::UserInput { .. } => "user_input",
+            Self::CommitCorrection { .. } => "commit_correction",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",

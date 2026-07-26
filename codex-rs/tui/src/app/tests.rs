@@ -11,6 +11,8 @@ use super::*;
 use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::user_count;
+use crate::bottom_pane::ComposerLeaseId;
+use crate::bottom_pane::SubmittedComposerLease;
 
 use crate::chatwidget::ChatWidgetInit;
 use crate::chatwidget::create_initial_user_message;
@@ -5632,6 +5634,64 @@ async fn late_usage_result_can_follow_finalized_plan() {
 }
 
 #[tokio::test]
+async fn composer_submission_commits_only_on_matching_user_item_completion() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    let submission = NativeComposerSubmission::new(
+        thread_id.to_string(),
+        "owned",
+        vec![SubmittedComposerLease {
+            id: ComposerLeaseId::for_test(1),
+            range: 0..5,
+        }],
+    )
+    .expect("submission");
+    let client_id = submission.client_user_message_id();
+    app.register_pending_composer_submission(submission.clone(), "turn-1".to_string());
+
+    assert!(app.pending_composer_submissions.contains_key(&client_id));
+    assert!(matches!(
+        app.composer_submission_transitions.pop_front(),
+        Some(ComposerSubmissionTransition::Pending(pending))
+            if pending == submission
+    ));
+
+    app.note_composer_submission_notification(&ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: ThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                client_id: Some("different-client-id".to_string()),
+                content: Vec::new(),
+            },
+        },
+    ));
+    assert!(app.pending_composer_submissions.contains_key(&client_id));
+    assert!(app.composer_submission_transitions.is_empty());
+
+    app.note_composer_submission_notification(&ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: ThreadItem::UserMessage {
+                id: "user-2".to_string(),
+                client_id: Some(client_id.clone()),
+                content: Vec::new(),
+            },
+        },
+    ));
+    assert!(!app.pending_composer_submissions.contains_key(&client_id));
+    assert!(matches!(
+        app.composer_submission_transitions.pop_front(),
+        Some(ComposerSubmissionTransition::Committed(committed))
+            if committed == submission
+    ));
+}
+
+#[tokio::test]
 async fn thread_rollback_response_discards_queued_active_thread_events() {
     let mut app = make_test_app().await;
     let thread_id = ThreadId::new();
@@ -5687,6 +5747,11 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
         .as_mut()
         .expect("active receiver should remain attached");
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(
+        app.composer_submission_transitions.pop_front(),
+        Some(ComposerSubmissionTransition::InvalidateThread(invalidated))
+            if invalidated == thread_id.to_string()
+    ));
 }
 
 #[tokio::test]

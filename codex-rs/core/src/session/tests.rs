@@ -178,6 +178,7 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::Barrier;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -5593,6 +5594,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
+        pending_correction_commits: Mutex::new(HashMap::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
@@ -7724,6 +7726,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
+        pending_correction_commits: Mutex::new(HashMap::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
@@ -9366,6 +9369,84 @@ impl SessionTask for NeverEndingTask {
     }
 }
 
+struct RegularStartBoundaryTask {
+    task_published: Arc<Barrier>,
+    allow_turn_started: Arc<Barrier>,
+}
+
+impl SessionTask for RegularStartBoundaryTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.regular_start_boundary"
+    }
+
+    fn defers_steer_until_turn_started(&self) -> bool {
+        true
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        self.task_published.wait().await;
+        tokio::select! {
+            _ = self.allow_turn_started.wait() => {}
+            _ = cancellation_token.cancelled() => return Ok(None),
+        }
+        let sess = session.clone_session();
+        sess.send_event(
+            ctx.as_ref(),
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: ctx.sub_id.clone(),
+                trace_id: ctx.trace_id.clone(),
+                started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+                model_context_window: ctx.model_context_window(),
+                collaboration_mode_kind: ctx.collaboration_mode.mode,
+            }),
+        )
+        .await;
+        sess.publish_turn_started_for_steering(&ctx.sub_id).await;
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
+
+struct BlockingAbortTask {
+    abort_started: Arc<tokio::sync::Notify>,
+}
+
+impl SessionTask for BlockingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, _session: Arc<SessionTaskContext>, _ctx: Arc<TurnContext>) {
+        self.abort_started.notify_waiters();
+        std::future::pending().await
+    }
+}
+
 #[derive(Clone, Copy)]
 struct GuardianDeniedApprovalTask;
 
@@ -10154,11 +10235,7 @@ async fn steer_input_accepts_application_context_without_user_input() {
     assert_eq!(turn_id, tc.sub_id);
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::CommittedApplicationContext]
-    );
-    assert_eq!(
-        strip_metadata_from_items(sess.clone_history().await.raw_items()),
-        vec![ResponseItem::Message {
+        vec![TurnInput::ResponseItem(ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -10168,129 +10245,8 @@ async fn steer_input_accepts_application_context_without_user_input() {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }]
+        })]
     );
-
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    assert!(
-        matches!(
-            strip_metadata_from_items(sess.clone_history().await.raw_items()).first(),
-            Some(ResponseItem::Message {
-                role,
-                content,
-                ..
-            }) if role == "developer"
-                && content == &[ContentItem::InputText {
-                    text: "<koenig_correction_test>replace parakeat with \
-                           Parakeet</koenig_correction_test>"
-                        .to_string(),
-                }]
-        ),
-        "accepted Application context must survive an immediate interrupt"
-    );
-}
-
-#[tokio::test]
-async fn application_context_receipts_are_idempotent_and_conflicts_fail() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
-    let context = BTreeMap::from([(
-        "koenig_correction_idempotent".to_string(),
-        AdditionalContextEntry {
-            value: "replace first".to_string(),
-            kind: AdditionalContextKind::Application,
-        },
-    )]);
-
-    for _ in 0..2 {
-        sess.steer_input(
-            Vec::new(),
-            context.clone(),
-            Some(&tc.sub_id),
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
-        .await
-        .expect("same receipt and value is idempotent");
-    }
-    assert_eq!(
-        sess.clone_history().await.raw_items().len(),
-        1,
-        "an idempotent retry must not duplicate model-visible context"
-    );
-    assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::CommittedApplicationContext],
-        "an idempotent retry must not queue a second wake marker"
-    );
-
-    let err = sess
-        .steer_input(
-            Vec::new(),
-            BTreeMap::from([(
-                "koenig_correction_idempotent".to_string(),
-                AdditionalContextEntry {
-                    value: "different correction".to_string(),
-                    kind: AdditionalContextKind::Application,
-                },
-            )]),
-            Some(&tc.sub_id),
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
-        .await
-        .expect_err("same receipt with a different value must conflict");
-    assert_eq!(
-        err,
-        SteerInputError::ApplicationContextReceiptConflict {
-            key: "koenig_correction_idempotent".to_string(),
-        }
-    );
-
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
-
-#[tokio::test]
-async fn context_only_steer_rejects_non_application_context() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
-
-    let err = sess
-        .steer_input(
-            Vec::new(),
-            BTreeMap::from([(
-                "untrusted_context".to_string(),
-                AdditionalContextEntry {
-                    value: "must not become a context-only steer".to_string(),
-                    kind: AdditionalContextKind::Untrusted,
-                },
-            )]),
-            Some(&tc.sub_id),
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
-        .await
-        .expect_err("context-only steering is reserved for Application context");
-
-    assert_eq!(err, SteerInputError::EmptyInput);
-    assert!(sess.clone_history().await.raw_items().is_empty());
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
@@ -11219,4 +11175,639 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     }
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_commit_is_durable_idempotent_and_conflict_detecting_on_active_turn() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let store = attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    let correction_id = Uuid::new_v4().to_string();
+    let payload = "mechanically replace parakeat with Parakeet".to_string();
+    assert_eq!(
+        session
+            .commit_correction(correction_id.clone(), payload.clone())
+            .await
+            .expect("first correction commit"),
+        CorrectionCommitStatus::Committed
+    );
+    let calls_after_commit = store.calls().await;
+
+    assert_eq!(
+        session
+            .commit_correction(correction_id.clone(), payload.clone())
+            .await
+            .expect("idempotent correction retry"),
+        CorrectionCommitStatus::AlreadyCommitted
+    );
+    assert_eq!(
+        store.calls().await.append_items,
+        calls_after_commit.append_items,
+        "an acknowledged retry must not append again"
+    );
+    let pending = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await;
+    assert_eq!(pending, vec![TurnInput::CommittedCorrection]);
+
+    let history = session.clone_history().await;
+    let correction_frames = history
+        .raw_items()
+        .iter()
+        .filter(|item| correction::correction_frame_id(item).is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(correction_frames.len(), 1);
+    assert!(
+        correction::correction_payload_text(correction_frames[0])
+            .is_some_and(|text| text.contains(&payload))
+    );
+    assert!(
+        correction_frames[0]
+            .id()
+            .is_some_and(|id| id.starts_with("msg_correction_"))
+    );
+
+    let conflict = session
+        .commit_correction(correction_id, "different payload".to_string())
+        .await
+        .expect_err("same correction id with different payload must conflict");
+    assert!(
+        matches!(conflict, CodexErr::InvalidRequest(message) if message.contains("reused with different content"))
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_commit_failure_retains_intent_and_never_acknowledges() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let correction_id = Uuid::new_v4().to_string();
+
+    let first = session
+        .commit_correction(correction_id.clone(), "original payload".to_string())
+        .await
+        .expect_err("a correction without persistent thread history must fail");
+    assert!(matches!(first, CodexErr::InvalidRequest(_)));
+    assert!(session.clone_history().await.raw_items().is_empty());
+    {
+        let state = session.state.lock().await;
+        assert!(state.correction_receipts.is_empty());
+        assert_eq!(state.correction_intents.len(), 1);
+    }
+
+    let conflict = session
+        .commit_correction(correction_id, "changed after ambiguous failure".to_string())
+        .await
+        .expect_err("an uncertain correction id cannot be rebound");
+    assert!(
+        matches!(conflict, CodexErr::InvalidRequest(message) if message.contains("reused with different content"))
+    );
+
+    let oversized = session
+        .commit_correction(Uuid::new_v4().to_string(), "token ".repeat(2_000))
+        .await
+        .expect_err("core must enforce its correction payload token cap");
+    assert!(
+        matches!(oversized, CodexErr::InvalidRequest(message) if message.contains("1000-token limit"))
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_retry_crosses_turn_started_boundary_without_preceding_the_turn() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    let task_published = Arc::new(Barrier::new(2));
+    let allow_turn_started = Arc::new(Barrier::new(2));
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            RegularStartBoundaryTask {
+                task_published: Arc::clone(&task_published),
+                allow_turn_started: Arc::clone(&allow_turn_started),
+            },
+        )
+        .await;
+    task_published.wait().await;
+
+    let correction_id = Uuid::new_v4().to_string();
+    let payload = "replace parakeat with Parakeet".to_string();
+    let before_turn_started = timeout(
+        Duration::from_millis(100),
+        session.commit_correction(correction_id.clone(), payload.clone()),
+    )
+    .await
+    .expect("pre-TurnStarted correction outcome must be immediate")
+    .expect_err("a published task cannot accept correction before TurnStarted");
+    assert!(
+        matches!(before_turn_started, CodexErr::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(
+        !session
+            .clone_history()
+            .await
+            .raw_items()
+            .iter()
+            .any(|item| correction::correction_frame_id(item).is_some()),
+        "the retryable pre-TurnStarted attempt must not install a frame"
+    );
+
+    allow_turn_started.wait().await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|turn| turn.task.as_ref())
+                .is_some_and(|task| task.accepts_steer)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("regular task should publish TurnStarted acceptance");
+
+    assert_eq!(
+        session
+            .commit_correction(correction_id, payload)
+            .await
+            .expect("same correction identity should commit after TurnStarted"),
+        CorrectionCommitStatus::Committed
+    );
+    let stored = session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history");
+    let turn_started_index = stored
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
+        .expect("regular task must persist TurnStarted");
+    let correction_index = stored
+        .items
+        .iter()
+        .position(|item| {
+            matches!(item, RolloutItem::ResponseItem(frame) if correction::correction_frame_id(frame).is_some())
+        })
+        .expect("correction frame must persist");
+    assert!(
+        turn_started_index < correction_index,
+        "model-visible correction history must follow its TurnStarted boundary"
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_spawn_waits_for_task_start_reservation_instead_of_overwriting_it() {
+    let (session, reserved_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let reserved_context = Arc::new(reserved_context);
+    let replacement_context = session
+        .new_default_turn_with_sub_id("replacement-turn".to_string())
+        .await;
+    let reservation = session
+        .reserve_task_start()
+        .await
+        .expect("idle session should be reservable");
+
+    let replacement_session = Arc::clone(&session);
+    let replacement = tokio::spawn(async move {
+        replacement_session
+            .spawn_task(
+                replacement_context,
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: true,
+                },
+            )
+            .await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement must wait until the reservation owner publishes its task"
+    );
+
+    assert!(
+        session
+            .start_reserved_task(
+                reservation,
+                reserved_context,
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: true,
+                },
+            )
+            .await
+    );
+    timeout(Duration::from_secs(2), replacement)
+        .await
+        .expect("replacement should proceed after startup publication")
+        .expect("replacement task should join");
+    assert_eq!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .map(|task| task.turn_context.sub_id.as_str()),
+        Some("replacement-turn")
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_task_start_reservation_never_blocks_abort_or_next_start() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+
+    for _ in 0..64 {
+        let reservation = session
+            .reserve_task_start()
+            .await
+            .expect("idle session should be reservable");
+        let abort_session = Arc::clone(&session);
+        let abort = tokio::spawn(async move {
+            abort_session
+                .abort_all_tasks(TurnAbortReason::Replaced)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        drop(reservation);
+        timeout(Duration::from_secs(1), abort)
+            .await
+            .expect("abandoned startup waiter must wake")
+            .expect("abort task should join");
+        assert!(session.active_turn.lock().await.is_none());
+    }
+
+    let abandoned = session
+        .reserve_task_start()
+        .await
+        .expect("idle session should be reservable");
+    drop(abandoned);
+    let reclaimed = session
+        .reserve_task_start()
+        .await
+        .expect("ordinary next start must reclaim an abandoned reservation");
+    session.release_task_start(&reclaimed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_abort_finalizer_abandons_terminal_reservation_and_allows_restart() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let abort_started = Arc::new(tokio::sync::Notify::new());
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            BlockingAbortTask {
+                abort_started: Arc::clone(&abort_started),
+            },
+        )
+        .await;
+
+    let abort_started_wait = abort_started.notified();
+    let abort_session = Arc::clone(&session);
+    let abort = tokio::spawn(async move {
+        abort_session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    });
+    timeout(Duration::from_secs(2), abort_started_wait)
+        .await
+        .expect("abort finalizer should reach its cancellable await");
+    abort.abort();
+    assert!(
+        abort
+            .await
+            .expect_err("abort finalizer should be cancelled")
+            .is_cancelled()
+    );
+
+    let replacement_context = session
+        .new_default_turn_with_sub_id("replacement-after-abandoned-terminal".to_string())
+        .await;
+    timeout(
+        Duration::from_secs(2),
+        session.spawn_task(
+            replacement_context,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        ),
+    )
+    .await
+    .expect("next ordinary start must reclaim abandoned terminal publication");
+    assert_eq!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .map(|task| task.turn_context.sub_id.as_str()),
+        Some("replacement-after-abandoned-terminal")
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn injection_records_instead_of_queueing_into_non_consuming_turn_transitions() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let startup_item = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "startup item".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let startup = session
+        .reserve_task_start()
+        .await
+        .expect("idle session should be reservable");
+    let rejected = session
+        .inject_if_running(vec![startup_item.clone()])
+        .await
+        .expect_err("taskless startup has no committed consumer");
+    session
+        .inject_no_new_turn(rejected, Some(&turn_context))
+        .await;
+    let mut expected_startup_item = startup_item;
+    expected_startup_item.set_turn_id_if_missing(&turn_context.sub_id);
+    assert!(
+        session
+            .clone_history()
+            .await
+            .raw_items()
+            .contains(&expected_startup_item),
+        "startup-race injection must be recorded instead of silently lost"
+    );
+    session.release_task_start(&startup).await;
+
+    let closing_item = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "closing task item".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let closing_context = session
+        .new_default_turn_with_sub_id("closing-injection-task".to_string())
+        .await;
+    session
+        .spawn_task(
+            closing_context,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    session
+        .active_turn
+        .lock()
+        .await
+        .as_mut()
+        .and_then(|turn| turn.task.as_mut())
+        .expect("active task")
+        .accepts_steer = false;
+    let rejected = session
+        .inject_if_running(vec![closing_item.clone()])
+        .await
+        .expect_err("a closing task cannot consume newly injected input");
+    session
+        .inject_no_new_turn(rejected, Some(&turn_context))
+        .await;
+    let mut expected_closing_item = closing_item;
+    expected_closing_item.set_turn_id_if_missing(&turn_context.sub_id);
+    assert!(
+        session
+            .clone_history()
+            .await
+            .raw_items()
+            .contains(&expected_closing_item),
+        "closing-task injection must be recorded instead of silently lost"
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let terminal_item = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "terminal item".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let terminal_done = Arc::new(crate::state::TaskPublication::new());
+    let mut terminal = ActiveTurn::default();
+    terminal.terminal_done = Some(terminal_done);
+    *session.active_turn.lock().await = Some(terminal);
+    let rejected = session
+        .inject_if_running(vec![terminal_item.clone()])
+        .await
+        .expect_err("terminal-only transition has no consumer");
+    session
+        .inject_no_new_turn(rejected, Some(&turn_context))
+        .await;
+    let mut expected_terminal_item = terminal_item;
+    expected_terminal_item.set_turn_id_if_missing(&turn_context.sub_id);
+    assert!(
+        session
+            .clone_history()
+            .await
+            .raw_items()
+            .contains(&expected_terminal_item),
+        "terminal-race injection must be recorded instead of silently lost"
+    );
+    *session.active_turn.lock().await = None;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_commit_never_blocks_on_nonregular_or_closing_turns() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Review,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    let review_result = timeout(
+        Duration::from_millis(100),
+        session.commit_correction(
+            Uuid::new_v4().to_string(),
+            "review-time correction".to_string(),
+        ),
+    )
+    .await
+    .expect("review-time rejection must be immediate")
+    .expect_err("review-time correction must be definitely unavailable");
+    assert!(matches!(review_result, CodexErr::InvalidRequest(_)));
+    assert!(
+        session.state.lock().await.correction_intents.is_empty(),
+        "a definite rejection must not poison later correction identities"
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let closing_context = session
+        .new_default_turn_with_sub_id("closing-regular".to_string())
+        .await;
+    session
+        .spawn_task(
+            closing_context,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    session
+        .active_turn
+        .lock()
+        .await
+        .as_mut()
+        .and_then(|turn| turn.task.as_mut())
+        .expect("active regular task")
+        .accepts_steer = false;
+
+    let closing_result = timeout(
+        Duration::from_millis(100),
+        session.commit_correction(
+            Uuid::new_v4().to_string(),
+            "closing-time correction".to_string(),
+        ),
+    )
+    .await
+    .expect("closing-time ambiguity must be immediate")
+    .expect_err("closing turn cannot accept a correction yet");
+    assert!(
+        matches!(closing_result, CodexErr::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(
+        session.state.lock().await.correction_intents.len(),
+        1,
+        "an ambiguous closing-turn result must retain the stable intent for retry"
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_commit_retries_after_closing_turn_into_new_turn_segment() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let closing_done = Arc::new(crate::state::TaskPublication::new());
+    let mut closing = ActiveTurn::default();
+    closing.terminal_done = Some(Arc::clone(&closing_done));
+    *session.active_turn.lock().await = Some(closing);
+    let session = Arc::new(session);
+
+    let correction_id = Uuid::new_v4().to_string();
+    assert!(
+        matches!(
+            timeout(
+                Duration::from_millis(100),
+                session.commit_correction(
+                    correction_id.clone(),
+                    "post-terminal correction".to_string(),
+                ),
+            )
+            .await
+            .expect("closing-turn response must be immediate"),
+            Err(CodexErr::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "a closing turn must produce a retryable ambiguous result"
+    );
+
+    *session.active_turn.lock().await = None;
+    closing_done.publish();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(2),
+            session.commit_correction(correction_id, "post-terminal correction".to_string(),),
+        )
+        .await
+        .expect("correction commit should resume after terminal publication")
+        .expect("correction should commit"),
+        CorrectionCommitStatus::Committed
+    );
+
+    let stored = session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history");
+    let turn_started_index = stored
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
+        .expect("correction-processing turn must start");
+    let correction_index = stored
+        .items
+        .iter()
+        .position(|item| {
+            matches!(item, RolloutItem::ResponseItem(frame) if correction::correction_frame_id(frame).is_some())
+        })
+        .expect("correction frame must persist");
+    assert!(turn_started_index < correction_index);
+    assert!(
+        !stored
+            .items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_)))),
+        "correction processing must not invent a user message"
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

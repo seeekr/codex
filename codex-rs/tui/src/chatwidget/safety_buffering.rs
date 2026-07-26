@@ -25,7 +25,20 @@ pub(super) struct SafetyBufferingState {
 
 impl ChatWidget {
     pub(crate) fn record_safety_buffering_turn(&mut self, turn_id: String, turn: &AppCommand) {
-        self.safety_buffering.submitted_turn = Some((turn_id, turn.clone()));
+        self.safety_buffering.submitted_turn = if matches!(
+            turn,
+            AppCommand::UserTurn {
+                composer_submission: Some(_),
+                ..
+            }
+        ) {
+            // Rolling back and replaying native composer input can invalidate a still-live
+            // producer lease or undo a correction that the producer already observed as
+            // acknowledged. Keep waiting is safe; do not offer the lossy retry action.
+            None
+        } else {
+            Some((turn_id, turn.clone()))
+        };
     }
 
     pub(super) fn reset_safety_buffering_for_turn_start(&mut self) {
@@ -55,11 +68,11 @@ impl ChatWidget {
 
     pub(crate) fn can_retry_safety_buffered_turn(&self, turn_id: &str) -> bool {
         self.turn_lifecycle.agent_turn_running
-            && self
-                .safety_buffering
-                .active
-                .as_ref()
-                .is_some_and(|active| active.turn_id == turn_id && !active.agent_message_started)
+            && self.safety_buffering.active.as_ref().is_some_and(|active| {
+                active.turn_id == turn_id
+                    && active.last_prompt_had_retry
+                    && !active.agent_message_started
+            })
     }
 
     pub(crate) fn prepare_safety_buffering_retry(&mut self) {

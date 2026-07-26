@@ -7,6 +7,18 @@
 use super::*;
 use crate::session_resume::read_session_model;
 
+const JSONRPC_INVALID_REQUEST: i64 = -32600;
+const JSONRPC_INVALID_PARAMS: i64 = -32602;
+const COMPOSER_CORRECTION_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+fn correction_server_error_outcome(code: i64) -> CorrectionDispatchOutcome {
+    if matches!(code, JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS) {
+        CorrectionDispatchOutcome::NotApplied
+    } else {
+        CorrectionDispatchOutcome::Unknown
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ThreadRollbackOrigin {
     Backtrack,
@@ -14,88 +26,94 @@ pub(super) enum ThreadRollbackOrigin {
 }
 
 impl App {
-    pub(super) async fn dispatch_composer_correction(
-        &mut self,
-        app_server: &mut AppServerSession,
+    pub(super) fn composer_correction_thread_id(
+        &self,
         pending: &PendingComposerCorrection,
-    ) -> CorrectionDispatchOutcome {
+    ) -> std::result::Result<ThreadId, CorrectionDispatchOutcome> {
         let Ok(thread_id) = ThreadId::from_string(pending.thread_id()) else {
-            return CorrectionDispatchOutcome::NotApplied;
+            return Err(CorrectionDispatchOutcome::NotApplied);
         };
         if self.active_thread_id != Some(thread_id)
             || self.chat_widget.thread_id() != Some(thread_id)
         {
-            return CorrectionDispatchOutcome::NotApplied;
+            return Err(CorrectionDispatchOutcome::NotApplied);
         }
+        Ok(thread_id)
+    }
+}
 
-        if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
-            let mut steer_turn_id = turn_id;
-            let mut retried_after_turn_mismatch = false;
-            let mut retried_after_transport = false;
-            loop {
-                match app_server
-                    .turn_steer_application_context(
-                        thread_id,
-                        steer_turn_id.clone(),
-                        pending.context_key().to_string(),
-                        pending.context_value().to_string(),
-                    )
-                    .await
-                {
-                    Ok(_) => return CorrectionDispatchOutcome::Acknowledged,
-                    Err(error @ TypedRequestError::Server { .. }) => {
-                        match active_turn_steer_race(&error) {
-                            Some(ActiveTurnSteerRace::Missing) => {
-                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-                                    let mut store = channel.store.lock().await;
-                                    store.clear_active_turn_id();
-                                }
-                                break;
-                            }
-                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id })
-                                if !retried_after_turn_mismatch
-                                    && actual_turn_id != steer_turn_id =>
-                            {
-                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-                                    let mut store = channel.store.lock().await;
-                                    store.active_turn_id = Some(actual_turn_id.clone());
-                                }
-                                steer_turn_id = actual_turn_id;
-                                retried_after_turn_mismatch = true;
-                            }
-                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { .. }) | None => {
-                                return CorrectionDispatchOutcome::NotApplied;
-                            }
-                        }
-                    }
-                    Err(
-                        TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. },
-                    ) if !retried_after_transport => {
-                        retried_after_transport = true;
-                    }
-                    Err(
-                        TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. },
-                    ) => return CorrectionDispatchOutcome::Unknown,
-                }
+async fn dispatch_composer_correction_unbounded(
+    request_handle: &AppServerRequestHandle,
+    thread_id: ThreadId,
+    pending: &PendingComposerCorrection,
+) -> CorrectionDispatchOutcome {
+    for retried_after_transport in [false, true] {
+        let response: std::result::Result<ThreadCorrectionCommitResponse, TypedRequestError> =
+            request_handle
+                .request_typed(ClientRequest::ThreadCorrectionCommit {
+                    request_id: RequestId::String(format!(
+                        "composer-correction-{}",
+                        Uuid::new_v4()
+                    )),
+                    params: ThreadCorrectionCommitParams {
+                        thread_id: thread_id.to_string(),
+                        correction_id: pending.correction_id().to_string(),
+                        payload: pending.payload().to_string(),
+                    },
+                })
+                .await;
+        match response {
+            Ok(_) => return CorrectionDispatchOutcome::Acknowledged,
+            Err(TypedRequestError::Server { source, .. }) => {
+                return correction_server_error_outcome(source.code);
             }
-        }
-
-        match app_server
-            .turn_start_application_context(
-                thread_id,
-                pending.context_key().to_string(),
-                pending.context_value().to_string(),
-            )
-            .await
-        {
-            Ok(_) => CorrectionDispatchOutcome::Acknowledged,
-            Err(TypedRequestError::Server { .. }) => CorrectionDispatchOutcome::NotApplied,
+            Err(TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. })
+                if !retried_after_transport => {}
             Err(TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. }) => {
-                CorrectionDispatchOutcome::Unknown
+                return CorrectionDispatchOutcome::Unknown;
             }
         }
     }
+    unreachable!("correction commit transport retry loop should return")
+}
 
+async fn correction_dispatch_with_timeout(
+    dispatch: impl std::future::Future<Output = CorrectionDispatchOutcome>,
+    timeout: Duration,
+) -> CorrectionDispatchOutcome {
+    tokio::time::timeout(timeout, dispatch)
+        .await
+        .unwrap_or(CorrectionDispatchOutcome::Unknown)
+}
+
+pub(super) async fn dispatch_composer_correction(
+    request_handle: AppServerRequestHandle,
+    thread_id: ThreadId,
+    pending: &PendingComposerCorrection,
+) -> CorrectionDispatchOutcome {
+    correction_dispatch_with_timeout(
+        dispatch_composer_correction_unbounded(&request_handle, thread_id, pending),
+        COMPOSER_CORRECTION_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod correction_dispatch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn correction_dispatch_expiry_is_unknown() {
+        let outcome = correction_dispatch_with_timeout(
+            std::future::pending::<CorrectionDispatchOutcome>(),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(outcome, CorrectionDispatchOutcome::Unknown);
+    }
+}
+
+impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
@@ -1630,7 +1648,7 @@ impl App {
         }
     }
 
-    fn register_pending_composer_submission(
+    pub(super) fn register_pending_composer_submission(
         &mut self,
         submission: NativeComposerSubmission,
         turn_id: String,
@@ -1647,7 +1665,10 @@ impl App {
             .push_back(super::ComposerSubmissionTransition::Pending(submission));
     }
 
-    fn note_composer_submission_notification(&mut self, notification: &ServerNotification) {
+    pub(super) fn note_composer_submission_notification(
+        &mut self,
+        notification: &ServerNotification,
+    ) {
         match notification {
             ServerNotification::ItemCompleted(notification) => {
                 let ThreadItem::UserMessage {
@@ -1760,6 +1781,24 @@ mod tests {
     use super::*;
     use codex_protocol::models::ActivePermissionProfile;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+
+    #[test]
+    fn correction_server_error_outcome_only_treats_request_rejection_as_not_applied() {
+        assert_eq!(
+            correction_server_error_outcome(JSONRPC_INVALID_REQUEST),
+            CorrectionDispatchOutcome::NotApplied
+        );
+        assert_eq!(
+            correction_server_error_outcome(JSONRPC_INVALID_PARAMS),
+            CorrectionDispatchOutcome::NotApplied
+        );
+        for code in [-32601, -32603, -32000] {
+            assert_eq!(
+                correction_server_error_outcome(code),
+                CorrectionDispatchOutcome::Unknown
+            );
+        }
+    }
 
     async fn config_with_workspace_profile() -> Config {
         let temp_dir = tempfile::tempdir().expect("tempdir");

@@ -771,6 +771,15 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
+                Op::CommitCorrection {
+                    correction_id,
+                    payload,
+                } => {
+                    let submission_id = sub.id;
+                    let result = sess.commit_correction(correction_id, payload).await;
+                    sess.resolve_correction_commit(&submission_id, result).await;
+                    false
+                }
                 Op::ThreadSettings { thread_settings } => {
                     update_thread_settings(&sess, sub.id.clone(), thread_settings).await;
                     false

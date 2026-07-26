@@ -526,7 +526,7 @@ async fn build_skills_and_plugins(
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_)
-            | TurnInput::CommittedApplicationContext
+            | TurnInput::CommittedCorrection
             | TurnInput::InterAgentCommunication(_) => None,
         })
         .flatten()
@@ -765,7 +765,7 @@ async fn track_turn_resolved_config_analytics(
                 .filter_map(|item| match item {
                     TurnInput::UserInput { content, .. } => Some(content.as_slice()),
                     TurnInput::ResponseItem(_)
-                    | TurnInput::CommittedApplicationContext
+                    | TurnInput::CommittedCorrection
                     | TurnInput::InterAgentCommunication(_) => None,
                 })
                 .flatten()

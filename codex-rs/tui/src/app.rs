@@ -116,6 +116,7 @@ use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::PluginUninstallResponse;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode as AppServerSandboxMode;
 use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
 use codex_app_server_protocol::ServerNotification;
@@ -123,6 +124,8 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillErrorInfo;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadCorrectionCommitParams;
+use codex_app_server_protocol::ThreadCorrectionCommitResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
@@ -1168,6 +1171,7 @@ See the Codex keymap documentation for supported actions and examples."
         // Publish the socket only once startup work is complete and the serialized UI loop is
         // ready to answer within the transport deadline.
         let (mut composer_control_rx, _composer_control_server) = crate::composer_control::start();
+        let (composer_correction_tx, mut composer_correction_rx) = mpsc::unbounded_channel();
         let mut composer_control_state = crate::composer_control::NativeComposerControlState::new();
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
@@ -1211,11 +1215,29 @@ See the Codex keymap documentation for supported actions and examples."
                             &mut app.chat_widget,
                             app_overlay_active,
                         ) {
-                            let outcome = app
-                                .dispatch_composer_correction(&mut app_server, &correction)
-                                .await;
-                            composer_control_state.finish_correction(correction, outcome);
+                            match app.composer_correction_thread_id(&correction) {
+                                Ok(thread_id) => {
+                                    let request_handle = app_server.request_handle();
+                                    let correction_tx = composer_correction_tx.clone();
+                                    tokio::spawn(async move {
+                                        let outcome = thread_routing::dispatch_composer_correction(
+                                            request_handle,
+                                            thread_id,
+                                            &correction,
+                                        )
+                                        .await;
+                                        let _ = correction_tx.send((correction, outcome));
+                                    });
+                                }
+                                Err(outcome) => {
+                                    composer_control_state.finish_correction(correction, outcome);
+                                }
+                            }
                         }
+                        AppRunControl::Continue
+                    }
+                    Some((correction, outcome)) = composer_correction_rx.recv() => {
+                        composer_control_state.finish_correction(correction, outcome);
                         AppRunControl::Continue
                     }
                     active = async {
