@@ -5,18 +5,31 @@ use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadCorrectionCommitParams;
 use codex_app_server_protocol::ThreadCorrectionCommitResponse;
 use codex_app_server_protocol::ThreadCorrectionCommitStatus;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadRollbackParams;
+use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::RolloutRecorder;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 use core_test_support::responses;
+use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -79,6 +92,7 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     )
     .await??;
     assert_eq!(first_response_mock.requests().len(), 1);
+    app.clear_message_buffer();
 
     let correction_response = responses::sse_response(responses::sse(vec![
         responses::ev_response_created("resp-correction"),
@@ -113,7 +127,9 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
         ThreadCorrectionCommitStatus::Queued
     );
 
-    let retry_request = app.send_thread_correction_commit_request(params).await?;
+    let retry_request = app
+        .send_thread_correction_commit_request(params.clone())
+        .await?;
     let retry_response: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         app.read_stream_until_response_message(RequestId::Integer(retry_request)),
@@ -127,8 +143,8 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     let conflict_request = app
         .send_thread_correction_commit_request(ThreadCorrectionCommitParams {
             thread_id: thread.id.clone(),
-            correction_id,
-            expected_client_user_message_id: target_client_user_message_id,
+            correction_id: correction_id.clone(),
+            expected_client_user_message_id: target_client_user_message_id.clone(),
             payload: "different payload".to_string(),
         })
         .await?;
@@ -139,76 +155,298 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     .await??;
     assert_eq!(conflict.error.code, -32600);
 
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        app.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        while response_mock.requests().is_empty() {
+            sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for correction sampling request")?;
+    assert_eq!(
+        response_mock.requests().len(),
+        1,
+        "correction must be sampled exactly once"
+    );
     let request = response_mock.single_request();
+    let request_body = request.body_json();
+    assert_eq!(
+        request_body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "correction appendix must advertise zero tools"
+    );
+    let expected_frame_text = format!("<{correction_frame_id}>{payload}</{correction_frame_id}>");
     let expected_content = serde_json::json!([{
         "type": "input_text",
-        "text": format!("<{correction_frame_id}>{payload}</{correction_frame_id}>"),
+        "text": expected_frame_text,
     }]);
-    let correction_messages = request
-        .input()
-        .into_iter()
-        .filter(|item| {
-            item.get("role").and_then(serde_json::Value::as_str) == Some("developer")
-                && item.get("content") == Some(&expected_content)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(correction_messages.len(), 1);
+    let request_input = request.input();
     assert_eq!(
-        correction_messages[0]
-            .get("role")
-            .and_then(serde_json::Value::as_str),
-        Some("developer")
+        request_input
+            .iter()
+            .filter(|item| {
+                item.get("role").and_then(serde_json::Value::as_str) == Some("developer")
+                    && item.get("content") == Some(&expected_content)
+            })
+            .count(),
+        1
     );
-    assert_eq!(
-        correction_messages[0].get("content"),
-        Some(&expected_content)
-    );
-    let correction_user_messages = request
-        .input()
-        .into_iter()
-        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .filter(|item| {
-            let serialized = item.to_string();
-            serialized.contains(&correction_frame_id) || serialized.contains(&payload)
-        })
-        .count();
-    assert_eq!(
-        correction_user_messages, 0,
+    assert!(
+        !request_input
+            .iter()
+            .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+            .any(|item| {
+                let serialized = item.to_string();
+                serialized.contains(&correction_frame_id) || serialized.contains(&payload)
+            }),
         "correction context must not invent a user message"
     );
 
     let rollout_path = thread.path.as_ref().context("thread path missing")?;
-    let InitialHistory::Resumed(history) =
-        RolloutRecorder::get_rollout_history(rollout_path).await?
-    else {
-        anyhow::bail!("expected resumed rollout history");
-    };
-    let correction_frames = history
-        .history
+    let rollout_items = wait_for_sampled_rollout(rollout_path, correction_id.as_str()).await?;
+    assert_eq!(
+        responses_request_count(&server).await?,
+        2,
+        "target turn and correction appendix must make exactly two model requests"
+    );
+    let correction_intents = rollout_items
         .iter()
-        .filter_map(|item| match item {
-            RolloutItem::ResponseItem(item)
-                if item
-                    .id()
-                    .is_some_and(|id| id.starts_with("msg_correction_")) =>
-            {
-                Some(item)
-            }
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) => event
+                .persisted_correction_intent()
+                .filter(|intent| intent.correction_id.as_str() == correction_id)
+                .map(|intent| (index, intent)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(correction_frames.len(), 1);
+    assert_eq!(
+        correction_intents.len(),
+        1,
+        "idempotent retries must persist exactly one correction intent"
+    );
+    let (correction_intent_index, correction_intent) = correction_intents[0];
+    assert_eq!(
+        correction_intent.expected_client_user_message_id,
+        target_client_user_message_id
+    );
+    assert_eq!(correction_intent.payload, payload);
+
+    let expected_frame_content = [ContentItem::InputText {
+        text: expected_frame_text,
+    }];
+    let appendix_projection = rollout_items
+        .iter()
+        .skip(correction_intent_index + 1)
+        .filter_map(|item| {
+            assert!(
+                !matches!(
+                    item,
+                    RolloutItem::TurnContext(_)
+                        | RolloutItem::WorldState(_)
+                        | RolloutItem::Compacted(_)
+                        | RolloutItem::ResponseItem(
+                            ResponseItem::Compaction { .. }
+                                | ResponseItem::CompactionTrigger { .. }
+                                | ResponseItem::ContextCompaction { .. }
+                        )
+                ),
+                "correction appendix must not persist context or compaction structure: {item:#?}"
+            );
+            assert!(
+                !is_user_turn_boundary(item),
+                "correction appendix must not add a user-turn boundary: {item:#?}"
+            );
+            match item {
+                RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: Some(id),
+                    role,
+                    content,
+                    ..
+                }) if id == &correction_frame_id
+                    && role == "developer"
+                    && content.as_slice() == expected_frame_content.as_slice() =>
+                {
+                    Some("frame")
+                }
+                RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                    if role == "assistant"
+                        && matches!(
+                            content.as_slice(),
+                            [ContentItem::OutputText { text }] if text == "Done"
+                        ) =>
+                {
+                    Some("assistant")
+                }
+                RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                    if event.persisted_corrections_sampled().is_some_and(|proof| {
+                        proof.correction_ids.as_slice() == [correction_id.as_str()]
+                    }) =>
+                {
+                    Some("proof")
+                }
+                RolloutItem::EventMsg(EventMsg::RawResponseItem(_)) => None,
+                RolloutItem::EventMsg(event) => {
+                    panic!("correction appendix must not persist UI events: {event:#?}")
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        appendix_projection,
+        ["frame", "assistant", "proof"],
+        "durable appendix must contain intent < frame < assistant result < sampled proof"
+    );
+
+    let visible_thread = read_thread(&mut app, thread.id.as_str()).await?;
     assert!(
-        serde_json::to_string(correction_frames[0])?.contains(&payload),
-        "persisted correction must retain the exact payload"
+        matches!(
+            visible_thread.turns.as_slice(),
+            [turn] if matches!(
+                turn.items.as_slice(),
+                [
+                    ThreadItem::UserMessage { client_id, .. },
+                    ThreadItem::AgentMessage { text, .. }
+                ] if client_id.as_deref() == Some(target_client_user_message_id.as_str())
+                    && text == "Ready"
+            )
+        ),
+        "correction appendix must leave exactly the unmodified visible target turn"
+    );
+    assert!(
+        app.pending_notification_methods().is_empty(),
+        "correction appendix must not emit transient client notifications: {:?}",
+        app.pending_notification_methods()
+    );
+
+    let rollback_request = app
+        .send_thread_rollback_request(ThreadRollbackParams {
+            thread_id: thread.id.clone(),
+            num_turns: 1,
+        })
+        .await?;
+    let rollback_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_response_message(RequestId::Integer(rollback_request)),
+    )
+    .await??;
+    let ThreadRollbackResponse {
+        thread: rolled_back_thread,
+    } = to_response::<ThreadRollbackResponse>(rollback_response)?;
+    assert!(
+        rolled_back_thread.turns.is_empty(),
+        "rollback 1 must remove the target and its correction appendix"
+    );
+    let rolled_back_read = read_thread(&mut app, thread.id.as_str()).await?;
+    assert!(
+        rolled_back_read.turns.is_empty(),
+        "thread/read must durably reflect the target rollback"
+    );
+
+    let model_request_count = responses_request_count(&server).await?;
+    let recommit_request = app.send_thread_correction_commit_request(params).await?;
+    let recommit_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_error_message(RequestId::Integer(recommit_request)),
+    )
+    .await??;
+    assert_eq!(recommit_error.error.code, -32600);
+    assert!(
+        recommit_error
+            .error
+            .message
+            .contains("does not identify a surviving user message"),
+        "recommit must be rejected against the rolled-back target: {}",
+        recommit_error.error.message
+    );
+    sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        responses_request_count(&server).await?,
+        model_request_count,
+        "rejected recommit must not resample the correction"
     );
 
     Ok(())
+}
+
+async fn wait_for_sampled_rollout(
+    rollout_path: &Path,
+    correction_id: &str,
+) -> Result<Arc<Vec<RolloutItem>>> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let InitialHistory::Resumed(history) =
+                RolloutRecorder::get_rollout_history(rollout_path).await?
+            else {
+                anyhow::bail!("expected resumed rollout history");
+            };
+            if history.history.iter().any(|item| {
+                matches!(
+                    item,
+                    RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                        if event.persisted_corrections_sampled().is_some_and(|proof| {
+                            proof.correction_ids.iter().any(|id| id == correction_id)
+                        })
+                )
+            }) {
+                let observed_len = history.history.len();
+                sleep(std::time::Duration::from_millis(50)).await;
+                let InitialHistory::Resumed(stable_history) =
+                    RolloutRecorder::get_rollout_history(rollout_path).await?
+                else {
+                    anyhow::bail!("expected resumed rollout history");
+                };
+                if stable_history.history.len() == observed_len {
+                    return Ok(stable_history.history);
+                }
+            }
+            sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for durable correction sampled proof")?
+}
+
+async fn responses_request_count(server: &wiremock::MockServer) -> Result<usize> {
+    let requests = server
+        .received_requests()
+        .await
+        .context("wiremock did not record requests")?;
+    Ok(requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/responses"))
+        .count())
+}
+
+async fn read_thread(app: &mut TestAppServer, thread_id: &str) -> Result<Thread> {
+    let read_request = app
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: true,
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_response_message(RequestId::Integer(read_request)),
+    )
+    .await??;
+    Ok(to_response::<ThreadReadResponse>(read_response)?.thread)
+}
+
+fn is_user_turn_boundary(item: &RolloutItem) -> bool {
+    match item {
+        RolloutItem::InterAgentCommunication(_) => true,
+        RolloutItem::ResponseItem(ResponseItem::AgentMessage { .. }) => true,
+        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+            role == "user"
+                || (role == "assistant"
+                    && InterAgentCommunication::is_message_content(content.as_slice()))
+        }
+        _ => false,
+    }
 }
 
 fn create_config_toml(codex_home: &std::path::Path, base_url: &str) -> Result<()> {

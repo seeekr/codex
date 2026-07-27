@@ -323,6 +323,14 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
 
+    if ctx.turn_context.is_correction_appendix()
+        && !crate::session::correction_appendix_item_allowed(&item)
+    {
+        return Err(CodexErr::Fatal(
+            "correction appendix returned an unsupported non-assistant output".to_string(),
+        ));
+    }
+
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
@@ -359,7 +367,11 @@ pub(crate) async fn handle_output_item_done(
         Ok(None) => {
             let finalized_turn_item = finalize_non_tool_response_item(
                 ctx.sess.as_ref(),
-                TurnItemContributorPolicy::Run(ctx.turn_store.as_ref()),
+                if ctx.turn_context.is_correction_appendix() {
+                    TurnItemContributorPolicy::Skip
+                } else {
+                    TurnItemContributorPolicy::Run(ctx.turn_store.as_ref())
+                },
                 &item,
                 plan_mode,
             )

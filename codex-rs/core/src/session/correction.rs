@@ -459,7 +459,7 @@ impl Session {
                 return;
             }
 
-            let turn_context = session.new_default_turn().await;
+            let turn_context = session.new_correction_appendix().await;
             session
                 .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
                 .await;

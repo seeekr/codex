@@ -1649,6 +1649,75 @@ mod tests {
     }
 
     #[test]
+    fn correction_appendix_does_not_add_rollback_depth() {
+        let correction_id = "b7754d6f-f4df-4cfe-8621-8b735d348fb3";
+        let mut items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "target-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: Some("target-client-message".into()),
+                message: "Tori is the Rust app framework".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "target-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(
+                codex_protocol::protocol::RawResponseItemEvent::correction_intent(
+                    codex_protocol::protocol::CorrectionIntent {
+                        correction_id: correction_id.into(),
+                        expected_client_user_message_id: "target-client-message".into(),
+                        payload: "Tori should be Tauri".into(),
+                    },
+                ),
+            )),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
+                id: Some("msg_correction_b7754d6ff4df4cfe86218b735d348fb3".into()),
+                role: "developer".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: "Tori should be Tauri".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
+                id: Some("assistant-correction-response".into()),
+                role: "assistant".into(),
+                content: vec![codex_protocol::models::ContentItem::OutputText {
+                    text: "Understood.".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(
+                codex_protocol::protocol::RawResponseItemEvent::corrections_sampled(vec![
+                    correction_id.into(),
+                ]),
+            )),
+        ];
+
+        assert_eq!(build_turns_from_rollout_items(&items).len(), 1);
+
+        items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            ThreadRolledBackEvent { num_turns: 1 },
+        )));
+
+        assert!(build_turns_from_rollout_items(&items).is_empty());
+    }
+
+    #[test]
     fn builds_multiple_turns_with_reasoning_items() {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
