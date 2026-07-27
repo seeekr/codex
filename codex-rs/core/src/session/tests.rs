@@ -45,6 +45,7 @@ use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -11331,6 +11332,132 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
 const TEST_CORRECTION_TARGET: &str = "test-correction-target";
 
+#[test]
+fn correction_appendix_item_allowlist_rejects_every_turn_boundary() {
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("worker path"),
+        Vec::new(),
+        "continue".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let inter_agent_boundary = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: serde_json::to_string(&communication).expect("serialize communication"),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let ordinary_assistant = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "correction considered".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let correction_frame = ResponseItem::Message {
+        id: Some("msg_correction_test".to_string()),
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "mechanical correction".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert!(!correction_appendix_item_allowed(&inter_agent_boundary));
+    assert!(!correction_appendix_item_allowed(&ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "hidden user boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }));
+    assert!(!correction_appendix_item_allowed(
+        &ResponseItem::CompactionTrigger {}
+    ));
+    assert!(!correction_appendix_item_allowed(&correction_frame));
+    assert!(correction_appendix_item_allowed(&ordinary_assistant));
+    assert!(!correction_appendix_item_allowed(
+        &ResponseItem::FunctionCall {
+            id: None,
+            name: "unadvertised_tool".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+            namespace: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_appendix_deferral_preserves_startup_prewarm() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let (_prewarm_tx, prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let prewarm = tokio::spawn(async move {
+        let _ = prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+    session
+        .set_session_startup_prewarm(
+            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                prewarm,
+                std::time::Instant::now(),
+                crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+            ),
+        )
+        .await;
+
+    let mut correction_context = session.new_correction_appendix().await;
+    let correction_context_mut =
+        Arc::get_mut(&mut correction_context).expect("unshared correction context");
+    Arc::make_mut(&mut correction_context_mut.config).model_auto_compact_token_limit = Some(1);
+    Arc::make_mut(&mut correction_context_mut.config).model_auto_compact_token_limit_scope =
+        AutoCompactTokenLimitScope::Total;
+    correction_context_mut.model_info.context_window = Some(100);
+    correction_context_mut
+        .model_info
+        .effective_context_window_percent = 100;
+    session
+        .set_total_tokens_full(correction_context.as_ref())
+        .await;
+    let reservation = session
+        .reserve_task_start()
+        .await
+        .expect("correction reservation");
+    assert!(
+        session
+            .start_reserved_task(
+                reservation,
+                correction_context,
+                vec![TurnInput::CommittedCorrection],
+                crate::tasks::RegularTask::new(),
+            )
+            .await
+    );
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deferred correction appendix must finish without waiting on prewarm");
+    assert!(
+        session.take_session_startup_prewarm().await.is_some(),
+        "the first real turn still owns startup prewarm"
+    );
+}
+
 async fn seed_test_correction_target(session: &Session) {
     session
         .state
@@ -11869,9 +11996,7 @@ async fn correction_stop_waits_for_terminal_publication_before_latching() {
             .correction_auto_start_suppressed,
         "taskless correction startup is not yet a durable interrupted turn"
     );
-    let context = correction_session
-        .new_default_turn_with_sub_id("terminal-reserves-correction".to_string())
-        .await;
+    let context = correction_session.new_correction_appendix().await;
     assert!(
         correction_session
             .start_reserved_task(
@@ -11894,8 +12019,8 @@ async fn correction_stop_waits_for_terminal_publication_before_latching() {
             .correction_auto_start_suppressed
     );
     assert!(
-        replayed_correction_auto_start_suppressed(&correction_session, &replay_context).await,
-        "terminal-to-correction interruption must reconstruct the live suppression latch"
+        !replayed_correction_auto_start_suppressed(&correction_session, &replay_context).await,
+        "headless correction interruption must not leave a durable turn boundary"
     );
 }
 
@@ -11987,9 +12112,7 @@ async fn correction_only_turn_rejects_immediate_user_input_into_a_normal_turn() 
         .reserve_task_start()
         .await
         .expect("correction-only reservation");
-    let correction_context = session
-        .new_default_turn_with_sub_id("correction-background".to_string())
-        .await;
+    let correction_context = session.new_correction_appendix().await;
     assert!(
         session
             .start_reserved_task(
@@ -12000,9 +12123,6 @@ async fn correction_only_turn_rejects_immediate_user_input_into_a_normal_turn() 
             )
             .await
     );
-    session
-        .publish_turn_started_for_steering(&correction_context.sub_id)
-        .await;
     assert!(
         !session
             .active_turn
@@ -12799,25 +12919,21 @@ async fn correction_commit_retries_after_closing_turn_into_new_turn_segment() {
     })
     .await
     .expect("queued correction must materialize in its correction-only turn");
-    let turn_started_index = stored
-        .items
-        .iter()
-        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
-        .expect("correction-processing turn must start");
-    let correction_index = stored
-        .items
-        .iter()
-        .position(|item| {
-            matches!(item, RolloutItem::ResponseItem(frame) if correction::correction_frame_id(frame).is_some())
-        })
-        .expect("correction frame must persist");
-    assert!(turn_started_index < correction_index);
     assert!(
-        !stored
-            .items
-            .iter()
-            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_)))),
-        "correction processing must not invent a user message"
+        !stored.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(
+                    EventMsg::TurnStarted(_)
+                        | EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                        | EventMsg::UserMessage(_)
+                ) | RolloutItem::TurnContext(_)
+                    | RolloutItem::WorldState(_)
+                    | RolloutItem::Compacted(_)
+            )
+        }),
+        "correction processing must remain a headless non-turn appendix"
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;

@@ -17,6 +17,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::world_state::WorldState;
 use crate::feedback_tags;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -147,64 +148,82 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let correction_appendix = turn_context.is_correction_appendix();
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
-        if matches!(err, CodexErr::TurnAborted) {
-            return Err(err);
+    match run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
+        Ok(PreSamplingCompactOutcome::Ready) => {}
+        Ok(PreSamplingCompactOutcome::DeferredCorrection) => return Ok(None),
+        Err(err) => {
+            if matches!(err, CodexErr::TurnAborted) {
+                return Err(err);
+            }
+            let error = err.to_codex_protocol_error();
+            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                .await;
+            error!("Failed to run pre-sampling compact");
+            return Ok(None);
         }
-        let error = err.to_codex_protocol_error();
-        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-            .await;
-        error!("Failed to run pre-sampling compact");
-        return Ok(None);
     }
 
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
     // Keep the exact model-visible state used by this turn and its inline compactions.
-    let (mut world_state, display_roots) = tokio::join!(
-        sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(turn_context.as_ref()),
-    );
-
-    let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
-        &sess,
-        first_step_context.as_ref(),
-        &input,
-        &cancellation_token,
-    )
-    .await
-    else {
-        return Ok(None);
+    let (mut world_state, display_roots) = if correction_appendix {
+        (Arc::new(WorldState::default()), Vec::new())
+    } else {
+        tokio::join!(
+            sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
+            turn_diff_display_roots(turn_context.as_ref()),
+        )
     };
 
-    if run_pending_session_start_hooks(&sess, &turn_context).await {
+    let (injection_items, explicitly_enabled_connectors) = if correction_appendix {
+        (Vec::new(), HashSet::new())
+    } else {
+        let Some(result) = build_skills_and_plugins(
+            &sess,
+            first_step_context.as_ref(),
+            &input,
+            &cancellation_token,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        result
+    };
+
+    if !correction_appendix && run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(None);
     }
     let mut can_drain_pending_input = input.is_empty();
-    if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
+    if !correction_appendix && run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
         return Ok(None);
     }
 
-    sess.merge_connector_selection(explicitly_enabled_connectors.clone())
+    if !correction_appendix {
+        sess.merge_connector_selection(explicitly_enabled_connectors.clone())
+            .await;
+        sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone(),
+            comp_hash: turn_context.model_info.comp_hash.clone(),
+            realtime_active: Some(turn_context.realtime_active),
+        }))
         .await;
-    sess.set_previous_turn_settings(Some(PreviousTurnSettings {
-        model: turn_context.model_info.slug.clone(),
-        comp_hash: turn_context.model_info.comp_hash.clone(),
-        realtime_active: Some(turn_context.realtime_active),
-    }))
-    .await;
+    }
     for response_item in injection_items {
         sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
             .await;
     }
 
-    track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
+    if !correction_appendix {
+        track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
+    }
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
@@ -232,17 +251,21 @@ pub(crate) async fn run_turn(
             Vec::new()
         };
 
-        if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
+        if !correction_appendix
+            && run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await
+        {
             break;
         }
 
         let window_id = sess.current_window_id().await;
-        super::rollout_budget::maybe_record_reminder(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            &window_id,
-        )
-        .await;
+        if !correction_appendix {
+            super::rollout_budget::maybe_record_reminder(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &window_id,
+            )
+            .await;
+        }
 
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
@@ -250,17 +273,20 @@ pub(crate) async fn run_turn(
             None => sess.capture_step_context(Arc::clone(&turn_context)).await,
         };
         let sampling_request_result: CodexResult<_> = async {
-            super::time_reminder::maybe_record_current_time_reminder(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                &window_id,
-            )
-            .await?;
+            if !correction_appendix {
+                super::time_reminder::maybe_record_current_time_reminder(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &window_id,
+                )
+                .await?;
+            }
 
-            if turn_context
-                .config
-                .features
-                .enabled(Feature::DeferredExecutor)
+            if !correction_appendix
+                && turn_context
+                    .config
+                    .features
+                    .enabled(Feature::DeferredExecutor)
             {
                 world_state = sess
                     .record_step_world_state_if_changed(&world_state, step_context.as_ref())
@@ -318,6 +344,13 @@ pub(crate) async fn run_turn(
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                if correction_appendix {
+                    // The correction has now been sampled and durably acknowledged. Any further
+                    // agent loop belongs to the next real user turn, where lifecycle, tools, and
+                    // compaction are visible and rollback-eligible.
+                    last_agent_message = sampling_request_last_agent_message;
+                    break;
+                }
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status, estimated_token_count) = async {
                     let has_pending_input =
@@ -353,12 +386,14 @@ pub(crate) async fn run_turn(
                     "post sampling token usage"
                 );
 
-                super::token_budget::maybe_record(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    token_status.tokens_until_compaction,
-                )
-                .await;
+                if !correction_appendix {
+                    super::token_budget::maybe_record(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        token_status.tokens_until_compaction,
+                    )
+                    .await;
+                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if needs_follow_up
@@ -817,18 +852,31 @@ async fn track_turn_resolved_config_analytics(
         });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreSamplingCompactOutcome {
+    Ready,
+    DeferredCorrection,
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
-) -> CodexResult<()> {
-    maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
+) -> CodexResult<PreSamplingCompactOutcome> {
+    if maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
+        == PreSamplingCompactOutcome::DeferredCorrection
+    {
+        return Ok(PreSamplingCompactOutcome::DeferredCorrection);
+    }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
     if token_status.token_limit_reached {
+        if turn_context.is_correction_appendix() {
+            return Ok(PreSamplingCompactOutcome::DeferredCorrection);
+        }
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
@@ -842,7 +890,7 @@ async fn run_pre_sampling_compact(
         )
         .await?;
     }
-    Ok(())
+    Ok(PreSamplingCompactOutcome::Ready)
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
@@ -883,9 +931,9 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
-) -> CodexResult<()> {
+) -> CodexResult<PreSamplingCompactOutcome> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
-        return Ok(());
+        return Ok(PreSamplingCompactOutcome::Ready);
     };
     let should_compact_for_comp_hash_change = comp_hash_changed(
         previous_turn_settings.comp_hash.as_deref(),
@@ -899,6 +947,9 @@ async fn maybe_run_previous_model_inline_compact(
     );
 
     if should_compact_for_comp_hash_change {
+        if turn_context.is_correction_appendix() {
+            return Ok(PreSamplingCompactOutcome::DeferredCorrection);
+        }
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
             .await;
@@ -918,14 +969,14 @@ async fn maybe_run_previous_model_inline_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
-        return Ok(());
+        return Ok(PreSamplingCompactOutcome::Ready);
     }
 
     let Some(old_context_window) = previous_model_turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(PreSamplingCompactOutcome::Ready);
     };
     let Some(new_context_window) = turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(PreSamplingCompactOutcome::Ready);
     };
     let active_context_tokens = sess.get_total_token_usage().await;
     let previous_model_limit_reached = match turn_context
@@ -946,6 +997,9 @@ async fn maybe_run_previous_model_inline_compact(
         && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
         && old_context_window > new_context_window;
     if should_run {
+        if turn_context.is_correction_appendix() {
+            return Ok(PreSamplingCompactOutcome::DeferredCorrection);
+        }
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
             .await;
@@ -966,7 +1020,7 @@ async fn maybe_run_previous_model_inline_compact(
         )
         .await?;
     }
-    Ok(())
+    Ok(PreSamplingCompactOutcome::Ready)
 }
 
 #[instrument(
@@ -1110,10 +1164,16 @@ pub(crate) fn build_prompt(
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
+    let correction_appendix = turn_context.is_correction_appendix();
     Prompt {
         input,
-        tools: router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        tools: if correction_appendix {
+            Vec::new()
+        } else {
+            router.model_visible_specs()
+        },
+        parallel_tool_calls: !correction_appendix
+            && turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
@@ -1143,7 +1203,11 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let router = built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?;
+    let router = if turn_context.is_correction_appendix() {
+        Arc::new(ToolRouter::empty())
+    } else {
+        built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?
+    };
 
     let base_instructions = sess.get_base_instructions().await;
 
@@ -1153,12 +1217,16 @@ async fn run_sampling_request(
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-        &sess,
-        Arc::clone(&step_context),
-        Arc::clone(&router),
-        Arc::clone(&turn_diff_tracker),
-    );
+    let _code_mode_worker = if turn_context.is_correction_appendix() {
+        None
+    } else {
+        sess.services.code_mode_service.start_turn_worker(
+            &sess,
+            Arc::clone(&step_context),
+            Arc::clone(&router),
+            Arc::clone(&turn_diff_tracker),
+        )
+    };
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
@@ -1876,7 +1944,11 @@ async fn handle_assistant_item_done_in_plan_mode(
         let mut finalized_facts = None;
         if let Some(finalized_turn_item) = finalize_non_tool_response_item(
             sess,
-            TurnItemContributorPolicy::Run(turn_store),
+            if turn_context.is_correction_appendix() {
+                TurnItemContributorPolicy::Skip
+            } else {
+                TurnItemContributorPolicy::Run(turn_store)
+            },
             item,
             /*plan_mode*/ true,
         )

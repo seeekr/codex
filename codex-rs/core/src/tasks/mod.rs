@@ -512,6 +512,11 @@ impl Session {
             && input
                 .iter()
                 .all(|item| matches!(item, TurnInput::CommittedCorrection));
+        assert_eq!(
+            turn_context.is_correction_appendix(),
+            correction_only_turn,
+            "correction-only task input must use a correction appendix context"
+        );
         turn_state.lock().await.correction_only_turn = correction_only_turn;
 
         let turn_extension_data = Arc::clone(&turn_context.extension_data);
@@ -573,11 +578,13 @@ impl Session {
                 sess.input_queue
                     .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
                     .await;
-                sess.emit_turn_start_lifecycle(
-                    ctx_for_finish.as_ref(),
-                    &token_usage_at_turn_start,
-                )
-                .await;
+                if !ctx_for_finish.is_correction_appendix() {
+                    sess.emit_turn_start_lifecycle(
+                        ctx_for_finish.as_ref(),
+                        &token_usage_at_turn_start,
+                    )
+                    .await;
+                }
                 let task_result = task_for_run
                     .run(
                         Arc::clone(&session_ctx),
@@ -846,7 +853,10 @@ impl Session {
         if let Some(task) = task {
             self.handle_task_abort(task, reason.clone()).await;
         }
-        if let Some(turn_context) = turn_context.as_deref() {
+        if let Some(turn_context) = turn_context
+            .as_deref()
+            .filter(|turn_context| !turn_context.is_correction_appendix())
+        {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
         }
@@ -901,8 +911,10 @@ impl Session {
         let turn_context = Arc::clone(&task.turn_context);
         let mut terminal_guard = TerminalPublicationGuard::new(Arc::clone(&task.terminal_done));
         self.handle_task_abort(task, reason.clone()).await;
-        self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-            .await;
+        if !turn_context.is_correction_appendix() {
+            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+                .await;
+        }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue
@@ -1129,15 +1141,17 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile: turn_context.turn_timing_state.complete_profile(),
             });
-        let event = if let Some(reason) = abort_reason {
+        let event = if correction_only_turn {
+            None
+        } else if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
-            EventMsg::TurnAborted(TurnAbortedEvent {
+            Some(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
                 completed_at,
                 duration_ms,
-            })
+            }))
         } else {
             let time_to_first_token_ms = turn_context
                 .turn_timing_state
@@ -1145,13 +1159,13 @@ impl Session {
                 .await;
             self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
                 .await;
-            EventMsg::TurnComplete(TurnCompleteEvent {
+            Some(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
                 completed_at,
                 duration_ms,
                 time_to_first_token_ms,
-            })
+            }))
         };
         let mut terminal_guard = {
             let mut active = self.active_turn.lock().await;
@@ -1173,7 +1187,9 @@ impl Session {
             TerminalPublicationGuard::new(terminal_done)
         };
 
-        self.send_event(turn_context.as_ref(), event).await;
+        if let Some(event) = event {
+            self.send_event(turn_context.as_ref(), event).await;
+        }
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
@@ -1197,7 +1213,7 @@ impl Session {
             .await;
         terminal_guard.mark_published();
         if let Some(reservation) = correction_reservation {
-            let turn_context = self.new_default_turn().await;
+            let turn_context = self.new_correction_appendix().await;
             self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
                 .await;
             assert!(
@@ -1263,7 +1279,8 @@ impl Session {
             .abort(session_ctx, Arc::clone(&task.turn_context))
             .await;
 
-        if reason == TurnAbortReason::Interrupted
+        if !task.turn_context.is_correction_appendix()
+            && reason == TurnAbortReason::Interrupted
             && let Some(marker) = interrupted_turn_history_marker(
                 InterruptedTurnHistoryMarker::from_config_and_version(
                     task.turn_context.config.as_ref(),
@@ -1294,13 +1311,15 @@ impl Session {
                 turn_id: task.turn_context.sub_id.clone(),
                 profile: task.turn_context.turn_timing_state.complete_profile(),
             });
-        let event = EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(task.turn_context.sub_id.clone()),
-            reason,
-            completed_at,
-            duration_ms,
-        });
-        self.send_event(task.turn_context.as_ref(), event).await;
+        if !task.turn_context.is_correction_appendix() {
+            let event = EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(task.turn_context.sub_id.clone()),
+                reason,
+                completed_at,
+                duration_ms,
+            });
+            self.send_event(task.turn_context.as_ref(), event).await;
+        }
         self.services
             .guardian_rejection_circuit_breaker
             .lock()

@@ -524,6 +524,39 @@ async fn correction_replay_drops_intent_and_frame_when_target_is_rolled_back() {
 }
 
 #[tokio::test]
+async fn correction_appendix_replay_rolls_back_with_target_turn() {
+    let (session, turn_context) = make_session_and_context().await;
+    let correction_id = Uuid::new_v4();
+    let target = user_message("Use Tori for the Rust app.");
+    let target_result = assistant_message("I will use Tori.");
+    let correction = correction_message(correction_id, "Tori should be Tauri");
+    let appendix_result = assistant_message("I incorporated the Tauri correction.");
+    let rollout_items = vec![
+        turn_started("target-turn"),
+        RolloutItem::ResponseItem(target),
+        completed_client_user_message("target-turn", "target-client-id"),
+        RolloutItem::ResponseItem(target_result),
+        turn_complete("target-turn"),
+        correction_intent(correction_id, "target-client-id", "Tori should be Tauri"),
+        RolloutItem::ResponseItem(correction),
+        RolloutItem::ResponseItem(appendix_result),
+        corrections_sampled(&[correction_id]),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert!(reconstructed.history.is_empty());
+    assert!(reconstructed.surviving_client_user_message_ids.is_empty());
+    assert!(reconstructed.correction_receipts.is_empty());
+    assert!(reconstructed.processed_correction_ids.is_empty());
+}
+
+#[tokio::test]
 async fn correction_replay_drops_physical_frame_when_carrier_target_is_missing() {
     let (session, turn_context) = make_session_and_context().await;
     let correction_id = Uuid::new_v4();

@@ -143,6 +143,8 @@ pub struct TurnContext {
     pub(crate) terminal_error: Arc<Mutex<Option<String>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
+    /// A background correction sampling pass that must not materialize as a user turn.
+    pub(crate) correction_appendix: bool,
 }
 
 enum TurnMultiAgentRuntime {
@@ -151,6 +153,10 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    pub(crate) fn is_correction_appendix(&self) -> bool {
+        self.correction_appendix
+    }
+
     pub(crate) fn item_ids_enabled(&self) -> bool {
         self.config.features.enabled(Feature::ItemIds)
             || matches!(self.history_mode, ThreadHistoryMode::Paginated)
@@ -304,6 +310,7 @@ impl TurnContext {
             model_verification_emitted: AtomicBool::new(
                 self.model_verification_emitted.load(Ordering::Relaxed),
             ),
+            correction_appendix: self.correction_appendix,
         }
     }
 
@@ -580,6 +587,7 @@ impl Session {
             terminal_error: Arc::new(Mutex::new(None)),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
+            correction_appendix: false,
         }
     }
 
@@ -663,6 +671,7 @@ impl Session {
             session_configuration,
             final_output_json_schema,
             TurnMultiAgentRuntime::ResolveAndStore,
+            /*correction_appendix*/ false,
         )
         .await
     }
@@ -677,6 +686,7 @@ impl Session {
             session_configuration,
             /*final_output_json_schema*/ None,
             TurnMultiAgentRuntime::Preview,
+            /*correction_appendix*/ false,
         )
         .await
     }
@@ -688,6 +698,7 @@ impl Session {
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
+        correction_appendix: bool,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
         let primary_turn_environment = turn_environments.primary().cloned();
@@ -777,15 +788,17 @@ impl Session {
             skills_snapshot,
         );
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
+        turn_context.correction_appendix = correction_appendix;
 
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
         let turn_context = Arc::new(turn_context);
-        if turn_context
-            .environments
-            .single_local_environment_cwd()
-            .is_some()
+        if !turn_context.is_correction_appendix()
+            && turn_context
+                .environments
+                .single_local_environment_cwd()
+                .is_some()
         {
             turn_context.turn_metadata_state.spawn_git_enrichment_task();
         }
@@ -817,6 +830,18 @@ impl Session {
     pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
         self.new_default_turn_with_sub_id(self.next_internal_sub_id())
             .await
+    }
+
+    pub(crate) async fn new_correction_appendix(&self) -> Arc<TurnContext> {
+        let session_configuration = self.default_turn_configuration().await;
+        self.new_turn_context_from_configuration(
+            self.next_internal_sub_id(),
+            session_configuration,
+            /*final_output_json_schema*/ None,
+            TurnMultiAgentRuntime::ResolveAndStore,
+            /*correction_appendix*/ true,
+        )
+        .await
     }
 
     pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
