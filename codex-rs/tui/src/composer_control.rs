@@ -312,6 +312,7 @@ impl<L: Copy> ComposerControlState<L> {
             Ok(native) => native,
             Err(err) => return WireResult::not_applied(map_lease_error(err)),
         };
+        self.rebase_matching_captures(target, &snapshot);
         let lease_id = fresh_id(&self.leases);
         self.leases.insert(
             lease_id,
@@ -323,6 +324,30 @@ impl<L: Copy> ComposerControlState<L> {
         );
         self.lease_order.push_back(lease_id);
         WireResult::Inserted { lease_id }
+    }
+
+    fn rebase_matching_captures<T>(&mut self, target: &T, before: &ComposerSnapshot)
+    where
+        T: ComposerControlTarget<Lease = L>,
+    {
+        let Some(after) = target.snapshot() else {
+            return;
+        };
+        if after.thread_id != before.thread_id {
+            return;
+        }
+        let before_hash = text_hash(&before.text);
+        let after_hash = text_hash(&after.text);
+        for capture in self.captures.values_mut() {
+            if capture.input_epoch == self.input_epoch
+                && capture.thread_id == before.thread_id
+                && capture.text_hash == before_hash
+                && capture.cursor == before.cursor
+            {
+                capture.text_hash = after_hash;
+                capture.cursor = after.cursor;
+            }
+        }
     }
 
     fn verify<T>(
@@ -405,7 +430,10 @@ impl<L: Copy> ComposerControlState<L> {
         self.leases.remove(&lease_id);
         self.lease_order.retain(|queued| *queued != lease_id);
         match target.replace_owned_text(lease.native, &expected, &replacement) {
-            Ok(()) => WireResult::Replaced,
+            Ok(()) => {
+                self.rebase_matching_captures(target, &snapshot);
+                WireResult::Replaced
+            }
             Err(err) => WireResult::not_applied(map_lease_error(err)),
         }
     }

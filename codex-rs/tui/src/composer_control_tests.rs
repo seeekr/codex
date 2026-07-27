@@ -302,6 +302,59 @@ fn capture_compare_and_swap_rejects_intervening_input_and_snapshot_changes() {
 }
 
 #[test]
+fn captures_rebase_only_across_acknowledged_native_mutations() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("draft");
+
+    let capture_a = capture(&mut state, &mut target);
+    let capture_b = capture(&mut state, &mut target);
+    let lease_a = insert(&mut state, &mut target, capture_a, " A");
+    let lease_b = insert(&mut state, &mut target, capture_b, " B");
+    assert_eq!(target.text, "draft A B");
+
+    let capture_c = capture(&mut state, &mut target);
+    let capture_d = capture(&mut state, &mut target);
+    let lease_c = insert(&mut state, &mut target, capture_c, " C");
+    state.note_tui_event(&TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Insert {
+                capture_id: capture_d,
+                text: " D".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            outcome: MutationOutcome::NotApplied,
+        }
+    ));
+
+    let capture_e = capture(&mut state, &mut target);
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Replace {
+                lease_id: lease_c,
+                expected: " C".to_string(),
+                replacement: " corrected C".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Replaced
+    ));
+    let _lease_e = insert(&mut state, &mut target, capture_e, " E");
+    assert_eq!(target.text, "draft A B corrected C E");
+
+    assert!(state.leases.contains_key(&lease_a));
+    assert!(state.leases.contains_key(&lease_b));
+}
+
+#[test]
 fn verify_mismatch_is_retryable_but_replace_mismatch_is_terminal() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("draft");
