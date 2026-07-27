@@ -110,6 +110,10 @@ pub struct ThreadHistoryTurnChange {
 }
 
 /// Incremental changes produced by opt-in `ThreadHistoryBuilder` handlers.
+///
+/// Consumers must discard every `removed_turn_ids` entry before applying
+/// `changed_turns` and `changed_items`. A turn id can appear in both when a
+/// rollback replaces that turn with a retained prefix instead of deleting it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ThreadHistoryChangeSet {
     pub changed_items: Vec<ThreadHistoryItemChange>,
@@ -234,10 +238,18 @@ impl ThreadHistoryChangeAccumulator {
 pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
+    rollback_boundaries: Vec<RollbackBoundary>,
     next_item_index: i64,
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeSet>,
+}
+
+#[derive(Clone)]
+struct RollbackBoundary {
+    turn_index: usize,
+    turn_id: Option<String>,
+    item_index: usize,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -251,6 +263,7 @@ impl ThreadHistoryBuilder {
         Self {
             turns: Vec::new(),
             current_turn: None,
+            rollback_boundaries: Vec::new(),
             next_item_index: 1,
             current_rollout_index: 0,
             next_rollout_index: 0,
@@ -391,8 +404,8 @@ impl ThreadHistoryBuilder {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::ResponseItem(item) => self.handle_response_item(item),
-            RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            RolloutItem::InterAgentCommunication(_) => self.record_rollback_boundary(),
+            RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}
@@ -436,29 +449,36 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
-        let codex_protocol::models::ResponseItem::Message {
-            role, content, id, ..
-        } = item
-        else {
-            return;
-        };
+        match item {
+            codex_protocol::models::ResponseItem::AgentMessage { .. } => {
+                self.record_rollback_boundary();
+            }
+            codex_protocol::models::ResponseItem::Message { role, content, .. }
+                if role == "assistant"
+                    && codex_protocol::protocol::InterAgentCommunication::is_message_content(
+                        content,
+                    ) =>
+            {
+                self.record_rollback_boundary();
+            }
+            codex_protocol::models::ResponseItem::Message {
+                role, content, id, ..
+            } if role == "user" => {
+                let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
+                    return;
+                };
 
-        if role != "user" {
-            return;
+                self.push_item_in_current_turn(ThreadItem::HookPrompt {
+                    id: hook_prompt.id,
+                    fragments: hook_prompt
+                        .fragments
+                        .into_iter()
+                        .map(crate::protocol::v2::HookPromptFragment::from)
+                        .collect(),
+                });
+            }
+            _ => {}
         }
-
-        let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
-            return;
-        };
-
-        self.push_item_in_current_turn(ThreadItem::HookPrompt {
-            id: hook_prompt.id,
-            fragments: hook_prompt
-                .fragments
-                .into_iter()
-                .map(crate::protocol::v2::HookPromptFragment::from)
-                .collect(),
-        });
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -471,6 +491,7 @@ impl ThreadHistoryBuilder {
         {
             self.finish_current_turn();
         }
+        self.record_rollback_boundary();
         let id = self.next_item_id();
         let content = self.build_user_inputs(payload);
         self.push_item_in_current_turn(ThreadItem::UserMessage {
@@ -1293,28 +1314,96 @@ impl ThreadHistoryBuilder {
 
     fn handle_thread_rollback(&mut self, payload: &ThreadRolledBackEvent) {
         self.finish_current_turn();
+        let turns_before_rollback = self.is_tracking_changes().then(|| self.turns.clone());
 
-        let n = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
-        let removed_turn_ids = if n >= self.turns.len() {
-            self.turns.iter().map(|turn| turn.id.clone()).collect()
-        } else if n == 0 {
-            Vec::new()
-        } else {
-            self.turns[self.turns.len() - n..]
-                .iter()
-                .map(|turn| turn.id.clone())
-                .collect()
-        };
-        self.record_removed_turn_ids(removed_turn_ids);
+        let rollback_count = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
+        if rollback_count > 0 && !self.rollback_boundaries.is_empty() {
+            let boundary_index = self
+                .rollback_boundaries
+                .len()
+                .saturating_sub(rollback_count);
+            let boundary = self.rollback_boundaries[boundary_index].clone();
+            self.rollback_boundaries.truncate(boundary_index);
+            self.truncate_to_rollback_boundary(&boundary);
+        }
 
-        if n >= self.turns.len() {
-            self.turns.clear();
-        } else {
-            self.turns.truncate(self.turns.len().saturating_sub(n));
+        if let Some(turns_before_rollback) = turns_before_rollback {
+            self.record_rollback_changes(&turns_before_rollback);
         }
 
         let item_count: usize = self.turns.iter().map(|t| t.items.len()).sum();
         self.next_item_index = i64::try_from(item_count.saturating_add(1)).unwrap_or(i64::MAX);
+    }
+
+    fn truncate_to_rollback_boundary(&mut self, boundary: &RollbackBoundary) {
+        let Some(turn_index) = boundary
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| self.turns.iter().position(|turn| &turn.id == turn_id))
+        else {
+            self.turns
+                .truncate(boundary.turn_index.min(self.turns.len()));
+            return;
+        };
+
+        self.turns.truncate(turn_index + 1);
+        self.turns[turn_index].items.truncate(boundary.item_index);
+        if self.turns[turn_index].items.is_empty() {
+            self.turns.truncate(turn_index);
+        }
+    }
+
+    fn record_rollback_boundary(&mut self) {
+        self.rollback_boundaries
+            .push(self.current_rollback_boundary());
+    }
+
+    fn current_rollback_boundary(&self) -> RollbackBoundary {
+        let turn_index = self.turns.len();
+        let (turn_id, item_index) = self
+            .current_turn
+            .as_ref()
+            .map_or((None, 0), |turn| (Some(turn.id.clone()), turn.items.len()));
+        RollbackBoundary {
+            turn_index,
+            turn_id,
+            item_index,
+        }
+    }
+
+    fn record_rollback_changes(&mut self, turns_before_rollback: &[Turn]) {
+        let removed_turn_ids = turns_before_rollback
+            .iter()
+            .filter(|turn| {
+                !self
+                    .turns
+                    .iter()
+                    .any(|retained_turn| retained_turn.id == turn.id)
+            })
+            .map(|turn| turn.id.clone());
+        let replaced_turns = self
+            .turns
+            .iter()
+            .filter(|turn| {
+                turns_before_rollback
+                    .iter()
+                    .find(|prior_turn| prior_turn.id == turn.id)
+                    .is_some_and(|prior_turn| prior_turn != *turn)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        self.record_removed_turn_ids(
+            removed_turn_ids
+                .chain(replaced_turns.iter().map(|turn| turn.id.clone()))
+                .collect(),
+        );
+        for turn in replaced_turns {
+            self.record_changed_turn(ThreadHistoryTurnChange::from_turn(&turn));
+            for item in turn.items {
+                self.record_changed_item(turn.id.clone(), item);
+            }
+        }
     }
 
     fn finish_current_turn(&mut self) {
@@ -1649,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_appendix_does_not_add_rollback_depth() {
+    fn correction_turn_prefix_does_not_add_rollback_depth() {
         let correction_id = "b7754d6f-f4df-4cfe-8621-8b735d348fb3";
         let mut items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
@@ -1715,6 +1804,274 @@ mod tests {
         )));
 
         assert!(build_turns_from_rollout_items(&items).is_empty());
+    }
+
+    #[test]
+    fn rollback_cuts_at_mid_turn_user_boundary_and_preserves_correction_prefix() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "correction-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Applied the late transcription correction.".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: Some("next-user-message".into()),
+                message: "New instruction after the correction".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Work produced for the new instruction.".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "correction-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "correction-turn");
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::AgentMessage {
+                id: "item-1".into(),
+                text: "Applied the late transcription correction.".into(),
+                phase: None,
+                memory_citation: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn rollback_counts_hidden_inter_agent_lifecycle_without_rendering_it() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "user-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: Some("user-message".into()),
+                message: "First instruction".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "First reply".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "user-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "inter-agent-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::AgentMessage {
+                id: Some("amsg-1".into()),
+                author: "/root/worker".into(),
+                recipient: "/root".into(),
+                content: vec![
+                    codex_protocol::models::AgentMessageInputContent::InputText {
+                        text: "Continue from the worker result".into(),
+                    },
+                ],
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Reply to the hidden instruction".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "inter-agent-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "user-turn");
+        assert_eq!(turns[0].items.len(), 2);
+    }
+
+    #[test]
+    fn rollback_cuts_same_lifecycle_at_hidden_inter_agent_boundary() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "shared-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: Some("user-message".into()),
+                message: "First instruction".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "First reply".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::AgentMessage {
+                id: Some("amsg-1".into()),
+                author: "/root/worker".into(),
+                recipient: "/root".into(),
+                content: vec![
+                    codex_protocol::models::AgentMessageInputContent::InputText {
+                        text: "Continue in the same lifecycle".into(),
+                    },
+                ],
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Reply to the hidden follow-up".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "shared-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "shared-turn");
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::UserMessage {
+                    id: "item-1".into(),
+                    client_id: Some("user-message".into()),
+                    content: vec![UserInput::Text {
+                        text: "First instruction".into(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::AgentMessage {
+                    id: "item-2".into(),
+                    text: "First reply".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_inter_agent_rollout_forms_consume_rollback_depth_without_a_visible_turn() {
+        let communication = codex_protocol::protocol::InterAgentCommunication::new(
+            codex_protocol::AgentPath::root()
+                .join("worker")
+                .expect("worker path"),
+            codex_protocol::AgentPath::root(),
+            Vec::new(),
+            "Continue from the worker result".into(),
+            /*trigger_turn*/ true,
+        );
+        let hidden_forms = vec![
+            RolloutItem::ResponseItem(communication.to_model_input_item()),
+            RolloutItem::InterAgentCommunication(communication.clone()),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
+                id: Some("legacy-inter-agent-message".into()),
+                role: "assistant".into(),
+                content: vec![codex_protocol::models::ContentItem::OutputText {
+                    text: serde_json::to_string(&communication).expect("serialize communication"),
+                }],
+                phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        ];
+
+        for hidden_form in hidden_forms {
+            let items = vec![
+                RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "user-turn".into(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                })),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    client_id: Some("user-message".into()),
+                    message: "First instruction".into(),
+                    images: None,
+                    text_elements: Vec::new(),
+                    local_images: Vec::new(),
+                    ..Default::default()
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "First reply".into(),
+                    phase: None,
+                    memory_citation: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "user-turn".into(),
+                    last_agent_message: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                })),
+                hidden_form,
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                    num_turns: 1,
+                })),
+            ];
+
+            let turns = build_turns_from_rollout_items(&items);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].id, "user-turn");
+            assert_eq!(turns[0].items.len(), 2);
+        }
     }
 
     #[test]
@@ -4463,6 +4820,83 @@ mod tests {
                 changed_turns: Vec::new(),
                 removed_turn_ids: vec!["turn-a".into()],
             }
+        );
+    }
+
+    #[test]
+    fn changed_rollout_items_replace_retained_mid_turn_prefix_after_rollback() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: Some(10),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Applied the late transcription correction.".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: Some("next-user-message".into()),
+                message: "New instruction after the correction".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "Work produced for the new instruction.".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+                completed_at: Some(20),
+                duration_ms: Some(123),
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+        let expected = ThreadHistoryChangeSet {
+            changed_items: vec![ThreadHistoryItemChange {
+                turn_id: "turn-a".into(),
+                item: ThreadItem::AgentMessage {
+                    id: "item-1".into(),
+                    text: "Applied the late transcription correction.".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            }],
+            changed_turns: vec![ThreadHistoryTurnChange {
+                turn_id: "turn-a".into(),
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: Some(10),
+                completed_at: Some(20),
+                duration_ms: Some(123),
+            }],
+            removed_turn_ids: vec!["turn-a".into()],
+        };
+
+        let mut incremental_builder = ThreadHistoryBuilder::new();
+        let (rollback, preceding_items) = items.split_last().expect("rollback item");
+        for item in preceding_items {
+            incremental_builder.handle_rollout_item(item);
+        }
+        assert_eq!(
+            incremental_builder.handle_rollout_item_with_changes(rollback),
+            expected
+        );
+
+        let mut batch_builder = ThreadHistoryBuilder::new();
+        assert_eq!(
+            batch_builder.handle_rollout_items_with_changes(&items),
+            expected
         );
     }
 }

@@ -44,7 +44,7 @@ pub(crate) struct SessionState {
     pub(crate) processed_correction_ids: HashSet<String>,
     /// Client user-message IDs whose durable instruction boundary survives rollback.
     pub(crate) surviving_client_user_message_ids: HashSet<String>,
-    /// Explicit Stop suppresses correction-only turns until real work resumes the session.
+    /// Explicit Stop suppresses automatic correction turns until real work resumes the session.
     pub(crate) correction_auto_start_suppressed: bool,
     /// Settings used by the latest regular user turn, used for turn-to-turn
     /// model/realtime handling on subsequent regular turns (including full-context

@@ -21,11 +21,6 @@ use codex_protocol::error::Result as CodexResult;
 use futures::future::BoxFuture;
 
 const CORRECTION_FRAME_ID_PREFIX: &str = "msg_correction_";
-const CORRECTION_ACK_FRAME_ID_PREFIX: &str = "msg_correction_ack_";
-const CORRECTION_ACK_TEXT_SUFFIX: &str = "was included in an earlier successful normal sampling \
-step. Treat it as already-evaluated historical context, not a new instruction. Do not initiate or \
-repeat an action solely because this correction frame is present after replay or rollback. \
-Continue any unfinished work independently required by the surviving conversation state.";
 
 pub(super) struct CorrectionSamplingInput {
     pub(super) input: Vec<ResponseItem>,
@@ -41,16 +36,6 @@ struct PendingCorrection {
 
 pub(super) fn correction_frame_stable_id(correction_id: Uuid) -> String {
     format!("{CORRECTION_FRAME_ID_PREFIX}{}", correction_id.simple())
-}
-
-fn correction_ack_frame_stable_id(correction_id: Uuid) -> String {
-    format!("{CORRECTION_ACK_FRAME_ID_PREFIX}{}", correction_id.simple())
-}
-
-pub(super) fn correction_ack_frame_id(item: &ResponseItem) -> Option<Uuid> {
-    let id = item.id()?;
-    let uuid = id.strip_prefix(CORRECTION_ACK_FRAME_ID_PREFIX)?;
-    Uuid::parse_str(uuid).ok()
 }
 
 pub(super) fn correction_frame_id(item: &ResponseItem) -> Option<&str> {
@@ -90,40 +75,6 @@ pub(super) fn correction_frame(correction_id: Uuid, payload: String) -> Response
     let mut frame = ResponseItem::from(fragment);
     frame.set_id(Some(stable_id));
     frame
-}
-
-pub(super) fn correction_ack_frame(correction_id: Uuid) -> ResponseItem {
-    let stable_id = correction_ack_frame_stable_id(correction_id);
-    let payload = format!("Correction {correction_id} {CORRECTION_ACK_TEXT_SUFFIX}");
-    let fragment = AdditionalContextDeveloperFragment::new(stable_id.clone(), payload)
-        .into_response_input_item();
-    let mut frame = ResponseItem::from(fragment);
-    frame.set_id(Some(stable_id));
-    frame
-}
-
-pub(super) fn project_correction_acks(
-    history: Vec<ResponseItem>,
-    processed_correction_ids: &std::collections::HashSet<String>,
-) -> Vec<ResponseItem> {
-    let mut projected = Vec::with_capacity(history.len() + processed_correction_ids.len());
-    for item in history {
-        if correction_ack_frame_id(&item).is_some() {
-            continue;
-        }
-        let correction_id = correction_frame_id(&item).and_then(|stable_id| {
-            processed_correction_ids
-                .contains(stable_id)
-                .then(|| stable_id.strip_prefix(CORRECTION_FRAME_ID_PREFIX))
-                .flatten()
-                .and_then(|id| Uuid::parse_str(id).ok())
-        });
-        projected.push(item);
-        if let Some(correction_id) = correction_id {
-            projected.push(correction_ack_frame(correction_id));
-        }
-    }
-    projected
 }
 
 enum ExistingCorrection {
@@ -459,7 +410,7 @@ impl Session {
                 return;
             }
 
-            let turn_context = session.new_correction_appendix().await;
+            let turn_context = session.new_default_turn().await;
             session
                 .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
                 .await;
@@ -469,7 +420,7 @@ impl Session {
                         reservation,
                         turn_context,
                         vec![TurnInput::CommittedCorrection],
-                        RegularTask::new(),
+                        RegularTask::correction_bootstrap(),
                     )
                     .await,
                 "correction task-start reservation must remain owned until task publication"

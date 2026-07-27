@@ -120,6 +120,8 @@ pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) terminal_done: Arc<TaskPublication>,
     pub(crate) kind: TaskKind,
+    /// True when the scheduler created this regular task solely to sample queued corrections.
+    pub(crate) correction_bootstrap: bool,
     /// Cleared atomically with the final empty pending-input check.
     pub(crate) accepts_steer: bool,
     pub(crate) task: Arc<dyn AnySessionTask>,
@@ -147,7 +149,6 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
-    pub(crate) correction_only_turn: bool,
     pub(crate) normal_sampling_attempted: bool,
     pub(crate) completed_normal_sampling: bool,
 }

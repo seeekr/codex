@@ -18,11 +18,19 @@ use super::SessionTaskContext;
 use super::SessionTaskResult;
 
 #[derive(Default)]
-pub(crate) struct RegularTask;
+pub(crate) struct RegularTask {
+    accepts_steer_before_turn_started: bool,
+}
 
 impl RegularTask {
     pub(crate) fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub(crate) fn correction_bootstrap() -> Self {
+        Self {
+            accepts_steer_before_turn_started: true,
+        }
     }
 }
 
@@ -36,7 +44,7 @@ impl SessionTask for RegularTask {
     }
 
     fn defers_steer_until_turn_started(&self) -> bool {
-        true
+        !self.accepts_steer_before_turn_started
     }
 
     async fn run(
@@ -51,34 +59,28 @@ impl SessionTask for RegularTask {
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
-        if !ctx.is_correction_appendix() {
-            let event = EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: ctx.sub_id.clone(),
-                trace_id: ctx.trace_id.clone(),
-                started_at: ctx.turn_timing_state.started_at_unix_secs().await,
-                model_context_window: ctx.model_context_window(),
-                collaboration_mode_kind: ctx.collaboration_mode.mode,
-            });
-            sess.send_event(ctx.as_ref(), event).await;
-            sess.publish_turn_started_for_steering(&ctx.sub_id).await;
-        }
+        let event = EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: ctx.sub_id.clone(),
+            trace_id: ctx.trace_id.clone(),
+            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+            model_context_window: ctx.model_context_window(),
+            collaboration_mode_kind: ctx.collaboration_mode.mode,
+        });
+        sess.send_event(ctx.as_ref(), event).await;
+        sess.publish_turn_started_for_steering(&ctx.sub_id).await;
 
-        let prewarmed_client_session = if ctx.is_correction_appendix() {
-            None
-        } else {
-            let resolution = async {
-                sess.set_server_reasoning_included(/*included*/ false).await;
-                sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
-                    .await
-            }
-            .instrument(trace_span!("regular_task.prepare_run_turn"))
-            .await;
-            match resolution {
-                SessionStartupPrewarmResolution::Cancelled => return Ok(None),
-                SessionStartupPrewarmResolution::Unavailable { .. } => None,
-                SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
-                    Some(*prewarmed_client_session)
-                }
+        let resolution = async {
+            sess.set_server_reasoning_included(/*included*/ false).await;
+            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await
+        }
+        .instrument(trace_span!("regular_task.prepare_run_turn"))
+        .await;
+        let prewarmed_client_session = match resolution {
+            SessionStartupPrewarmResolution::Cancelled => return Ok(None),
+            SessionStartupPrewarmResolution::Unavailable { .. } => None,
+            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
+                Some(*prewarmed_client_session)
             }
         };
         let mut next_input = input;
@@ -95,9 +97,6 @@ impl SessionTask for RegularTask {
             .instrument(run_turn_span.clone())
             .boxed()
             .await?;
-            if ctx.is_correction_appendix() {
-                return Ok(last_agent_message);
-            }
             if sess.close_regular_turn_steering_if_idle(&ctx.sub_id).await {
                 return Ok(last_agent_message);
             }

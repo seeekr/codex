@@ -58,10 +58,6 @@ pub(crate) struct ToolSuggestCandidates {
 }
 
 impl ToolRouter {
-    pub(crate) fn empty() -> Self {
-        Self::from_parts(ToolRegistry::from_tools([]), Vec::new())
-    }
-
     pub(crate) fn from_context(
         step_context: &StepContext,
         params: ToolRouterParams<'_>,

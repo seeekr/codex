@@ -425,6 +425,7 @@ fn accepted_submission_survives_composer_clear_for_verify_and_keep() {
     let lease_id = insert(&mut state, &mut target, capture_id, "transcribed");
     mark_submitted(&mut state, &target, &[lease_id]);
 
+    target.thread_id = "different-thread".to_string();
     target.text.clear();
     target.cursor = 0;
     target.leases.clear();
@@ -458,6 +459,7 @@ fn submission_stays_pending_until_matching_user_message_commit() {
     let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
     let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
 
+    target.thread_id = "different-thread".to_string();
     target.text.clear();
     target.cursor = 0;
     target.leases.clear();
@@ -500,7 +502,7 @@ fn submission_stays_pending_until_matching_user_message_commit() {
 }
 
 #[test]
-fn abandoned_submission_and_rollback_invalidate_owned_state() {
+fn rollback_invalidates_uncommitted_state_but_preserves_surviving_submission_leases() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
     let first_capture = capture(&mut state, &mut target);
@@ -512,9 +514,34 @@ fn abandoned_submission_and_rollback_invalidate_owned_state() {
     let second_capture = capture(&mut state, &mut target);
     let second_lease = insert(&mut state, &mut target, second_capture, " second");
     mark_submitted(&mut state, &target, &[second_lease]);
-    state.invalidate_thread("synthetic-thread");
+    state.note_thread_rolled_back("synthetic-thread");
     assert!(state.captures.is_empty());
-    assert!(state.leases.is_empty());
+    assert!(matches!(
+        state.leases.get(&second_lease).map(|lease| &lease.state),
+        Some(ExternalLeaseState::SubmittedIntact { .. })
+    ));
+
+    let replacement = || ComposerCommand::Replace {
+        lease_id: second_lease,
+        expected: " second".to_string(),
+        replacement: " Second".to_string(),
+    };
+    let CommandExecution::Correct(pending) = state.prepare_command(
+        replacement(),
+        &mut target,
+        /*app_overlay_active*/ false,
+    ) else {
+        panic!("surviving submitted lease should still dispatch its correction");
+    };
+    assert_eq!(pending.thread_id, "synthetic-thread");
+
+    state.note_thread_rolled_back("synthetic-thread");
+    assert!(matches!(
+        state.prepare_command(replacement(), &mut target, /*app_overlay_active*/ false),
+        CommandExecution::Correct(retry)
+            if retry.thread_id == "synthetic-thread"
+                && retry.correction_id == pending.correction_id
+    ));
 }
 
 #[test]
@@ -649,11 +676,11 @@ fn submitted_replace_is_same_thread_application_correction_with_ack_semantics() 
             payload: correction.payload,
             reply,
         },
-        CorrectionDispatchOutcome::Acknowledged,
+        CorrectionDispatchOutcome::Accepted,
     );
     assert!(matches!(
         reply_rx.recv().expect("correction reply"),
-        WireResult::Corrected
+        WireResult::CorrectionQueued
     ));
     assert!(matches!(
         state.execute(
@@ -682,6 +709,7 @@ fn submitted_correction_retries_definite_rejection_or_ambiguity_without_identity
         let capture_id = capture(&mut state, &mut target);
         let lease_id = insert(&mut state, &mut target, capture_id, "parakeat");
         mark_submitted(&mut state, &target, &[lease_id]);
+        target.thread_id = "different-thread".to_string();
         target.text.clear();
         target.cursor = 0;
         target.leases.clear();
@@ -757,7 +785,7 @@ fn submitted_correction_retries_definite_rejection_or_ambiguity_without_identity
 #[test]
 fn stale_correction_completion_does_not_mutate_a_newer_generation() {
     for stale_outcome in [
-        CorrectionDispatchOutcome::Acknowledged,
+        CorrectionDispatchOutcome::Accepted,
         CorrectionDispatchOutcome::NotApplied,
     ] {
         let mut state = ComposerControlState::<u64>::new();
@@ -816,7 +844,7 @@ fn stale_correction_completion_does_not_mutate_a_newer_generation() {
 }
 
 #[test]
-fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
+fn late_acceptance_removes_same_generation_after_definite_rejection() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
     let capture_id = capture(&mut state, &mut target);
@@ -845,7 +873,7 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
     );
     let _ = rejected_reply_rx.recv().expect("rejected correction reply");
 
-    let (ack_reply, ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    let (accepted_reply, accepted_reply_rx) = std::sync::mpsc::sync_channel(1);
     state.finish_correction(
         PendingComposerCorrection {
             lease_id,
@@ -853,13 +881,13 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
             correction_id,
             expected_client_user_message_id,
             payload,
-            reply: ack_reply,
+            reply: accepted_reply,
         },
-        CorrectionDispatchOutcome::Acknowledged,
+        CorrectionDispatchOutcome::Accepted,
     );
     assert!(matches!(
-        ack_reply_rx.recv().expect("acknowledged correction reply"),
-        WireResult::Corrected
+        accepted_reply_rx.recv().expect("accepted correction reply"),
+        WireResult::CorrectionQueued
     ));
     assert!(matches!(
         state.prepare_command(
@@ -879,7 +907,7 @@ fn late_acknowledgement_removes_same_generation_after_definite_rejection() {
 }
 
 #[test]
-fn submitted_replace_rejects_wrong_thread_without_effect() {
+fn submitted_replace_routes_by_origin_after_display_thread_switch() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
     let capture_id = capture(&mut state, &mut target);
@@ -889,6 +917,18 @@ fn submitted_replace_rejects_wrong_thread_without_effect() {
     target.text.clear();
     target.cursor = 0;
 
+    let CommandExecution::Correct(correction) = state.prepare_command(
+        ComposerCommand::Replace {
+            lease_id,
+            expected: "parakeat".to_string(),
+            replacement: "Parakeet".to_string(),
+        },
+        &mut target,
+        /*app_overlay_active*/ false,
+    ) else {
+        panic!("submitted correction should route by its stored origin");
+    };
+    assert_eq!(correction.thread_id, "synthetic-thread");
     assert!(matches!(
         state.prepare_command(
             ComposerCommand::Replace {
@@ -899,10 +939,9 @@ fn submitted_replace_rejects_wrong_thread_without_effect() {
             &mut target,
             /*app_overlay_active*/ false,
         ),
-        CommandExecution::Complete(WireResult::Error {
-            code: ErrorCode::ComposerUnavailable,
-            outcome: MutationOutcome::NotApplied,
-        })
+        CommandExecution::Correct(retry)
+            if retry.thread_id == "synthetic-thread"
+                && retry.correction_id == correction.correction_id
     ));
 }
 
@@ -1254,6 +1293,20 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
             "status": "submission_pending",
         }),
         "slow-final clients receive a typed retryable status, not a target error"
+    );
+    assert_eq!(
+        serde_json::to_value(WireResponse {
+            protocol_version: PROTOCOL_VERSION,
+            instance_id,
+            result: WireResult::CorrectionQueued,
+        })
+        .expect("wire response"),
+        serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "instanceId": instance_id,
+            "status": "correction_queued",
+        }),
+        "acceptance only claims that the correction was queued"
     );
 }
 

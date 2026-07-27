@@ -188,7 +188,6 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
-use crate::context_manager::is_user_turn_boundary;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
@@ -222,11 +221,6 @@ pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod world_state;
 
-pub(crate) fn correction_appendix_item_allowed(item: &ResponseItem) -> bool {
-    matches!(item, ResponseItem::Reasoning { .. })
-        || matches!(item, ResponseItem::Message { role, .. } if role == "assistant")
-            && !is_user_turn_boundary(item)
-}
 use self::code_mode_warning::unsupported_code_mode_warning;
 use self::config_lock::export_config_lock_if_configured;
 use self::config_lock::validate_config_lock_if_configured;
@@ -1868,12 +1862,6 @@ impl Session {
         self.services
             .rollout_thread_trace
             .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
-        if turn_context.is_correction_appendix() {
-            // A correction appendix is durable model history, not a user turn. Delivering even
-            // transient protocol events would let the live app-server reducer create or alter a
-            // visible turn, so appendix observability stays in tracing and raw rollout items.
-            return;
-        }
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -2921,21 +2909,6 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let correction_appendix_items = turn_context.is_correction_appendix().then(|| {
-            let allowed = items
-                .iter()
-                .filter(|item| correction_appendix_item_allowed(item))
-                .cloned()
-                .collect::<Vec<_>>();
-            if allowed.len() != items.len() {
-                warn!(
-                    rejected = items.len().saturating_sub(allowed.len()),
-                    "rejected instruction-boundary or compaction items from correction appendix"
-                );
-            }
-            allowed
-        });
-        let items = correction_appendix_items.as_deref().unwrap_or(items);
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         {
@@ -3618,14 +3591,7 @@ impl Session {
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
-        let state = self.state.lock().await;
-        let mut history = state.clone_history();
-        let projected = correction::project_correction_acks(
-            history.raw_items().to_vec(),
-            &state.processed_correction_ids,
-        );
-        history.replace_prompt_projection(projected);
-        history
+        self.state.lock().await.clone_history()
     }
 
     pub(crate) async fn current_window_id(&self) -> String {

@@ -485,6 +485,10 @@ impl Session {
     ) -> bool {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
+        let correction_bootstrap = task_kind == TaskKind::Regular
+            && input
+                .iter()
+                .any(|item| matches!(item, TurnInput::CommittedCorrection));
         let accepts_steer = !task.defers_steer_until_turn_started();
         let span_name = task.span_name();
         let started_at = Instant::now();
@@ -508,16 +512,6 @@ impl Session {
             .clear_turn(&turn_context.sub_id);
 
         let turn_state = Arc::clone(&reservation.turn_state);
-        let correction_only_turn = !input.is_empty()
-            && input
-                .iter()
-                .all(|item| matches!(item, TurnInput::CommittedCorrection));
-        assert_eq!(
-            turn_context.is_correction_appendix(),
-            correction_only_turn,
-            "correction-only task input must use a correction appendix context"
-        );
-        turn_state.lock().await.correction_only_turn = correction_only_turn;
 
         let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
@@ -578,13 +572,11 @@ impl Session {
                 sess.input_queue
                     .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
                     .await;
-                if !ctx_for_finish.is_correction_appendix() {
-                    sess.emit_turn_start_lifecycle(
-                        ctx_for_finish.as_ref(),
-                        &token_usage_at_turn_start,
-                    )
-                    .await;
-                }
+                sess.emit_turn_start_lifecycle(
+                    ctx_for_finish.as_ref(),
+                    &token_usage_at_turn_start,
+                )
+                .await;
                 let task_result = task_for_run
                     .run(
                         Arc::clone(&session_ctx),
@@ -626,6 +618,7 @@ impl Session {
             terminal_done: Arc::clone(&terminal_done),
             handle: AbortOnDropHandle::new(handle),
             kind: task_kind,
+            correction_bootstrap,
             accepts_steer,
             task,
             cancellation_token,
@@ -653,18 +646,11 @@ impl Session {
         true
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the active-turn lock keeps the correction-only classification bound to the task whose steering gate is opened"
-    )]
     pub(crate) async fn publish_turn_started_for_steering(&self, turn_id: &str) {
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return;
         };
-        if active_turn.turn_state.lock().await.correction_only_turn {
-            return;
-        }
         if let Some(task) = active_turn.task.as_mut()
             && task.turn_context.sub_id == turn_id
         {
@@ -697,7 +683,7 @@ impl Session {
 
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "the active-turn lock linearizes terminal publication with correction-only follow-up reservation"
+        reason = "the active-turn lock linearizes terminal publication with automatic correction follow-up reservation"
     )]
     pub(crate) async fn publish_turn_terminal_and_reserve_correction(
         &self,
@@ -853,10 +839,7 @@ impl Session {
         if let Some(task) = task {
             self.handle_task_abort(task, reason.clone()).await;
         }
-        if let Some(turn_context) = turn_context
-            .as_deref()
-            .filter(|turn_context| !turn_context.is_correction_appendix())
-        {
+        if let Some(turn_context) = turn_context.as_deref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
         }
@@ -911,10 +894,8 @@ impl Session {
         let turn_context = Arc::clone(&task.turn_context);
         let mut terminal_guard = TerminalPublicationGuard::new(Arc::clone(&task.terminal_done));
         self.handle_task_abort(task, reason.clone()).await;
-        if !turn_context.is_correction_appendix() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
+        self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+            .await;
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue
@@ -963,10 +944,14 @@ impl Session {
                     return None;
                 }
                 task.accepts_steer = false;
-                Some((Arc::clone(&active_turn.turn_state), task.kind))
+                Some((
+                    Arc::clone(&active_turn.turn_state),
+                    task.kind,
+                    task.correction_bootstrap,
+                ))
             })
         };
-        let Some((turn_state, task_kind)) = turn_state_and_kind else {
+        let Some((turn_state, task_kind, correction_bootstrap)) = turn_state_and_kind else {
             return false;
         };
         let pending_input = self
@@ -977,7 +962,6 @@ impl Session {
             turn_had_memory_citation,
             turn_tool_calls,
             token_usage_at_turn_start,
-            correction_only_turn,
             normal_sampling_attempted,
             completed_normal_sampling,
         ) = {
@@ -986,7 +970,6 @@ impl Session {
                 ts.has_memory_citation,
                 ts.tool_calls,
                 ts.token_usage_at_turn_start.clone(),
-                ts.correction_only_turn,
                 ts.normal_sampling_attempted,
                 ts.completed_normal_sampling,
             )
@@ -1141,17 +1124,15 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile: turn_context.turn_timing_state.complete_profile(),
             });
-        let event = if correction_only_turn {
-            None
-        } else if let Some(reason) = abort_reason {
+        let event = if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
-            Some(EventMsg::TurnAborted(TurnAbortedEvent {
+            EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
                 completed_at,
                 duration_ms,
-            }))
+            })
         } else {
             let time_to_first_token_ms = turn_context
                 .turn_timing_state
@@ -1159,13 +1140,13 @@ impl Session {
                 .await;
             self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
                 .await;
-            Some(EventMsg::TurnComplete(TurnCompleteEvent {
+            EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
                 completed_at,
                 duration_ms,
                 time_to_first_token_ms,
-            }))
+            })
         };
         let mut terminal_guard = {
             let mut active = self.active_turn.lock().await;
@@ -1187,9 +1168,7 @@ impl Session {
             TerminalPublicationGuard::new(terminal_done)
         };
 
-        if let Some(event) = event {
-            self.send_event(turn_context.as_ref(), event).await;
-        }
+        self.send_event(turn_context.as_ref(), event).await;
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
@@ -1203,7 +1182,7 @@ impl Session {
         }
         let should_schedule_correction = task_succeeded
             && (task_kind != TaskKind::Regular
-                || (!normal_sampling_attempted && !correction_only_turn)
+                || (!correction_bootstrap && !normal_sampling_attempted)
                 || completed_normal_sampling);
         let correction_reservation = self
             .publish_turn_terminal_and_reserve_correction(
@@ -1213,7 +1192,7 @@ impl Session {
             .await;
         terminal_guard.mark_published();
         if let Some(reservation) = correction_reservation {
-            let turn_context = self.new_correction_appendix().await;
+            let turn_context = self.new_default_turn().await;
             self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
                 .await;
             assert!(
@@ -1221,7 +1200,7 @@ impl Session {
                     reservation,
                     turn_context,
                     vec![TurnInput::CommittedCorrection],
-                    RegularTask::new(),
+                    RegularTask::correction_bootstrap(),
                 )
                 .await,
                 "terminal-to-correction reservation must remain owned until task publication"
@@ -1279,8 +1258,7 @@ impl Session {
             .abort(session_ctx, Arc::clone(&task.turn_context))
             .await;
 
-        if !task.turn_context.is_correction_appendix()
-            && reason == TurnAbortReason::Interrupted
+        if reason == TurnAbortReason::Interrupted
             && let Some(marker) = interrupted_turn_history_marker(
                 InterruptedTurnHistoryMarker::from_config_and_version(
                     task.turn_context.config.as_ref(),
@@ -1311,15 +1289,13 @@ impl Session {
                 turn_id: task.turn_context.sub_id.clone(),
                 profile: task.turn_context.turn_timing_state.complete_profile(),
             });
-        if !task.turn_context.is_correction_appendix() {
-            let event = EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: Some(task.turn_context.sub_id.clone()),
-                reason,
-                completed_at,
-                duration_ms,
-            });
-            self.send_event(task.turn_context.as_ref(), event).await;
-        }
+        let event = EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some(task.turn_context.sub_id.clone()),
+            reason,
+            completed_at,
+            duration_ms,
+        });
+        self.send_event(task.turn_context.as_ref(), event).await;
         self.services
             .guardian_rejection_circuit_breaker
             .lock()

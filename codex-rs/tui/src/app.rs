@@ -259,7 +259,7 @@ enum ComposerSubmissionTransition {
     Pending(NativeComposerSubmission),
     Committed(NativeComposerSubmission),
     Abandoned(NativeComposerSubmission),
-    InvalidateThread(String),
+    ThreadRolledBack(String),
 }
 
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
@@ -1293,8 +1293,8 @@ See the Codex keymap documentation for supported actions and examples."
                         ComposerSubmissionTransition::Abandoned(submission) => {
                             composer_control_state.note_submission_abandoned(&submission);
                         }
-                        ComposerSubmissionTransition::InvalidateThread(thread_id) => {
-                            composer_control_state.invalidate_thread(&thread_id);
+                        ComposerSubmissionTransition::ThreadRolledBack(thread_id) => {
+                            composer_control_state.note_thread_rolled_back(&thread_id);
                         }
                     }
                 }

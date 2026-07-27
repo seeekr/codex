@@ -5634,9 +5634,10 @@ async fn late_usage_result_can_follow_finalized_plan() {
 }
 
 #[tokio::test]
-async fn composer_submission_commits_only_on_matching_user_item_completion() {
+async fn inactive_composer_submission_commits_at_notification_ingress() {
     let mut app = make_test_app().await;
     let thread_id = ThreadId::new();
+    app.active_thread_id = Some(ThreadId::new());
     let submission = NativeComposerSubmission::new(
         thread_id.to_string(),
         "owned",
@@ -5656,8 +5657,9 @@ async fn composer_submission_commits_only_on_matching_user_item_completion() {
             if pending == submission
     ));
 
-    app.note_composer_submission_notification(&ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
+    app.enqueue_thread_notification(
+        thread_id,
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
@@ -5666,13 +5668,16 @@ async fn composer_submission_commits_only_on_matching_user_item_completion() {
                 client_id: Some("different-client-id".to_string()),
                 content: Vec::new(),
             },
-        },
-    ));
+        }),
+    )
+    .await
+    .expect("inactive notification should buffer");
     assert!(app.pending_composer_submissions.contains_key(&client_id));
     assert!(app.composer_submission_transitions.is_empty());
 
-    app.note_composer_submission_notification(&ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
+    app.enqueue_thread_notification(
+        thread_id,
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
@@ -5681,8 +5686,10 @@ async fn composer_submission_commits_only_on_matching_user_item_completion() {
                 client_id: Some(client_id.clone()),
                 content: Vec::new(),
             },
-        },
-    ));
+        }),
+    )
+    .await
+    .expect("inactive notification should buffer");
     assert!(!app.pending_composer_submissions.contains_key(&client_id));
     assert!(matches!(
         app.composer_submission_transitions.pop_front(),
@@ -5749,7 +5756,7 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     assert!(matches!(
         app.composer_submission_transitions.pop_front(),
-        Some(ComposerSubmissionTransition::InvalidateThread(invalidated))
+        Some(ComposerSubmissionTransition::ThreadRolledBack(invalidated))
             if invalidated == thread_id.to_string()
     ));
 }

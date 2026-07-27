@@ -33,11 +33,6 @@ impl App {
         let Ok(thread_id) = ThreadId::from_string(pending.thread_id()) else {
             return Err(CorrectionDispatchOutcome::NotApplied);
         };
-        if self.active_thread_id != Some(thread_id)
-            || self.chat_widget.thread_id() != Some(thread_id)
-        {
-            return Err(CorrectionDispatchOutcome::NotApplied);
-        }
         Ok(thread_id)
     }
 }
@@ -66,7 +61,7 @@ async fn dispatch_composer_correction_unbounded(
                 })
                 .await;
         match response {
-            Ok(_) => return CorrectionDispatchOutcome::Acknowledged,
+            Ok(_) => return CorrectionDispatchOutcome::Accepted,
             Err(TypedRequestError::Server { source, .. }) => {
                 return correction_server_error_outcome(source.code);
             }
@@ -1018,6 +1013,7 @@ impl App {
         {
             return Ok(());
         }
+        self.note_composer_submission_notification(&notification);
         if let ServerNotification::ThreadSettingsUpdated(notification) = &notification {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
                 .await;
@@ -1563,7 +1559,7 @@ impl App {
         self.pending_composer_submissions
             .retain(|_, pending| pending.submission.thread_id() != thread_id.to_string());
         self.composer_submission_transitions.push_back(
-            super::ComposerSubmissionTransition::InvalidateThread(thread_id.to_string()),
+            super::ComposerSubmissionTransition::ThreadRolledBack(thread_id.to_string()),
         );
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
@@ -1606,7 +1602,6 @@ impl App {
         );
         match event {
             ThreadBufferedEvent::Notification(notification) => {
-                self.note_composer_submission_notification(&notification);
                 self.cache_collab_receiver_threads_for_notification(&notification);
                 self.chat_widget
                     .handle_server_notification(notification, /*replay_kind*/ None);
@@ -1635,7 +1630,6 @@ impl App {
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
         match event {
             ThreadBufferedEvent::Notification(notification) => {
-                self.note_composer_submission_notification(&notification);
                 self.chat_widget
                     .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot));
             }

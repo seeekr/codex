@@ -16,7 +16,10 @@ use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::RolloutRecorder;
 use codex_protocol::models::ContentItem;
@@ -169,13 +172,12 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     );
     let request = response_mock.single_request();
     let request_body = request.body_json();
-    assert_eq!(
+    assert!(
         request_body
             .get("tools")
             .and_then(serde_json::Value::as_array)
-            .map(Vec::len),
-        Some(0),
-        "correction appendix must advertise zero tools"
+            .is_some_and(|tools| !tools.is_empty()),
+        "ordinary correction turn must advertise the normal nonempty tool set"
     );
     let expected_frame_text = format!("<{correction_frame_id}>{payload}</{correction_frame_id}>");
     let expected_content = serde_json::json!([{
@@ -204,12 +206,40 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
         "correction context must not invent a user message"
     );
 
+    let started_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+    let started: TurnStartedNotification = serde_json::from_value(
+        started_notification
+            .params
+            .context("turn/started notification must include params")?,
+    )?;
+    assert_eq!(started.thread_id, thread.id);
+    assert_eq!(started.turn.status, TurnStatus::InProgress);
+    let correction_turn_id = started.turn.id.clone();
+
+    let completed_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notification
+            .params
+            .context("turn/completed notification must include params")?,
+    )?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, correction_turn_id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+
     let rollout_path = thread.path.as_ref().context("thread path missing")?;
     let rollout_items = wait_for_sampled_rollout(rollout_path, correction_id.as_str()).await?;
     assert_eq!(
         responses_request_count(&server).await?,
         2,
-        "target turn and correction appendix must make exactly two model requests"
+        "target and ordinary correction turns must make exactly two model requests"
     );
     let correction_intents = rollout_items
         .iter()
@@ -237,89 +267,87 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     let expected_frame_content = [ContentItem::InputText {
         text: expected_frame_text,
     }];
-    let appendix_projection = rollout_items
+    let lifecycle_projection = rollout_items
         .iter()
+        .enumerate()
         .skip(correction_intent_index + 1)
-        .filter_map(|item| {
-            assert!(
-                !matches!(
-                    item,
-                    RolloutItem::TurnContext(_)
-                        | RolloutItem::WorldState(_)
-                        | RolloutItem::Compacted(_)
-                        | RolloutItem::ResponseItem(
-                            ResponseItem::Compaction { .. }
-                                | ResponseItem::CompactionTrigger { .. }
-                                | ResponseItem::ContextCompaction { .. }
-                        )
-                ),
-                "correction appendix must not persist context or compaction structure: {item:#?}"
-            );
-            assert!(
-                !is_user_turn_boundary(item),
-                "correction appendix must not add a user-turn boundary: {item:#?}"
-            );
-            match item {
-                RolloutItem::ResponseItem(ResponseItem::Message {
-                    id: Some(id),
-                    role,
-                    content,
-                    ..
-                }) if id == &correction_frame_id
-                    && role == "developer"
-                    && content.as_slice() == expected_frame_content.as_slice() =>
-                {
-                    Some("frame")
-                }
-                RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                    if role == "assistant"
-                        && matches!(
-                            content.as_slice(),
-                            [ContentItem::OutputText { text }] if text == "Done"
-                        ) =>
-                {
-                    Some("assistant")
-                }
-                RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
-                    if event.persisted_corrections_sampled().is_some_and(|proof| {
-                        proof.correction_ids.as_slice() == [correction_id.as_str()]
-                    }) =>
-                {
-                    Some("proof")
-                }
-                RolloutItem::EventMsg(EventMsg::RawResponseItem(_)) => None,
-                RolloutItem::EventMsg(event) => {
-                    panic!("correction appendix must not persist UI events: {event:#?}")
-                }
-                _ => None,
+        .filter_map(|(index, item)| match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event))
+                if event.turn_id == correction_turn_id =>
+            {
+                Some((index, "started"))
             }
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some(id),
+                role,
+                content,
+                ..
+            }) if id == &correction_frame_id
+                && role == "developer"
+                && content.as_slice() == expected_frame_content.as_slice() =>
+            {
+                Some((index, "frame"))
+            }
+            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                if role == "assistant"
+                    && matches!(
+                        content.as_slice(),
+                        [ContentItem::OutputText { text }] if text == "Done"
+                    ) =>
+            {
+                Some((index, "assistant"))
+            }
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                if event.persisted_corrections_sampled().is_some_and(|proof| {
+                    proof.correction_ids.as_slice() == [correction_id.as_str()]
+                }) =>
+            {
+                Some((index, "sampled"))
+            }
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                if event.turn_id == correction_turn_id =>
+            {
+                Some((index, "complete"))
+            }
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        appendix_projection,
-        ["frame", "assistant", "proof"],
-        "durable appendix must contain intent < frame < assistant result < sampled proof"
+        lifecycle_projection
+            .iter()
+            .map(|(_, marker)| *marker)
+            .collect::<Vec<_>>(),
+        ["started", "frame", "assistant", "sampled", "complete"],
+        "durable lifecycle must contain each marker once and in execution order"
+    );
+    let turn_started_index = lifecycle_projection[0].0;
+    let turn_complete_index = lifecycle_projection[4].0;
+    assert!(
+        rollout_items[turn_started_index + 1..turn_complete_index]
+            .iter()
+            .all(|item| !is_user_turn_boundary(item)),
+        "ordinary correction lifecycle must not invent an actual user boundary"
     );
 
     let visible_thread = read_thread(&mut app, thread.id.as_str()).await?;
     assert!(
         matches!(
             visible_thread.turns.as_slice(),
-            [turn] if matches!(
-                turn.items.as_slice(),
+            [target_turn, correction_turn]
+                if matches!(
+                target_turn.items.as_slice(),
                 [
                     ThreadItem::UserMessage { client_id, .. },
                     ThreadItem::AgentMessage { text, .. }
                 ] if client_id.as_deref() == Some(target_client_user_message_id.as_str())
                     && text == "Ready"
-            )
+            ) && correction_turn.id == correction_turn_id
+                && matches!(
+                    correction_turn.items.as_slice(),
+                    [ThreadItem::AgentMessage { text, .. }] if text == "Done"
+                )
         ),
-        "correction appendix must leave exactly the unmodified visible target turn"
-    );
-    assert!(
-        app.pending_notification_methods().is_empty(),
-        "correction appendix must not emit transient client notifications: {:?}",
-        app.pending_notification_methods()
+        "ordinary correction must add a visible agent-only turn after the target"
     );
 
     let rollback_request = app
@@ -338,7 +366,7 @@ async fn thread_correction_commit_is_durable_and_idempotent() -> Result<()> {
     } = to_response::<ThreadRollbackResponse>(rollback_response)?;
     assert!(
         rolled_back_thread.turns.is_empty(),
-        "rollback 1 must remove the target and its correction appendix"
+        "rollback 1 must remove the newest actual user boundary and its later correction turn"
     );
     let rolled_back_read = read_thread(&mut app, thread.id.as_str()).await?;
     assert!(
@@ -438,6 +466,7 @@ async fn read_thread(app: &mut TestAppServer, thread_id: &str) -> Result<Thread>
 
 fn is_user_turn_boundary(item: &RolloutItem) -> bool {
     match item {
+        RolloutItem::EventMsg(EventMsg::UserMessage(_)) => true,
         RolloutItem::InterAgentCommunication(_) => true,
         RolloutItem::ResponseItem(ResponseItem::AgentMessage { .. }) => true,
         RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {

@@ -45,7 +45,6 @@ use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -159,9 +158,11 @@ use core_test_support::PathExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_items;
@@ -9377,34 +9378,6 @@ impl SessionTask for SelfAbortingTask {
     }
 }
 
-#[derive(Clone, Copy)]
-struct DeferredNeverEndingTask;
-
-impl SessionTask for DeferredNeverEndingTask {
-    fn kind(&self) -> TaskKind {
-        TaskKind::Regular
-    }
-
-    fn span_name(&self) -> &'static str {
-        "session_task.deferred_never_ending"
-    }
-
-    fn defers_steer_until_turn_started(&self) -> bool {
-        true
-    }
-
-    async fn run(
-        self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
-        _ctx: Arc<TurnContext>,
-        _input: Vec<TurnInput>,
-        cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        cancellation_token.cancelled().await;
-        Ok(None)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -11332,132 +11305,6 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
 const TEST_CORRECTION_TARGET: &str = "test-correction-target";
 
-#[test]
-fn correction_appendix_item_allowlist_rejects_every_turn_boundary() {
-    let communication = InterAgentCommunication::new(
-        AgentPath::root(),
-        AgentPath::root().join("worker").expect("worker path"),
-        Vec::new(),
-        "continue".to_string(),
-        /*trigger_turn*/ true,
-    );
-    let inter_agent_boundary = ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: serde_json::to_string(&communication).expect("serialize communication"),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let ordinary_assistant = ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: "correction considered".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let correction_frame = ResponseItem::Message {
-        id: Some("msg_correction_test".to_string()),
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "mechanical correction".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    assert!(!correction_appendix_item_allowed(&inter_agent_boundary));
-    assert!(!correction_appendix_item_allowed(&ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "hidden user boundary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }));
-    assert!(!correction_appendix_item_allowed(
-        &ResponseItem::CompactionTrigger {}
-    ));
-    assert!(!correction_appendix_item_allowed(&correction_frame));
-    assert!(correction_appendix_item_allowed(&ordinary_assistant));
-    assert!(!correction_appendix_item_allowed(
-        &ResponseItem::FunctionCall {
-            id: None,
-            name: "unadvertised_tool".to_string(),
-            arguments: "{}".to_string(),
-            call_id: "call-1".to_string(),
-            namespace: None,
-            internal_chat_message_metadata_passthrough: None,
-        }
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn correction_appendix_deferral_preserves_startup_prewarm() {
-    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
-    let (_prewarm_tx, prewarm_rx) = tokio::sync::oneshot::channel::<()>();
-    let prewarm = tokio::spawn(async move {
-        let _ = prewarm_rx.await;
-        Ok(test_model_client_session())
-    });
-    session
-        .set_session_startup_prewarm(
-            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
-                prewarm,
-                std::time::Instant::now(),
-                crate::client::WEBSOCKET_CONNECT_TIMEOUT,
-            ),
-        )
-        .await;
-
-    let mut correction_context = session.new_correction_appendix().await;
-    let correction_context_mut =
-        Arc::get_mut(&mut correction_context).expect("unshared correction context");
-    Arc::make_mut(&mut correction_context_mut.config).model_auto_compact_token_limit = Some(1);
-    Arc::make_mut(&mut correction_context_mut.config).model_auto_compact_token_limit_scope =
-        AutoCompactTokenLimitScope::Total;
-    correction_context_mut.model_info.context_window = Some(100);
-    correction_context_mut
-        .model_info
-        .effective_context_window_percent = 100;
-    session
-        .set_total_tokens_full(correction_context.as_ref())
-        .await;
-    let reservation = session
-        .reserve_task_start()
-        .await
-        .expect("correction reservation");
-    assert!(
-        session
-            .start_reserved_task(
-                reservation,
-                correction_context,
-                vec![TurnInput::CommittedCorrection],
-                crate::tasks::RegularTask::new(),
-            )
-            .await
-    );
-
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if session.active_turn.lock().await.is_none() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("deferred correction appendix must finish without waiting on prewarm");
-    assert!(
-        session.take_session_startup_prewarm().await.is_some(),
-        "the first real turn still owns startup prewarm"
-    );
-}
-
 async fn seed_test_correction_target(session: &Session) {
     session
         .state
@@ -11544,7 +11391,7 @@ async fn correction_stop_keeps_late_commit_idle_until_successful_shell_work_resu
     session.interrupt_task().await;
     assert!(
         session.state.lock().await.correction_auto_start_suppressed,
-        "Stop observed against active work must suppress correction-only starts"
+        "Stop observed against active work must suppress automatic correction starts"
     );
 
     let correction_id = Uuid::new_v4().to_string();
@@ -11641,6 +11488,58 @@ async fn correction_failed_latest_sampling_attempt_does_not_auto_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correction_bootstrap_without_sampling_does_not_auto_retry() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_in_memory_thread_store(&mut session).await;
+    let session = Arc::new(session);
+    seed_test_correction_target(session.as_ref()).await;
+    session.suppress_correction_auto_start().await;
+    session
+        .commit_correction(
+            Uuid::new_v4().to_string(),
+            TEST_CORRECTION_TARGET.to_string(),
+            "Tori should be Tauri".to_string(),
+        )
+        .await
+        .expect("queue correction while automatic work is suppressed");
+    session.allow_correction_auto_start().await;
+
+    let turn_context = session
+        .new_default_turn_with_sub_id("zero-sample-correction-bootstrap".to_string())
+        .await;
+    session
+        .spawn_task(
+            turn_context,
+            vec![TurnInput::CommittedCorrection],
+            CompletingTask,
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("zero-sample correction bootstrap must reach terminal idle state");
+    assert!(session.has_pending_corrections().await);
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .clone_history()
+            .raw_items()
+            .iter()
+            .all(|item| correction::correction_frame_id(item).is_none()),
+        "a zero-sample correction bootstrap must not recursively start correction work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn correction_user_input_real_work_clears_stop() {
     let (user_session, user_turn, _rx) = make_session_and_context_with_rx().await;
     user_session
@@ -11660,7 +11559,7 @@ async fn correction_user_input_real_work_clears_stop() {
             .lock()
             .await
             .correction_auto_start_suppressed,
-        "Stop observed against active work must suppress correction-only starts"
+        "Stop observed against active work must suppress automatic correction starts"
     );
     assert!(user_session.active_turn.lock().await.is_none());
 
@@ -11996,7 +11895,7 @@ async fn correction_stop_waits_for_terminal_publication_before_latching() {
             .correction_auto_start_suppressed,
         "taskless correction startup is not yet a durable interrupted turn"
     );
-    let context = correction_session.new_correction_appendix().await;
+    let context = correction_session.new_default_turn().await;
     assert!(
         correction_session
             .start_reserved_task(
@@ -12019,8 +11918,8 @@ async fn correction_stop_waits_for_terminal_publication_before_latching() {
             .correction_auto_start_suppressed
     );
     assert!(
-        !replayed_correction_auto_start_suppressed(&correction_session, &replay_context).await,
-        "headless correction interruption must not leave a durable turn boundary"
+        replayed_correction_auto_start_suppressed(&correction_session, &replay_context).await,
+        "an interrupted visible correction turn must preserve its durable Stop latch"
     );
 }
 
@@ -12091,107 +11990,274 @@ async fn correction_all_interrupted_task_terminal_paths_match_replay() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn correction_only_turn_rejects_immediate_user_input_into_a_normal_turn() {
-    let (mut session, _turn_context) = make_session_and_context().await;
-    attach_in_memory_thread_store(&mut session).await;
-    let session = Arc::new(session);
-    seed_test_correction_target(session.as_ref()).await;
-    session.suppress_correction_auto_start().await;
-    session
-        .commit_correction(
-            Uuid::new_v4().to_string(),
-            TEST_CORRECTION_TARGET.to_string(),
-            "Tori should be Tauri".to_string(),
-        )
-        .await
-        .expect("queue durable correction");
-    session.allow_correction_auto_start().await;
+#[tokio::test]
+async fn idle_correction_is_visible_tool_capable_and_samples_prestart_steer_next() {
+    const CORRECTION: &str = "Tori should be Tauri";
+    const SKILL_NAME: &str = "prestart-demo";
+    const SKILL_BODY: &str = "PRESTART_SKILL_INSTRUCTIONS";
+    const USER_B: &str = "continue with user B using $prestart-demo";
 
-    let reservation = session
-        .reserve_task_start()
-        .await
-        .expect("correction-only reservation");
-    let correction_context = session.new_correction_appendix().await;
-    assert!(
+    let server = start_mock_server().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("correction-response"),
+                ev_assistant_message("correction-message", "correction considered"),
+                ev_completed("correction-response"),
+            ]),
+            sse(vec![
+                ev_response_created("user-b-response"),
+                ev_assistant_message("user-b-message", "user B considered"),
+                ev_completed("user-b-response"),
+            ]),
+        ],
+    )
+    .await;
+    let base_url = format!("{}/v1", server.uri());
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (mut session, _turn_context, rx) =
+        make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            move |config| {
+                config.model_provider.base_url = Some(base_url);
+                let skill_dir = config.codex_home.join("skills").join(SKILL_NAME);
+                std::fs::create_dir_all(&skill_dir).expect("create pending-input skill dir");
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    format!(
+                        "---\nname: {SKILL_NAME}\ndescription: proves pending steer enrichment\n---\n\n{SKILL_BODY}\n"
+                    ),
+                )
+                .expect("write pending-input skill");
+            },
+        )
+        .await;
+    attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("unique session")).await;
+    seed_test_correction_target(session.as_ref()).await;
+
+    assert_eq!(
         session
-            .start_reserved_task(
-                reservation,
-                Arc::clone(&correction_context),
-                vec![TurnInput::CommittedCorrection],
-                DeferredNeverEndingTask,
+            .commit_correction(
+                Uuid::new_v4().to_string(),
+                TEST_CORRECTION_TARGET.to_string(),
+                CORRECTION.to_string(),
             )
             .await
+            .expect("queue and start idle durable correction"),
+        CorrectionCommitStatus::Queued
     );
+
+    {
+        let active = session.active_turn.lock().await;
+        let active = active.as_ref().expect("idle correction must start a turn");
+        let task = active
+            .task
+            .as_ref()
+            .expect("idle correction must publish a task");
+        assert_eq!(task.kind, TaskKind::Regular);
+        assert!(task.accepts_steer);
+    }
     assert!(
-        !session
+        rx.try_recv().is_err(),
+        "the single-threaded test must still be before TurnStarted"
+    );
+
+    let correction_turn_id = session
+        .steer_input(
+            vec![UserInput::Text {
+                text: USER_B.to_string(),
+                text_elements: Vec::new(),
+            }],
+            /*additional_context*/ Default::default(),
+            /*expected_turn_id*/ None,
+            Some("client-user-b".to_string()),
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect("ordinary correction turn must accept user B before TurnStarted");
+    assert_eq!(
+        session
             .active_turn
             .lock()
             .await
             .as_ref()
-            .and_then(|turn| turn.task.as_ref())
-            .is_some_and(|task| task.accepts_steer),
-        "correction-only work must never accept user steering"
+            .and_then(|active| active.task.as_ref())
+            .map(|task| task.turn_context.sub_id.as_str()),
+        Some(correction_turn_id.as_str())
     );
-
-    handlers::user_input_or_turn(
-        &session,
-        "normal-user-turn".to_string(),
-        Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "this must reach a normal turn".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        },
-        Some("client-normal-user-turn".to_string()),
-    )
-    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "user B must be accepted before TurnStarted is emitted"
+    );
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if session
-                .clone_history()
-                .await
-                .raw_items()
-                .iter()
-                .any(|item| {
-                    matches!(
-                        item,
-                        ResponseItem::Message { role, content, .. }
-                            if role == "user"
-                                && content.iter().any(|content| matches!(
-                                    content,
-                                    ContentItem::InputText { text }
-                                        if text == "this must reach a normal turn"
-                                ))
-                    )
-                })
-            {
-                break;
+            let event = rx.recv().await.expect("event channel open");
+            if matches!(
+                event.msg,
+                EventMsg::TurnStarted(TurnStartedEvent { ref turn_id, .. })
+                    if turn_id == &correction_turn_id
+            ) {
+                return;
             }
-            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("immediate user input must be recorded by the replacement normal turn");
-    assert!(session.has_pending_corrections().await);
-    let active_turn_state = session
-        .active_turn
-        .lock()
-        .await
-        .as_ref()
-        .map(|active_turn| Arc::clone(&active_turn.turn_state));
-    if let Some(active_turn_state) = active_turn_state {
-        assert!(
-            !active_turn_state.lock().await.correction_only_turn,
-            "the user input must run on a normal turn"
-        );
+    .expect("ordinary correction turn must emit TurnStarted");
+    let terminal = timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("event channel open");
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "ordinary correction turn must complete after two samples; observed {} requests",
+            requests.requests().len()
+        )
+    });
+    assert!(matches!(
+        terminal.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. })
+            if turn_id == correction_turn_id
+    ));
+
+    let requests = requests.requests();
+    let [correction_sample, user_b_sample] = requests.as_slice() else {
+        panic!("expected correction sample followed by user B sample");
+    };
+    assert!(correction_sample.body_contains_text(CORRECTION));
+    assert!(!correction_sample.body_contains_text(USER_B));
+    assert!(!correction_sample.body_contains_text(SKILL_BODY));
+    assert!(
+        correction_sample
+            .body_json()
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        "ordinary correction sampling must retain the regular tool surface"
+    );
+    assert!(user_b_sample.body_contains_text(CORRECTION));
+    assert!(user_b_sample.body_contains_text(USER_B));
+    assert!(user_b_sample.body_contains_text(SKILL_BODY));
+}
+
+#[tokio::test]
+async fn pending_correction_steer_is_durable_before_cancellable_enrichment() {
+    struct BlockingUserInputContributor {
+        entered: Arc<Barrier>,
     }
-    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    impl codex_extension_api::TurnInputContributor for BlockingUserInputContributor {
+        fn contribute<'a>(
+            &'a self,
+            input: codex_extension_api::TurnInputContext,
+            _session_store: &'a codex_extension_api::ExtensionData,
+            _thread_store: &'a codex_extension_api::ExtensionData,
+            _turn_store: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<Box<dyn ContextualUserFragment + Send>>>
+        {
+            Box::pin(async move {
+                if input.user_input.is_empty() {
+                    return Vec::new();
+                }
+                self.entered.wait().await;
+                std::future::pending().await
+            })
+        }
+    }
+
+    const CORRECTION: &str = "Tori should be Tauri";
+    const USER_B: &str = "continue with user B";
+    const USER_B_CLIENT_ID: &str = "client-user-b";
+
+    let server = start_mock_server().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("correction-response"),
+            ev_assistant_message("correction-message", "correction considered"),
+            ev_completed("correction-response"),
+        ])],
+    )
+    .await;
+    let base_url = format!("{}/v1", server.uri());
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        move |config| {
+            config.model_provider.base_url = Some(base_url);
+        },
+    )
+    .await;
+    let enrichment_entered = Arc::new(Barrier::new(2));
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    extensions.turn_input_contributor(Arc::new(BlockingUserInputContributor {
+        entered: Arc::clone(&enrichment_entered),
+    }));
+    Arc::get_mut(&mut session)
+        .expect("unique session")
+        .services
+        .extensions = Arc::new(extensions.build());
+    attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("unique session")).await;
+    seed_test_correction_target(session.as_ref()).await;
+
+    assert_eq!(
+        session
+            .commit_correction(
+                Uuid::new_v4().to_string(),
+                TEST_CORRECTION_TARGET.to_string(),
+                CORRECTION.to_string(),
+            )
+            .await
+            .expect("queue and start idle durable correction"),
+        CorrectionCommitStatus::Queued
+    );
+    session
+        .steer_input(
+            vec![UserInput::Text {
+                text: USER_B.to_string(),
+                text_elements: Vec::new(),
+            }],
+            /*additional_context*/ Default::default(),
+            /*expected_turn_id*/ None,
+            Some(USER_B_CLIENT_ID.to_string()),
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect("ordinary correction turn must accept user B before TurnStarted");
+
+    timeout(Duration::from_secs(10), enrichment_entered.wait())
+        .await
+        .expect("pending-input enrichment should begin after the correction sample");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let history = strip_metadata_from_items(session.clone_history().await.raw_items());
+    assert!(
+        history.contains(&user_message(USER_B)),
+        "accepted user B must remain durable when its enrichment is cancelled"
+    );
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .surviving_client_user_message_ids
+            .contains(USER_B_CLIENT_ID),
+        "accepted user B must retain its durable client identity"
+    );
+    assert_eq!(
+        requests.requests().len(),
+        1,
+        "user B must not enter a sample when enrichment is cancelled"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12909,31 +12975,33 @@ async fn correction_commit_retries_after_closing_turn_into_new_turn_segment() {
                 .load_history(/*include_archived*/ false)
                 .await
                 .expect("load persisted history");
-            if stored.items.iter().any(|item| {
+            let has_correction = stored.items.iter().any(|item| {
                 matches!(item, RolloutItem::ResponseItem(frame) if correction::correction_frame_id(frame).is_some())
-            }) {
+            });
+            let has_started = stored
+                .items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
+            let has_turn_context = stored
+                .items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::TurnContext(_)));
+            if has_correction && has_started && has_turn_context {
                 break stored;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("queued correction must materialize in its correction-only turn");
+    .expect("queued correction must materialize in its visible regular turn");
     assert!(
-        !stored.items.iter().any(|item| {
+        stored.items.iter().any(|item| {
             matches!(
                 item,
-                RolloutItem::EventMsg(
-                    EventMsg::TurnStarted(_)
-                        | EventMsg::TurnComplete(_)
-                        | EventMsg::TurnAborted(_)
-                        | EventMsg::UserMessage(_)
-                ) | RolloutItem::TurnContext(_)
-                    | RolloutItem::WorldState(_)
-                    | RolloutItem::Compacted(_)
+                RolloutItem::TurnContext(_) | RolloutItem::WorldState(_)
             )
         }),
-        "correction processing must remain a headless non-turn appendix"
+        "correction processing must retain ordinary turn context"
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;

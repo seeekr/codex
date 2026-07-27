@@ -306,7 +306,7 @@ impl PendingComposerCorrection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CorrectionDispatchOutcome {
-    Acknowledged,
+    Accepted,
     NotApplied,
     Unknown,
 }
@@ -501,7 +501,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         outcome: CorrectionDispatchOutcome,
     ) {
         let result = match outcome {
-            CorrectionDispatchOutcome::Acknowledged => {
+            CorrectionDispatchOutcome::Accepted => {
                 let is_superseded = self.leases.get(&pending.lease_id).is_some_and(|lease| {
                     matches!(
                         &lease.state,
@@ -516,7 +516,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     self.lease_order
                         .retain(|queued| *queued != pending.lease_id);
                 }
-                WireResult::Corrected
+                WireResult::CorrectionQueued
             }
             CorrectionDispatchOutcome::NotApplied => {
                 if let Some(lease) = self.leases.get_mut(&pending.lease_id)
@@ -718,13 +718,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
             }
             ExternalLeaseState::SubmissionPending { .. } => WireResult::SubmissionPending,
-            ExternalLeaseState::SubmittedIntact { .. } => {
-                if target.thread_id().as_deref() == Some(lease.thread_id.as_str()) {
-                    WireResult::SubmittedIntact
-                } else {
-                    WireResult::not_applied(ErrorCode::ComposerUnavailable)
-                }
-            }
+            ExternalLeaseState::SubmittedIntact { .. } => WireResult::SubmittedIntact,
             ExternalLeaseState::CorrectionPending { .. } => {
                 WireResult::not_applied(ErrorCode::LeaseUnavailable)
             }
@@ -759,9 +753,6 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 WireResult::Kept
             }
             ExternalLeaseState::SubmittedIntact { .. } => {
-                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
-                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
-                }
                 self.leases.remove(&lease_id);
                 self.lease_order.retain(|queued| *queued != lease_id);
                 WireResult::Kept
@@ -830,11 +821,6 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
             }
             ExternalLeaseState::SubmissionPending { .. } => {
-                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
-                    return CommandExecution::Complete(WireResult::not_applied(
-                        ErrorCode::ComposerUnavailable,
-                    ));
-                }
                 if expected == replacement {
                     self.leases.remove(&lease_id);
                     self.lease_order.retain(|queued| *queued != lease_id);
@@ -844,11 +830,6 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
             }
             ExternalLeaseState::SubmittedIntact { receipt } => {
-                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
-                    return CommandExecution::Complete(WireResult::not_applied(
-                        ErrorCode::ComposerUnavailable,
-                    ));
-                }
                 if expected == replacement {
                     self.leases.remove(&lease_id);
                     self.lease_order.retain(|queued| *queued != lease_id);
@@ -904,11 +885,6 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 payload,
                 ..
             } => {
-                if target.thread_id().as_deref() != Some(lease.thread_id.as_str()) {
-                    return CommandExecution::Complete(WireResult::not_applied(
-                        ErrorCode::ComposerUnavailable,
-                    ));
-                }
                 if expected != pending_expected || replacement != pending_replacement {
                     return CommandExecution::Complete(WireResult::not_applied(
                         ErrorCode::LeaseUnavailable,
@@ -1018,12 +994,19 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
-    pub(crate) fn invalidate_thread(&mut self, thread_id: &str) {
+    pub(crate) fn note_thread_rolled_back(&mut self, thread_id: &str) {
         self.captures
             .retain(|_, capture| capture.thread_id != thread_id);
         self.capture_order
             .retain(|capture_id| self.captures.contains_key(capture_id));
-        self.leases.retain(|_, lease| lease.thread_id != thread_id);
+        self.leases.retain(|_, lease| {
+            lease.thread_id != thread_id
+                || matches!(
+                    &lease.state,
+                    ExternalLeaseState::SubmittedIntact { .. }
+                        | ExternalLeaseState::CorrectionPending { .. }
+                )
+        });
         self.lease_order
             .retain(|lease_id| self.leases.contains_key(lease_id));
     }
@@ -1558,10 +1541,12 @@ enum WireResult {
     /// acknowledgement was ambiguous. Retry the exact same replacement with this lease; the
     /// retained correction identity makes that retry idempotent.
     CorrectionPending,
+    /// The correction commit was accepted for the originating thread. This does not claim that
+    /// the model has sampled or semantically applied the correction.
+    CorrectionQueued,
     SubmittedIntact,
     Kept,
     Replaced,
-    Corrected,
     Error {
         code: ErrorCode,
         outcome: MutationOutcome,

@@ -180,7 +180,7 @@ fn surviving_client_message_projection_ignores_compaction_and_non_user_turns() {
             previous_window_id: None,
             window_id: None,
         }),
-        turn_started("correction-only-turn"),
+        turn_started("correction-turn"),
     ];
 
     assert_eq!(
@@ -393,24 +393,12 @@ async fn correction_replay_retains_target_anchored_frame_across_unrelated_rollba
     );
     assert_eq!(
         reconstructed.history,
-        vec![initial.clone(), correction.clone(), after_rollback.clone()]
-    );
-    assert_eq!(
-        correction::project_correction_acks(
-            reconstructed.history.clone(),
-            &reconstructed.processed_correction_ids,
-        ),
-        vec![
-            initial,
-            correction,
-            correction::correction_ack_frame(correction_id),
-            after_rollback,
-        ]
+        vec![initial, correction, after_rollback]
     );
 }
 
 #[tokio::test]
-async fn session_clone_history_projects_ack_without_mutating_canonical_history_or_rollout() {
+async fn session_clone_history_keeps_canonical_correction_without_settlement_projection() {
     let (session, turn_context) = make_session_and_context().await;
     let correction_id = Uuid::new_v4();
     let initial = user_message("initial dictated text");
@@ -441,24 +429,9 @@ async fn session_clone_history_projects_ack_without_mutating_canonical_history_o
         canonical.raw_items(),
         &[initial.clone(), correction.clone(), after_rollback.clone()]
     );
-    assert!(
-        rollout_items.iter().all(|item| {
-            !matches!(
-                item,
-                RolloutItem::ResponseItem(response)
-                    if correction::correction_ack_frame_id(response).is_some()
-            )
-        }),
-        "the rollout must never contain a projected acknowledgement"
-    );
     assert_eq!(
         session.clone_history().await.raw_items(),
-        &[
-            initial,
-            correction,
-            correction::correction_ack_frame(correction_id),
-            after_rollback,
-        ]
+        &[initial, correction, after_rollback]
     );
 }
 
@@ -524,7 +497,7 @@ async fn correction_replay_drops_intent_and_frame_when_target_is_rolled_back() {
 }
 
 #[tokio::test]
-async fn correction_appendix_replay_rolls_back_with_target_turn() {
+async fn sampled_correction_prefix_rolls_back_with_target_turn() {
     let (session, turn_context) = make_session_and_context().await;
     let correction_id = Uuid::new_v4();
     let target = user_message("Use Tori for the Rust app.");
@@ -639,14 +612,7 @@ async fn correction_replay_preserves_sampled_proof_across_surviving_compaction()
         reconstructed.processed_correction_ids,
         HashSet::from([correction.id().expect("correction stable id").to_string()])
     );
-    assert_eq!(reconstructed.history, vec![summary.clone()]);
-    assert_eq!(
-        correction::project_correction_acks(
-            reconstructed.history.clone(),
-            &reconstructed.processed_correction_ids,
-        ),
-        vec![summary]
-    );
+    assert_eq!(reconstructed.history, vec![summary]);
 }
 
 #[tokio::test]
@@ -674,34 +640,6 @@ async fn correction_replay_without_sampled_marker_remains_unprocessed_after_abor
         .await;
 
     assert!(reconstructed.processed_correction_ids.is_empty());
-}
-
-#[tokio::test]
-async fn correction_ack_without_sampled_proof_is_removed_from_model_projection() {
-    let (session, turn_context) = make_session_and_context().await;
-    let correction_id = Uuid::new_v4();
-    let user = user_message("dictated text");
-    let correction = correction_message(correction_id, "Tori should be Tauri");
-    let rollout_items = vec![
-        RolloutItem::ResponseItem(user.clone()),
-        completed_client_user_message("turn-1", "target-client-id"),
-        correction_intent(correction_id, "target-client-id", "Tori should be Tauri"),
-        RolloutItem::ResponseItem(correction.clone()),
-        RolloutItem::ResponseItem(correction::correction_ack_frame(correction_id)),
-    ];
-
-    let reconstructed = session
-        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
-
-    assert!(reconstructed.processed_correction_ids.is_empty());
-    assert_eq!(
-        correction::project_correction_acks(
-            reconstructed.history,
-            &reconstructed.processed_correction_ids,
-        ),
-        vec![user, correction]
-    );
 }
 
 #[tokio::test]
@@ -881,117 +819,6 @@ async fn correction_integrity_failure_includes_replacement_history_conflict() {
             .as_deref()
             .is_some_and(|message| message.contains("conflicting reconstructed correction frame"))
     );
-}
-
-#[test]
-fn correction_receipt_replay_is_compaction_independent_and_semantically_idempotent() {
-    let id = Uuid::new_v4();
-    let correction = correction_message(id, "replace parakeat with Parakeet");
-    let rollout_items = vec![
-        RolloutItem::ResponseItem(user_message("dictated text")),
-        RolloutItem::ResponseItem(correction.clone()),
-        RolloutItem::Compacted(CompactedItem {
-            message: "compacted".to_string(),
-            replacement_history: Some(vec![user_message("summary without correction frame")]),
-            window_number: None,
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-        }),
-        RolloutItem::ResponseItem(correction.clone()),
-    ];
-
-    let (receipts, conflicts) =
-        rollout_reconstruction::reconstruct_correction_receipts(&rollout_items);
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts.get(correction.id().unwrap()), Some(&correction));
-    assert!(conflicts.is_empty());
-
-    let mut history_conflicts = HashSet::new();
-    let deduplicated = rollout_reconstruction::deduplicate_correction_frames(
-        vec![correction.clone(), correction],
-        &mut history_conflicts,
-    );
-    assert_eq!(deduplicated.len(), 1);
-    assert!(history_conflicts.is_empty());
-}
-
-#[test]
-fn correction_receipt_replay_conflicts_only_for_surviving_frames() {
-    let id = Uuid::new_v4();
-    let first = correction_message(id, "first payload");
-    let second = correction_message(id, "different payload");
-    let surviving = vec![
-        RolloutItem::ResponseItem(user_message("dictated text")),
-        RolloutItem::ResponseItem(first.clone()),
-        RolloutItem::ResponseItem(second),
-    ];
-    let (_, conflicts) = rollout_reconstruction::reconstruct_correction_receipts(&surviving);
-    assert_eq!(conflicts, HashSet::from([first.id().unwrap().to_string()]));
-
-    let rolled_back = surviving
-        .into_iter()
-        .chain(std::iter::once(RolloutItem::EventMsg(
-            EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
-                num_turns: 1,
-            }),
-        )))
-        .collect::<Vec<_>>();
-    let (receipts, conflicts) =
-        rollout_reconstruction::reconstruct_correction_receipts(&rolled_back);
-    assert!(receipts.is_empty());
-    assert!(conflicts.is_empty());
-}
-
-#[test]
-fn correction_receipt_replay_restores_surviving_segment_after_rollback() {
-    let id = Uuid::new_v4();
-    let correction = correction_message(id, "payload");
-    let rollback = || {
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-        ))
-    };
-    let rollout_items = vec![
-        RolloutItem::ResponseItem(user_message("u1")),
-        RolloutItem::ResponseItem(user_message("u2")),
-        RolloutItem::ResponseItem(correction.clone()),
-        rollback(),
-        RolloutItem::ResponseItem(correction),
-        rollback(),
-    ];
-
-    let (receipts, conflicts) =
-        rollout_reconstruction::reconstruct_correction_receipts(&rollout_items);
-    assert!(receipts.is_empty());
-    assert!(conflicts.is_empty());
-}
-
-#[tokio::test]
-async fn reconstruct_history_rollback_then_reapply_keeps_one_correction_frame_and_receipt() {
-    let (session, turn_context) = make_session_and_context().await;
-    let id = Uuid::new_v4();
-    let correction = correction_message(id, "replace parakeat with Parakeet");
-    let rollout_items = vec![
-        RolloutItem::ResponseItem(user_message("dictated text")),
-        RolloutItem::ResponseItem(correction.clone()),
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-        )),
-        RolloutItem::ResponseItem(correction.clone()),
-    ];
-
-    let reconstructed = session
-        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
-    assert_eq!(reconstructed.history, vec![correction.clone()]);
-    assert_eq!(
-        reconstructed
-            .correction_receipts
-            .get(correction.id().unwrap()),
-        Some(&correction)
-    );
-    assert!(reconstructed.correction_receipt_conflicts.is_empty());
 }
 
 fn inter_agent_assistant_message(text: &str) -> ResponseItem {
@@ -1239,6 +1066,168 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
             realtime_active: Some(turn_context.realtime_active),
         })
     );
+}
+
+#[tokio::test]
+async fn rollback_inside_correction_lifecycle_keeps_sampled_correction_resume_metadata() {
+    let (session, turn_context) = make_session_and_context().await;
+    let seed_context = turn_context.to_turn_context_item();
+    let seed_turn_id = seed_context
+        .turn_id
+        .clone()
+        .expect("seed context should have a turn id");
+    let correction_turn_id = "correction-turn";
+    let correction_context = TurnContextItem {
+        turn_id: Some(correction_turn_id.to_string()),
+        model: "correction-model".to_string(),
+        ..seed_context.clone()
+    };
+    let correction_id = Uuid::new_v4();
+    let correction = correction_message(correction_id, "Tori should be Tauri");
+    let seed_user = user_message("initial dictated text");
+    let seed_assistant = assistant_message("initial reply");
+    let next_user = user_message("next dictated instruction");
+
+    let rollout_items = vec![
+        turn_started(&seed_turn_id),
+        legacy_client_user_message("target-client-id"),
+        RolloutItem::TurnContext(seed_context),
+        RolloutItem::ResponseItem(seed_user.clone()),
+        completed_client_user_message(&seed_turn_id, "target-client-id"),
+        RolloutItem::ResponseItem(seed_assistant.clone()),
+        turn_complete(&seed_turn_id),
+        correction_intent(correction_id, "target-client-id", "Tori should be Tauri"),
+        turn_started(correction_turn_id),
+        RolloutItem::TurnContext(correction_context.clone()),
+        RolloutItem::ResponseItem(correction.clone()),
+        corrections_sampled(&[correction_id]),
+        legacy_client_user_message("next-client-id"),
+        RolloutItem::ResponseItem(next_user),
+        RolloutItem::ResponseItem(assistant_message("next reply")),
+        turn_complete(correction_turn_id),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed.history,
+        vec![seed_user, seed_assistant, correction]
+    );
+    assert_eq!(
+        reconstructed.previous_turn_settings,
+        Some(PreviousTurnSettings {
+            model: "correction-model".to_string(),
+            comp_hash: correction_context.comp_hash.clone(),
+            realtime_active: correction_context.realtime_active,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(reconstructed.reference_context_item)
+            .expect("serialize reconstructed reference context item"),
+        serde_json::to_value(Some(correction_context))
+            .expect("serialize expected correction context item")
+    );
+}
+
+#[tokio::test]
+async fn rollback_inside_one_lifecycle_uses_canonical_user_boundaries_once() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = turn_context.to_turn_context_item();
+    let turn_id = first_context
+        .turn_id
+        .clone()
+        .expect("turn context should have a turn id");
+    let first_user = user_message("first instruction");
+    let first_assistant = assistant_message("first reply");
+    let second_user = user_message("second instruction");
+
+    let rollout_items = vec![
+        turn_started(&turn_id),
+        legacy_client_user_message("first-client-id"),
+        RolloutItem::TurnContext(first_context.clone()),
+        RolloutItem::ResponseItem(first_user.clone()),
+        RolloutItem::ResponseItem(first_assistant.clone()),
+        legacy_client_user_message("second-client-id"),
+        RolloutItem::ResponseItem(second_user.clone()),
+        RolloutItem::Compacted(CompactedItem {
+            message: "rolled-back summary".to_string(),
+            replacement_history: Some(vec![
+                first_user.clone(),
+                first_assistant.clone(),
+                second_user,
+            ]),
+            window_number: Some(99),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::ResponseItem(assistant_message("second reply")),
+        turn_complete(&turn_id),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.history, vec![first_user, first_assistant]);
+    assert_eq!(
+        reconstructed.previous_turn_settings,
+        Some(PreviousTurnSettings {
+            model: first_context.model.clone(),
+            comp_hash: first_context.comp_hash.clone(),
+            realtime_active: first_context.realtime_active,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(reconstructed.reference_context_item)
+            .expect("serialize reconstructed reference context item"),
+        serde_json::to_value(Some(first_context)).expect("serialize expected first context item")
+    );
+    assert_eq!(
+        reconstructed.window_number, 1,
+        "the replacement-history checkpoint from the rolled-back subsegment must not seed resume metadata"
+    );
+}
+
+#[tokio::test]
+async fn rollback_inside_one_lifecycle_removes_each_canonical_user_boundary() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = turn_context.to_turn_context_item();
+    let turn_id = first_context
+        .turn_id
+        .clone()
+        .expect("turn context should have a turn id");
+
+    let rollout_items = vec![
+        turn_started(&turn_id),
+        legacy_client_user_message("first-client-id"),
+        RolloutItem::TurnContext(first_context),
+        RolloutItem::ResponseItem(user_message("first instruction")),
+        RolloutItem::ResponseItem(assistant_message("first reply")),
+        legacy_client_user_message("second-client-id"),
+        RolloutItem::ResponseItem(user_message("second instruction")),
+        RolloutItem::ResponseItem(assistant_message("second reply")),
+        turn_complete(&turn_id),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 2 },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert!(reconstructed.history.is_empty());
+    assert_eq!(reconstructed.previous_turn_settings, None);
+    assert!(reconstructed.reference_context_item.is_none());
 }
 
 #[tokio::test]

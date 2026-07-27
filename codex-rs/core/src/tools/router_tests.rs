@@ -97,14 +97,6 @@ impl ExtensionEchoExecutor {
     }
 }
 
-#[test]
-fn empty_router_exposes_and_executes_no_tools() {
-    let router = ToolRouter::empty();
-
-    assert!(router.model_visible_specs().is_empty());
-    assert!(router.registered_tool_names_for_test().is_empty());
-}
-
 fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>> {
     let mut builder = ExtensionRegistryBuilder::new();
     builder.tool_contributor(Arc::new(ExtensionEchoContributor));

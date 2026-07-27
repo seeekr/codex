@@ -308,46 +308,6 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
 }
 
 #[tokio::test]
-async fn correction_appendix_rejects_unadvertised_tool_call_before_persistence() {
-    let (session, mut turn_context) = make_session_and_context().await;
-    turn_context.correction_appendix = true;
-    let session = Arc::new(session);
-    let turn_context = Arc::new(turn_context);
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let tool_runtime = ToolCallRuntime::new(
-        Arc::new(ToolRouter::empty()),
-        Arc::clone(&session),
-        step_context,
-        tracker,
-    );
-    let mut ctx = HandleOutputCtx {
-        sess: Arc::clone(&session),
-        turn_context: Arc::clone(&turn_context),
-        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
-        tool_runtime,
-        cancellation_token: CancellationToken::new(),
-    };
-    let item = ResponseItem::FunctionCall {
-        id: None,
-        name: "unadvertised_tool".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: "call-1".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    let error = match handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None).await
-    {
-        Ok(_) => panic!("correction appendix must reject tool-shaped output"),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, codex_protocol::error::CodexErr::Fatal(_)));
-    assert!(session.clone_history().await.raw_items().is_empty());
-}
-
-#[tokio::test]
 async fn finalized_turn_item_defers_mailbox_for_contributed_visible_text() {
     let (mut session, turn_context) = make_session_and_context().await;
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
