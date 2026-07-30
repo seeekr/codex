@@ -346,6 +346,36 @@ fn prepare_direct(
     }
 }
 
+fn start_direct(
+    state: &mut ComposerControlState<u64>,
+    target: &mut FakeTarget,
+    lease_id: Uuid,
+    expected: &str,
+) -> (
+    PendingDirectSubmission,
+    std::sync::mpsc::Receiver<WireResult>,
+) {
+    let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let action = state
+        .handle_ui_request(
+            ComposerControlRequest {
+                command: ComposerCommand::Submit {
+                    lease_id,
+                    expected: expected.to_string(),
+                },
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            },
+            target,
+            /*app_overlay_active*/ false,
+        )
+        .expect("exact direct reservation should produce a pending submit action");
+    let PendingComposerControlAction::DirectSubmission(pending) = action else {
+        panic!("direct submit request must not produce another action");
+    };
+    (pending, reply_rx)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DirectReceiptStage {
     Dispatching,
@@ -369,7 +399,7 @@ fn direct_at_stage(
     let mut target = FakeTarget::new("");
     let lease_id = acquire_direct(&mut state, &mut target);
     let prepared = prepare_direct(&mut state, &mut target, lease_id, "dictated");
-    let submission = prepared.submission.clone();
+    let submission = prepared.submission;
     let submission_id = submission.submission_id();
     let mut correction_id = None;
     match stage {
@@ -566,6 +596,29 @@ fn direct_reservation_ignores_unsent_edits_but_binds_thread_and_user_chronology(
             outcome: MutationOutcome::NotApplied,
         })
     ));
+    assert_eq!(
+        chronology_state.execute(
+            ComposerCommand::Verify {
+                lease_id: chronology_lease,
+                expected: "dictated".to_string(),
+            },
+            &mut chronology_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ReservationChanged)
+    );
+    assert_eq!(
+        chronology_state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: chronology_lease,
+                expected: "dictated".to_string(),
+            },
+            &mut chronology_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ReservationChanged),
+        "a pre-dispatch chronology rejection is not a reusable refused submission"
+    );
 }
 
 #[test]
@@ -664,22 +717,94 @@ fn delayed_submit_frozen_acquisition_preserves_arrival_order_and_fails_closed_af
 }
 
 #[test]
-fn direct_acceptance_does_not_invalidate_an_independent_reservation() {
+fn three_consecutive_direct_reservations_survive_prior_koenig_acceptance() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
     let first = acquire_direct(&mut state, &mut target);
     let second = acquire_direct(&mut state, &mut target);
-    let prepared = prepare_direct(&mut state, &mut target, first, "first");
+    let third = acquire_direct(&mut state, &mut target);
+
+    for (lease_id, expected) in [(first, "first"), (second, "second"), (third, "third")] {
+        let (pending, reply_rx) = start_direct(&mut state, &mut target, lease_id, expected);
+        state.finish_direct_submission(pending, SubmissionDispatchOutcome::Accepted);
+        assert_eq!(
+            reply_rx.recv().expect("direct submit response"),
+            WireResult::SendAccepted,
+            "an earlier Koenig acceptance must not invalidate a later Stop-time reservation"
+        );
+    }
+}
+
+#[test]
+fn later_direct_reservations_still_bind_manual_chronology_and_thread_after_acceptance() {
+    let mut chronology_state = ComposerControlState::<u64>::new();
+    let mut chronology_target = FakeTarget::new("");
+    let first = acquire_direct(&mut chronology_state, &mut chronology_target);
+    let second = acquire_direct(&mut chronology_state, &mut chronology_target);
+    let third = acquire_direct(&mut chronology_state, &mut chronology_target);
+    let first_submission = prepare_direct(
+        &mut chronology_state,
+        &mut chronology_target,
+        first,
+        "first",
+    );
     assert_eq!(
-        state.direct_sends.finish_submission(
+        chronology_state.direct_sends.finish_submission(
             first,
-            prepared.submission.submission_id(),
+            first_submission.submission.submission_id(),
             SubmissionDispatchOutcome::Accepted,
         ),
         WireResult::SendAccepted
     );
-    let second_prepared = prepare_direct(&mut state, &mut target, second, "second");
-    assert_eq!(second_prepared.expected, "second");
+    chronology_state.note_user_chronology_change();
+    for (lease_id, expected) in [(second, "second"), (third, "third")] {
+        assert!(matches!(
+            chronology_state.prepare_command(
+                ComposerCommand::Submit {
+                    lease_id,
+                    expected: expected.to_string(),
+                },
+                &mut chronology_target,
+                /*app_overlay_active*/ false,
+            ),
+            CommandExecution::Complete(WireResult::Error {
+                code: ErrorCode::ReservationChanged,
+                outcome: MutationOutcome::NotApplied,
+            })
+        ));
+    }
+
+    let mut thread_state = ComposerControlState::<u64>::new();
+    let mut thread_target = FakeTarget::new("");
+    let first = acquire_direct(&mut thread_state, &mut thread_target);
+    let second = acquire_direct(&mut thread_state, &mut thread_target);
+    let third = acquire_direct(&mut thread_state, &mut thread_target);
+    let first_submission = prepare_direct(&mut thread_state, &mut thread_target, first, "first");
+    assert_eq!(
+        thread_state.direct_sends.finish_submission(
+            first,
+            first_submission.submission.submission_id(),
+            SubmissionDispatchOutcome::Accepted,
+        ),
+        WireResult::SendAccepted
+    );
+    thread_target.thread_id = "different-thread".to_string();
+    for (lease_id, expected) in [(second, "second"), (third, "third")] {
+        assert!(matches!(
+            thread_state.prepare_command(
+                ComposerCommand::Submit {
+                    lease_id,
+                    expected: expected.to_string(),
+                },
+                &mut thread_target,
+                /*app_overlay_active*/ false,
+            ),
+            CommandExecution::Complete(WireResult::Error {
+                code: ErrorCode::ReservationChanged,
+                outcome: MutationOutcome::NotApplied,
+            })
+        ));
+    }
 }
 
 #[test]
@@ -792,7 +917,22 @@ fn direct_unknown_acknowledgement_is_idempotent_and_releases_the_reservation() {
 
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+    assert!(state.direct_sends.contains(lease_id));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -801,7 +941,10 @@ fn direct_unknown_acknowledgement_is_idempotent_and_releases_the_reservation() {
     assert!(!state.direct_sends.contains(lease_id));
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -812,7 +955,10 @@ fn direct_unknown_acknowledgement_is_idempotent_and_releases_the_reservation() {
     state.direct_sends.note_submission_committed(&submission);
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -824,6 +970,75 @@ fn direct_unknown_acknowledgement_is_idempotent_and_releases_the_reservation() {
     let following_submission =
         prepare_direct(&mut state, &mut target, following, "following recording");
     assert_eq!(following_submission.expected, "following recording");
+}
+
+#[test]
+fn direct_dispatching_unknown_acknowledgement_releases_immediately_and_settles_later() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let lease_id = acquire_direct(&mut state, &mut target);
+    let (pending, submit_reply_rx) = start_direct(&mut state, &mut target, lease_id, "dictated");
+    let frozen = state.freeze_acquisition(
+        &target, /*app_overlay_active*/ false, /*nonempty_capture_allowed*/ true,
+    );
+    let (wrong_ack_reply, wrong_ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    let wrong_request = ComposerControlRequest {
+        command: ComposerCommand::AcknowledgeUnknown {
+            lease_id,
+            expected: "different".to_string(),
+        },
+        deadline: Instant::now() + Duration::from_secs(1),
+        reply: wrong_ack_reply,
+    };
+    assert!(
+        state
+            .handle_frozen_acquisition_request(wrong_request, &frozen, /*tainted*/ false)
+            .is_none()
+    );
+    assert_eq!(
+        wrong_ack_reply_rx.recv().expect("mismatch response"),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+    assert!(state.direct_sends.contains(lease_id));
+
+    let (ack_reply, ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    let request = ComposerControlRequest {
+        command: ComposerCommand::AcknowledgeUnknown {
+            lease_id,
+            expected: "dictated".to_string(),
+        },
+        deadline: Instant::now() + Duration::from_secs(1),
+        reply: ack_reply,
+    };
+
+    assert!(
+        state
+            .handle_frozen_acquisition_request(request, &frozen, /*tainted*/ false)
+            .is_none(),
+        "acknowledgement must not wait behind the dispatch it is releasing"
+    );
+    assert_eq!(
+        ack_reply_rx.recv().expect("acknowledgement response"),
+        WireResult::UnknownAcknowledged
+    );
+
+    state.finish_direct_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        submit_reply_rx.recv().expect("original submit response"),
+        WireResult::Unknown
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged,
+        "late dispatch settlement must preserve the acknowledgement tombstone"
+    );
 }
 
 #[test]
@@ -854,7 +1069,10 @@ fn direct_terminal_truth_wins_over_unknown_acknowledgement() {
         }
         assert_eq!(
             state.execute(
-                ComposerCommand::AcknowledgeUnknown { lease_id },
+                ComposerCommand::AcknowledgeUnknown {
+                    lease_id,
+                    expected: "dictated".to_string(),
+                },
                 &mut target,
                 /*app_overlay_active*/ false,
             ),
@@ -868,12 +1086,15 @@ fn direct_terminal_truth_wins_over_unknown_acknowledgement() {
         direct_at_stage(DirectReceiptStage::Dispatching);
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
-        WireResult::Unknown,
-        "a dispatch still in progress has no resolved ambiguity to acknowledge"
+        WireResult::UnknownAcknowledged,
+        "explicit acknowledgement releases a dispatching reservation immediately"
     );
     assert!(state.direct_sends.contains(lease_id));
 }
@@ -968,7 +1189,7 @@ fn direct_submit_latches_exact_bytes_and_never_blindly_redispatches() {
     let mut target = FakeTarget::new("");
     let lease_id = acquire_direct(&mut state, &mut target);
     let prepared = prepare_direct(&mut state, &mut target, lease_id, "dictated");
-    let submission = prepared.submission.clone();
+    let submission = prepared.submission;
     let client_id = submission.client_user_message_id();
 
     assert!(matches!(
@@ -1118,7 +1339,87 @@ fn rollback_does_not_reclassify_a_definitely_rejected_direct_send() {
             &mut target,
             /*app_overlay_active*/ false,
         ),
+        WireResult::Verified,
+        "a definite dispatch refusal leaves the exact reservation reusable for reconciliation"
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Verified,
+        "delayed ambiguity recovery projects the still-exact reservation instead of replaying \
+         the old dispatch error"
+    );
+    state.note_user_chronology_change();
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ReservationChanged)
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ReservationChanged),
+        "an ordinary user admission still invalidates a definitely refused reservation"
+    );
+
+    let mut thread_state = ComposerControlState::<u64>::new();
+    let mut thread_target = FakeTarget::new("");
+    let thread_lease = acquire_direct(&mut thread_state, &mut thread_target);
+    let thread_submission = prepare_direct(
+        &mut thread_state,
+        &mut thread_target,
+        thread_lease,
+        "dictated",
+    );
+    assert_eq!(
+        thread_state.direct_sends.finish_submission(
+            thread_lease,
+            thread_submission.submission.submission_id(),
+            SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+        ),
         WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+    );
+    thread_target.thread_id = "different-thread".to_string();
+    assert_eq!(
+        thread_state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: thread_lease,
+                expected: "dictated".to_string(),
+            },
+            &mut thread_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ReservationChanged),
+        "thread changes still invalidate a definitely refused reservation"
     );
 }
 
@@ -1722,6 +2023,7 @@ fn dispatching_submit_consumes_default_and_custom_queue_bindings() {
     state.finish_submission(
         pending,
         SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+        &mut target,
     );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
@@ -1738,6 +2040,7 @@ fn explicit_submit_refusal_preserves_the_draft_and_consumes_queued_submit_events
     state.finish_submission(
         pending,
         SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+        &mut target,
     );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
@@ -1787,6 +2090,96 @@ fn explicit_submit_refusal_preserves_the_draft_and_consumes_queued_submit_events
         ),
         WireResult::Verified
     ));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Verified,
+        "delayed ambiguity recovery projects the still-exact captured draft instead of replaying \
+         the old dispatch error"
+    );
+    assert!(state.leases.contains_key(&lease_id));
+}
+
+#[test]
+fn pre_dispatch_captured_refusal_is_not_projected_as_verified() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::ExpectedMismatch,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+}
+
+#[test]
+fn captured_refusal_acknowledgement_live_verifies_expected_text_and_ownership() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+        &mut target,
+    );
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+    );
+
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+
+    let edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    state.note_tui_event(&edit);
+    target.user_insert("dict".len(), "x");
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::LeaseUnavailable),
+        "acknowledgement cannot claim verification after the owned range was edited"
+    );
 }
 
 #[test]
@@ -1799,7 +2192,7 @@ fn accepted_submit_consumes_dispatch_window_enter_after_the_draft_is_cleared() {
     target.text.clear();
     target.cursor = 0;
     target.leases.clear();
-    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::SendAccepted
@@ -1823,6 +2216,7 @@ fn dispatch_window_enter_is_consumed_after_an_earlier_buffered_edit() {
     state.finish_submission(
         pending,
         SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+        &mut target,
     );
 
     let edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
@@ -1865,7 +2259,7 @@ fn accepted_submit_is_pending_until_commit_and_retries_observe_stable_state() {
     ));
 
     let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
-    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::SendAccepted
@@ -1919,7 +2313,7 @@ fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
     };
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let fence = pending.fence();
-    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -1927,7 +2321,22 @@ fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
 
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+    assert!(!fence.is_relinquished());
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -1939,7 +2348,10 @@ fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
     assert_eq!(target.text, "dictated");
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -1958,7 +2370,10 @@ fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
     assert_eq!(target.text, "dictated");
     assert_eq!(
         state.execute(
-            ComposerCommand::AcknowledgeUnknown { lease_id },
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
             &mut target,
             /*app_overlay_active*/ false,
         ),
@@ -1977,6 +2392,80 @@ fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
 }
 
 #[test]
+fn captured_dispatching_unknown_acknowledgement_releases_immediately_and_settles_later() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, submit_reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let fence = pending.fence();
+    let frozen = state.freeze_acquisition(
+        &target, /*app_overlay_active*/ false, /*nonempty_capture_allowed*/ false,
+    );
+    let (wrong_ack_reply, wrong_ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    let wrong_request = ComposerControlRequest {
+        command: ComposerCommand::AcknowledgeUnknown {
+            lease_id,
+            expected: "different".to_string(),
+        },
+        deadline: Instant::now() + Duration::from_secs(1),
+        reply: wrong_ack_reply,
+    };
+    assert!(
+        state
+            .handle_frozen_acquisition_request(wrong_request, &frozen, /*tainted*/ false)
+            .is_none()
+    );
+    assert_eq!(
+        wrong_ack_reply_rx.recv().expect("mismatch response"),
+        WireResult::not_applied(ErrorCode::ExpectedMismatch)
+    );
+    assert!(!fence.is_relinquished());
+
+    let (ack_reply, ack_reply_rx) = std::sync::mpsc::sync_channel(1);
+    let request = ComposerControlRequest {
+        command: ComposerCommand::AcknowledgeUnknown {
+            lease_id,
+            expected: "dictated".to_string(),
+        },
+        deadline: Instant::now() + Duration::from_secs(1),
+        reply: ack_reply,
+    };
+
+    assert!(
+        state
+            .handle_frozen_acquisition_request(request, &frozen, /*tainted*/ false)
+            .is_none(),
+        "acknowledgement must not wait behind the dispatch it is releasing"
+    );
+    assert_eq!(
+        ack_reply_rx.recv().expect("acknowledgement response"),
+        WireResult::UnknownAcknowledged
+    );
+    assert!(
+        fence.is_relinquished(),
+        "an accepted late response must not clear the user-visible draft"
+    );
+
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
+    assert_eq!(
+        submit_reply_rx.recv().expect("original submit response"),
+        WireResult::Unknown
+    );
+    assert_eq!(target.text, "dictated");
+    assert!(!state.leases.contains_key(&lease_id));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged,
+        "late dispatch settlement must preserve the acknowledgement tombstone"
+    );
+}
+
+#[test]
 fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
     let (mut pending_state, mut pending_target, pending_lease) = inserted_draft("pending");
     let (pending, reply_rx) = start_submit(
@@ -1987,7 +2476,11 @@ fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
     );
     let pending_submission_id =
         mark_submission_pending(&mut pending_state, &pending_target, &[pending_lease]);
-    pending_state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    pending_state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::Unknown,
+        &mut pending_target,
+    );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -1996,6 +2489,7 @@ fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
         pending_state.execute(
             ComposerCommand::AcknowledgeUnknown {
                 lease_id: pending_lease,
+                expected: "pending".to_string(),
             },
             &mut pending_target,
             /*app_overlay_active*/ false,
@@ -2008,6 +2502,7 @@ fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
         pending_state.execute(
             ComposerCommand::AcknowledgeUnknown {
                 lease_id: pending_lease,
+                expected: "pending".to_string(),
             },
             &mut pending_target,
             /*app_overlay_active*/ false,
@@ -2024,7 +2519,11 @@ fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
     );
     let abandoned_submission_id =
         mark_submission_pending(&mut abandoned_state, &abandoned_target, &[abandoned_lease]);
-    abandoned_state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    abandoned_state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::Unknown,
+        &mut abandoned_target,
+    );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2034,6 +2533,7 @@ fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
         abandoned_state.execute(
             ComposerCommand::AcknowledgeUnknown {
                 lease_id: abandoned_lease,
+                expected: "abandoned".to_string(),
             },
             &mut abandoned_target,
             /*app_overlay_active*/ false,
@@ -2053,7 +2553,11 @@ fn unknown_submit_fences_submit_and_queue_bindings_until_the_user_edits() {
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let fence = pending.fence();
     mark_submission_pending(&mut state, &target, &[lease_id]);
-    state.finish_submission(pending, SubmissionDispatchOutcome::AcceptedButUncommitted);
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::AcceptedButUncommitted,
+        &mut target,
+    );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2152,7 +2656,7 @@ fn unknown_submit_latch_blocks_native_mutation_and_survives_malformed_retries() 
     };
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let fence = pending.fence();
-    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2272,7 +2776,7 @@ fn live_unknown_draft_does_not_block_an_independent_submitted_correction() {
     let unknown_capture = capture(&mut state, &mut target);
     let unknown_lease = insert(&mut state, &mut target, unknown_capture, "second");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, unknown_lease, "second");
-    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2297,7 +2801,7 @@ fn pending_submission_cannot_be_retired_before_commit_truth() {
     let (mut state, mut target, lease_id) = inserted_draft("dictated");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
-    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::SendAccepted
@@ -2433,7 +2937,7 @@ fn rejected_manual_enter_does_not_masquerade_as_an_in_flight_send() {
 fn unrelated_or_rejected_actions_do_not_relinquish_an_unknown_fence() {
     let (mut state, mut target, lease_id) = inserted_draft("dictated");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
-    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2505,7 +3009,7 @@ fn unrelated_or_rejected_actions_do_not_relinquish_an_unknown_fence() {
 fn another_thread_cannot_relinquish_an_unknown_draft_fence() {
     let (mut state, mut target, lease_id) = inserted_draft("dictated");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
-    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown, &mut target);
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -2749,7 +3253,11 @@ fn rollback_survivor_keeps_the_local_clear_fence_until_disposition() {
     let (mut state, mut target, lease_id) = inserted_draft("retained");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "retained");
     let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
-    state.finish_submission(pending, SubmissionDispatchOutcome::AcceptedButUncommitted);
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::AcceptedButUncommitted,
+        &mut target,
+    );
     assert_eq!(
         reply_rx.recv().expect("submit response"),
         WireResult::Unknown
@@ -3596,18 +4104,31 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
         }) if parsed_lease == lease_id && expected == "line\nsubmit"
     ));
 
+    assert!(
+        serde_json::from_value::<WireRequest>(serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "instanceId": instance_id,
+            "op": "acknowledge_unknown",
+            "leaseId": lease_id,
+        }))
+        .is_err(),
+        "acknowledgement must carry the exact text whose ownership it relinquishes"
+    );
+
     let request: WireRequest = serde_json::from_value(serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
         "instanceId": instance_id,
         "op": "acknowledge_unknown",
         "leaseId": lease_id,
+        "expected": "line\nsubmit",
     }))
     .expect("wire request");
     assert!(matches!(
         request.into_command(instance_id),
         Ok(ComposerCommand::AcknowledgeUnknown {
             lease_id: parsed_lease,
-        }) if parsed_lease == lease_id
+            expected,
+        }) if parsed_lease == lease_id && expected == "line\nsubmit"
     ));
 
     assert!(
@@ -3713,6 +4234,7 @@ fn insert_submit_acknowledge_and_replace_can_have_unknown_ui_timeout_effects() {
     };
     let acknowledge_unknown = ComposerCommand::AcknowledgeUnknown {
         lease_id: Uuid::new_v4(),
+        expected: "fast".to_string(),
     };
     let replace = ComposerCommand::Replace {
         lease_id: Uuid::new_v4(),
@@ -3748,6 +4270,7 @@ fn acquire_send_socket_timeout_is_unknown_because_a_reservation_may_exist() {
         ui_reply_timeout_result(
             ComposerCommand::AcknowledgeUnknown {
                 lease_id: Uuid::new_v4(),
+                expected: "fast".to_string(),
             }
             .may_have_effect(),
         ),

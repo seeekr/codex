@@ -112,6 +112,10 @@ impl App {
             .pending_composer_submissions
             .get(&client_id)
             .map(|pending| pending.external_commit.clone());
+        let local_clear_relinquished = external_commit
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|commit| commit.local_clear_relinquished());
         let committed = match external_commit {
             Some(Some(commit)) => self.chat_widget.commit_native_composer_submit(&commit),
             Some(None) => true,
@@ -126,10 +130,12 @@ impl App {
         if committed {
             SubmissionDispatchOutcome::Accepted
         } else {
-            self.chat_widget.add_error_message(
-                "Koenig send was accepted, but the exact draft could not be cleared. Automatic resubmission is disabled."
-                    .to_string(),
-            );
+            if !local_clear_relinquished {
+                self.chat_widget.add_error_message(
+                    "Koenig send was accepted, but the exact draft could not be cleared. Automatic resubmission is disabled."
+                        .to_string(),
+                );
+            }
             SubmissionDispatchOutcome::AcceptedButUncommitted
         }
     }

@@ -529,6 +529,7 @@ enum ComposerCommand {
     },
     AcknowledgeUnknown {
         lease_id: Uuid,
+        expected: String,
     },
     Replace {
         lease_id: Uuid,
@@ -735,6 +736,7 @@ pub(crate) struct ComposerControlState<L> {
     kept_lease_order: VecDeque<Uuid>,
     unknown_acknowledged_leases: HashSet<Uuid>,
     unknown_acknowledged_lease_order: VecDeque<Uuid>,
+    dispatch_acknowledged_leases: HashSet<Uuid>,
     direct_sends: DirectSendReservations,
 }
 
@@ -758,6 +760,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             kept_lease_order: VecDeque::new(),
             unknown_acknowledged_leases: HashSet::new(),
             unknown_acknowledged_lease_order: VecDeque::new(),
+            dispatch_acknowledged_leases: HashSet::new(),
             direct_sends: DirectSendReservations::new(),
         }
     }
@@ -789,18 +792,26 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
-    /// Service only Stop-time acquisition operations while another semantic submit owns the live
-    /// widget. Other operations are returned unchanged for normal serialized processing.
+    /// Service Stop-time acquisitions and explicit relinquishment while another semantic submit
+    /// owns the live widget. Other operations are returned unchanged for normal serialized
+    /// processing.
     pub(crate) fn handle_frozen_acquisition_request(
         &mut self,
         request: ComposerControlRequest,
         frozen: &FrozenComposerAcquisition,
         tainted_by_prior_terminal_input: bool,
     ) -> Option<ComposerControlRequest> {
-        if !matches!(
+        let acquisition = matches!(
             &request.command,
             ComposerCommand::AcquireSend | ComposerCommand::Capture
-        ) {
+        );
+        let dispatch_acknowledgement = match &request.command {
+            ComposerCommand::AcknowledgeUnknown { lease_id, .. } => {
+                self.can_acknowledge_dispatching(*lease_id)
+            }
+            _ => false,
+        };
+        if !acquisition && !dispatch_acknowledgement {
             return Some(request);
         }
         let ComposerControlRequest {
@@ -810,13 +821,16 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         } = request;
         let result = if Instant::now() > deadline {
             WireResult::not_applied(ErrorCode::UiTimeout)
-        } else if tainted_by_prior_terminal_input {
+        } else if acquisition && tainted_by_prior_terminal_input {
             WireResult::not_applied(ErrorCode::SubmissionUnavailable)
         } else {
             match command {
                 ComposerCommand::AcquireSend => self.acquire_send_frozen(frozen),
                 ComposerCommand::Capture => self.capture_frozen(frozen),
-                _ => unreachable!("acquisition operations checked above"),
+                ComposerCommand::AcknowledgeUnknown { lease_id, expected } => self
+                    .acknowledge_dispatching(lease_id, &expected)
+                    .unwrap_or_else(|| WireResult::not_applied(ErrorCode::LeaseUnavailable)),
+                _ => unreachable!("frozen operations checked above"),
             }
         };
         let _ = reply.send(result);
@@ -997,19 +1011,33 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
-    pub(crate) fn finish_submission(
+    pub(crate) fn finish_submission<T>(
         &mut self,
         pending: PendingComposerSubmission<L>,
         outcome: SubmissionDispatchOutcome,
-    ) {
+        target: &mut T,
+    ) where
+        T: ComposerControlTarget<Lease = L>,
+    {
         let result = match outcome {
             SubmissionDispatchOutcome::Accepted => WireResult::SendAccepted,
             SubmissionDispatchOutcome::AcceptedButUncommitted
             | SubmissionDispatchOutcome::Unknown => WireResult::Unknown,
             SubmissionDispatchOutcome::NotApplied(code) => WireResult::not_applied(code),
         };
-        if let Some(lease) = self.leases.get_mut(&pending.lease_id) {
-            let fence = matches!(result, WireResult::Unknown).then_some(pending.fence.clone());
+        if self.dispatch_acknowledged_leases.remove(&pending.lease_id) {
+            let _ = target.keep_owned_text(pending.native);
+            self.remove_lease_unknown_acknowledged(pending.lease_id);
+        } else if let Some(lease) = self.leases.get_mut(&pending.lease_id) {
+            let fence = matches!(
+                &result,
+                WireResult::Unknown
+                    | WireResult::Error {
+                        outcome: MutationOutcome::NotApplied,
+                        ..
+                    }
+            )
+            .then_some(pending.fence.clone());
             lease.submit_attempt = Some(SubmitAttempt::Resolved {
                 result: result.clone(),
                 fence,
@@ -1149,8 +1177,13 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             ComposerCommand::Keep { lease_id } => {
                 CommandExecution::Complete(self.keep(target, app_overlay_active, lease_id))
             }
-            ComposerCommand::AcknowledgeUnknown { lease_id } => {
-                CommandExecution::Complete(self.acknowledge_unknown(target, lease_id))
+            ComposerCommand::AcknowledgeUnknown { lease_id, expected } => {
+                CommandExecution::Complete(self.acknowledge_unknown(
+                    target,
+                    app_overlay_active,
+                    lease_id,
+                    &expected,
+                ))
             }
             ComposerCommand::Replace {
                 lease_id,
@@ -1625,12 +1658,63 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
-    fn acknowledge_unknown<T>(&mut self, target: &mut T, lease_id: Uuid) -> WireResult
+    fn can_acknowledge_dispatching(&self, lease_id: Uuid) -> bool {
+        if self.direct_sends.can_acknowledge_dispatching(lease_id) {
+            return true;
+        }
+        self.leases.get(&lease_id).is_some_and(|lease| {
+            matches!(lease.state, ExternalLeaseState::Draft { .. })
+                && matches!(
+                    lease.submit_attempt,
+                    Some(SubmitAttempt::Dispatching { .. })
+                )
+        })
+    }
+
+    fn acknowledge_dispatching(&mut self, lease_id: Uuid, expected: &str) -> Option<WireResult> {
+        if let Some(result) = self
+            .direct_sends
+            .acknowledge_dispatching(lease_id, expected)
+        {
+            return Some(result);
+        }
+        let (expected_matches, fence) = self.leases.get(&lease_id).and_then(|lease| {
+            if !matches!(lease.state, ExternalLeaseState::Draft { .. }) {
+                return None;
+            }
+            match &lease.submit_attempt {
+                Some(SubmitAttempt::Dispatching { fence }) => {
+                    Some((lease.expected_hash == text_hash(expected), fence.clone()))
+                }
+                _ => None,
+            }
+        })?;
+        if !expected_matches {
+            return Some(WireResult::not_applied(ErrorCode::ExpectedMismatch));
+        }
+        fence.relinquish();
+        self.dispatch_acknowledged_leases.insert(lease_id);
+        Some(WireResult::UnknownAcknowledged)
+    }
+
+    fn acknowledge_unknown<T>(
+        &mut self,
+        target: &mut T,
+        app_overlay_active: bool,
+        lease_id: Uuid,
+        expected: &str,
+    ) -> WireResult
     where
         T: ComposerControlTarget<Lease = L>,
     {
         if self.direct_sends.contains_acknowledgement_id(lease_id) {
-            return self.direct_sends.acknowledge_unknown(lease_id);
+            let current_thread_id = target.thread_id();
+            return self.direct_sends.acknowledge_unknown(
+                lease_id,
+                expected,
+                current_thread_id.as_deref(),
+                self.current_user_chronology_epoch(),
+            );
         }
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
             return if self.unknown_acknowledged_leases.contains(&lease_id) {
@@ -1656,11 +1740,16 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             unreachable!("terminal and pending states checked above")
         };
         match lease.submit_attempt {
-            Some(SubmitAttempt::Dispatching { .. }) => WireResult::Unknown,
+            Some(SubmitAttempt::Dispatching { .. }) => self
+                .acknowledge_dispatching(lease_id, expected)
+                .unwrap_or(WireResult::Unknown),
             Some(SubmitAttempt::Resolved {
                 result: WireResult::Unknown,
                 fence,
             }) => {
+                if lease.expected_hash != text_hash(expected) {
+                    return WireResult::not_applied(ErrorCode::ExpectedMismatch);
+                }
                 if let Some(fence) = fence {
                     fence.relinquish();
                 }
@@ -1671,6 +1760,28 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 self.remove_lease_unknown_acknowledged(lease_id);
                 WireResult::UnknownAcknowledged
             }
+            Some(SubmitAttempt::Resolved {
+                result:
+                    WireResult::Error {
+                        outcome: MutationOutcome::NotApplied,
+                        ..
+                    },
+                fence: Some(_),
+            }) => {
+                if lease.expected_hash != text_hash(expected) {
+                    return WireResult::not_applied(ErrorCode::ExpectedMismatch);
+                }
+                let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                };
+                if lease.thread_id != snapshot.thread_id {
+                    return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+                }
+                match target.verify_owned_text(native, expected) {
+                    Ok(()) => WireResult::Verified,
+                    Err(err) => WireResult::not_applied(map_lease_error(err)),
+                }
+            }
             Some(SubmitAttempt::Resolved { result, .. }) => result,
             None => WireResult::not_applied(ErrorCode::LeaseUnavailable),
         }
@@ -1679,6 +1790,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     fn remove_lease_kept(&mut self, lease_id: Uuid) {
         self.leases.remove(&lease_id);
         self.lease_order.retain(|queued| *queued != lease_id);
+        self.dispatch_acknowledged_leases.remove(&lease_id);
         if self.kept_leases.insert(lease_id) {
             self.kept_lease_order.push_back(lease_id);
         }
@@ -1693,6 +1805,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     fn remove_lease_unknown_acknowledged(&mut self, lease_id: Uuid) {
         self.leases.remove(&lease_id);
         self.lease_order.retain(|queued| *queued != lease_id);
+        self.dispatch_acknowledged_leases.remove(&lease_id);
         if self.unknown_acknowledged_leases.insert(lease_id) {
             self.unknown_acknowledged_lease_order.push_back(lease_id);
         }
@@ -2461,6 +2574,7 @@ enum WireRequest {
         instance_id: Uuid,
         #[serde(rename = "leaseId")]
         lease_id: Uuid,
+        expected: String,
     },
     Replace {
         #[serde(rename = "protocolVersion")]
@@ -2537,11 +2651,15 @@ impl WireRequest {
                 protocol_version,
                 instance_id,
                 lease_id,
-            } => (
-                protocol_version,
-                instance_id,
-                ComposerCommand::AcknowledgeUnknown { lease_id },
-            ),
+                expected,
+            } => {
+                validate_inserted_text(&expected, /*allow_empty*/ false)?;
+                (
+                    protocol_version,
+                    instance_id,
+                    ComposerCommand::AcknowledgeUnknown { lease_id, expected },
+                )
+            }
             Self::Replace {
                 protocol_version,
                 instance_id,

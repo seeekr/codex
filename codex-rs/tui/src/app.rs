@@ -1064,7 +1064,11 @@ impl App {
                     }
                     Err(code) => SubmissionDispatchOutcome::NotApplied(code),
                 };
-                composer_control_state.finish_submission(submission, outcome);
+                composer_control_state.finish_submission(
+                    submission,
+                    outcome,
+                    &mut self.chat_widget,
+                );
             }
             PendingComposerControlAction::DirectSubmission(submission) => {
                 let outcome = match self

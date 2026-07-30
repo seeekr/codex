@@ -61,6 +61,7 @@ struct DirectSendReservation {
     submission_id: Uuid,
     content_hash: Option<[u8; 32]>,
     release_on_settle: bool,
+    acknowledge_unknown_on_settle: bool,
     state: DirectSendState,
 }
 
@@ -133,6 +134,7 @@ impl DirectSendReservations {
                 submission_id: Uuid::new_v4(),
                 content_hash: None,
                 release_on_settle: false,
+                acknowledge_unknown_on_settle: false,
                 state: DirectSendState::Reserved,
             },
         );
@@ -205,17 +207,28 @@ impl DirectSendReservations {
         submission_id: Uuid,
         outcome: SubmissionDispatchOutcome,
     ) -> WireResult {
-        let Some(reservation) = self.reservations.get_mut(&lease_id) else {
+        let Some(existing) = self.reservations.get(&lease_id) else {
             return WireResult::not_applied(ErrorCode::LeaseUnavailable);
         };
+        if !matches!(existing.state, DirectSendState::Dispatching { .. }) {
+            let result = state_wire_result(&existing.state);
+            if existing.acknowledge_unknown_on_settle {
+                self.remove_unknown_acknowledged(lease_id);
+            }
+            return result;
+        }
+        let Some(reservation) = self.reservations.get_mut(&lease_id) else {
+            unreachable!("reservation was checked before mutable dispatch settlement");
+        };
         let DirectSendState::Dispatching { submission } = &reservation.state else {
-            return state_wire_result(&reservation.state);
+            unreachable!("dispatch state was checked before mutable settlement");
         };
         if submission.submission_id() != submission_id {
             return WireResult::not_applied(ErrorCode::ExpectedMismatch);
         }
         let submission = submission.clone();
-        match outcome {
+        let acknowledge_unknown_on_settle = reservation.acknowledge_unknown_on_settle;
+        let result = match outcome {
             SubmissionDispatchOutcome::Accepted => {
                 reservation.state = DirectSendState::SubmissionPending {
                     receipt: direct_receipt(&submission),
@@ -234,11 +247,15 @@ impl DirectSendReservations {
                 let result = WireResult::not_applied(code);
                 reservation.state = DirectSendState::Resolved {
                     result: result.clone(),
-                    submission: None,
+                    submission: Some(submission),
                 };
                 result
             }
+        };
+        if acknowledge_unknown_on_settle {
+            self.remove_unknown_acknowledged(lease_id);
         }
+        result
     }
 
     pub(super) fn verify(
@@ -259,6 +276,22 @@ impl DirectSendReservations {
         }
         match &reservation.state {
             DirectSendState::Reserved => {
+                if current_thread_id == Some(reservation.thread_id.as_str())
+                    && current_user_chronology_epoch == reservation.user_chronology_epoch
+                {
+                    WireResult::Verified
+                } else {
+                    WireResult::not_applied(ErrorCode::ReservationChanged)
+                }
+            }
+            DirectSendState::Resolved {
+                result:
+                    WireResult::Error {
+                        outcome: MutationOutcome::NotApplied,
+                        ..
+                    },
+                submission: Some(_),
+            } => {
                 if current_thread_id == Some(reservation.thread_id.as_str())
                     && current_user_chronology_epoch == reservation.user_chronology_epoch
                 {
@@ -321,7 +354,35 @@ impl DirectSendReservations {
         }
     }
 
-    pub(super) fn acknowledge_unknown(&mut self, lease_id: Uuid) -> WireResult {
+    pub(super) fn can_acknowledge_dispatching(&self, lease_id: Uuid) -> bool {
+        self.reservations.get(&lease_id).is_some_and(|reservation| {
+            matches!(reservation.state, DirectSendState::Dispatching { .. })
+        })
+    }
+
+    pub(super) fn acknowledge_dispatching(
+        &mut self,
+        lease_id: Uuid,
+        expected: &str,
+    ) -> Option<WireResult> {
+        let reservation = self.reservations.get_mut(&lease_id)?;
+        if !matches!(reservation.state, DirectSendState::Dispatching { .. }) {
+            return None;
+        }
+        if reservation.content_hash != Some(text_hash(expected)) {
+            return Some(WireResult::not_applied(ErrorCode::ExpectedMismatch));
+        }
+        reservation.acknowledge_unknown_on_settle = true;
+        Some(WireResult::UnknownAcknowledged)
+    }
+
+    pub(super) fn acknowledge_unknown(
+        &mut self,
+        lease_id: Uuid,
+        expected: &str,
+        current_thread_id: Option<&str>,
+        current_user_chronology_epoch: u64,
+    ) -> WireResult {
         let Some(state) = self
             .reservations
             .get(&lease_id)
@@ -334,12 +395,43 @@ impl DirectSendReservations {
             };
         };
         match state {
+            DirectSendState::Dispatching { .. } => self
+                .acknowledge_dispatching(lease_id, expected)
+                .unwrap_or(WireResult::Unknown),
             DirectSendState::Resolved {
                 result: WireResult::Unknown,
                 ..
             } => {
+                let Some(reservation) = self.reservations.get(&lease_id) else {
+                    return WireResult::not_applied(ErrorCode::LeaseUnavailable);
+                };
+                if reservation.content_hash != Some(text_hash(expected)) {
+                    return WireResult::not_applied(ErrorCode::ExpectedMismatch);
+                }
                 self.remove_unknown_acknowledged(lease_id);
                 WireResult::UnknownAcknowledged
+            }
+            DirectSendState::Resolved {
+                result:
+                    WireResult::Error {
+                        outcome: MutationOutcome::NotApplied,
+                        ..
+                    },
+                submission: Some(_),
+            } => {
+                let Some(reservation) = self.reservations.get(&lease_id) else {
+                    return WireResult::not_applied(ErrorCode::LeaseUnavailable);
+                };
+                if reservation.content_hash != Some(text_hash(expected)) {
+                    return WireResult::not_applied(ErrorCode::ExpectedMismatch);
+                }
+                if current_thread_id == Some(reservation.thread_id.as_str())
+                    && current_user_chronology_epoch == reservation.user_chronology_epoch
+                {
+                    WireResult::Verified
+                } else {
+                    WireResult::not_applied(ErrorCode::ReservationChanged)
+                }
             }
             state => state_wire_result(&state),
         }
