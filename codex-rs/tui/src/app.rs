@@ -267,6 +267,25 @@ enum DeferredTuiEvent {
     StreamClosed,
 }
 
+/// Preserve observed order while submission dispatch prevents immediate event handling.
+enum DeferredSubmissionEvent {
+    ComposerControl(crate::composer_control::ComposerControlRequest),
+    Tui(DeferredTuiEvent),
+}
+
+fn defer_submission_event(
+    deferred: &mut VecDeque<DeferredSubmissionEvent>,
+    event: DeferredSubmissionEvent,
+) {
+    deferred.push_back(event);
+}
+
+fn pop_deferred_submission_event(
+    deferred: &mut VecDeque<DeferredSubmissionEvent>,
+) -> Option<DeferredSubmissionEvent> {
+    deferred.pop_front()
+}
+
 enum SubmissionWaitEvent {
     Tui(Option<TuiEvent>),
     ComposerControl(crate::composer_control::ComposerControlRequest),
@@ -323,15 +342,6 @@ async fn drain_ready_terminal_events(
         }
     }
     ready
-}
-
-fn pop_deferred_tui_event(
-    deferred: &mut VecDeque<DeferredTuiEvent>,
-) -> Option<Option<DeferredTuiEvent>> {
-    deferred.pop_front().map(|event| match event {
-        DeferredTuiEvent::StreamClosed => None,
-        event @ DeferredTuiEvent::Event { .. } => Some(event),
-    })
 }
 
 enum ThreadInteractiveRequest {
@@ -949,8 +959,7 @@ impl App {
         composer_control_rx: &mut mpsc::UnboundedReceiver<
             crate::composer_control::ComposerControlRequest,
         >,
-        deferred_composer_requests: &mut VecDeque<crate::composer_control::ComposerControlRequest>,
-        deferred_tui_events: &mut VecDeque<DeferredTuiEvent>,
+        deferred_submission_events: &mut VecDeque<DeferredSubmissionEvent>,
         tui_events: &mut TuiEventReaderHandle,
     ) {
         let app_overlay_active = self.overlay.is_some();
@@ -1014,22 +1023,32 @@ impl App {
                                             frozen_tainted,
                                         )
                                     {
-                                        deferred_composer_requests.push_back(request);
+                                        defer_submission_event(
+                                            deferred_submission_events,
+                                            DeferredSubmissionEvent::ComposerControl(request),
+                                        );
                                     }
                                 }
                                 SubmissionWaitEvent::Tui(event) => {
                                     let Some(event) = event else {
-                                        deferred_tui_events
-                                            .push_back(DeferredTuiEvent::StreamClosed);
+                                        defer_submission_event(
+                                            deferred_submission_events,
+                                            DeferredSubmissionEvent::Tui(
+                                                DeferredTuiEvent::StreamClosed,
+                                            ),
+                                        );
                                         break dispatch.await;
                                     };
                                     if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
                                         frozen_tainted = true;
                                     }
-                                    deferred_tui_events.push_back(DeferredTuiEvent::Event {
-                                        event,
-                                        submission_fence: Some(submission_fence.clone()),
-                                    });
+                                    defer_submission_event(
+                                        deferred_submission_events,
+                                        DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
+                                            event,
+                                            submission_fence: Some(submission_fence.clone()),
+                                        }),
+                                    );
                                 }
                                 SubmissionWaitEvent::Dispatch(outcome) => break outcome,
                             }
@@ -1077,22 +1096,32 @@ impl App {
                                             frozen_tainted,
                                         )
                                     {
-                                        deferred_composer_requests.push_back(request);
+                                        defer_submission_event(
+                                            deferred_submission_events,
+                                            DeferredSubmissionEvent::ComposerControl(request),
+                                        );
                                     }
                                 }
                                 SubmissionWaitEvent::Tui(event) => {
                                     let Some(event) = event else {
-                                        deferred_tui_events
-                                            .push_back(DeferredTuiEvent::StreamClosed);
+                                        defer_submission_event(
+                                            deferred_submission_events,
+                                            DeferredSubmissionEvent::Tui(
+                                                DeferredTuiEvent::StreamClosed,
+                                            ),
+                                        );
                                         break dispatch.await;
                                     };
                                     if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
                                         frozen_tainted = true;
                                     }
-                                    deferred_tui_events.push_back(DeferredTuiEvent::Event {
-                                        event,
-                                        submission_fence: None,
-                                    });
+                                    defer_submission_event(
+                                        deferred_submission_events,
+                                        DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
+                                            event,
+                                            submission_fence: None,
+                                        }),
+                                    );
                                 }
                                 SubmissionWaitEvent::Dispatch(outcome) => break outcome,
                             }
@@ -1504,8 +1533,7 @@ See the Codex keymap documentation for supported actions and examples."
             crate::composer_control::NativeComposerControlState::with_user_chronology_epoch(
                 Arc::clone(&app.composer_user_chronology_epoch),
             );
-        let mut deferred_composer_requests = VecDeque::new();
-        let mut deferred_tui_events = VecDeque::new();
+        let mut deferred_submission_events = VecDeque::new();
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
@@ -1534,31 +1562,41 @@ See the Codex keymap documentation for supported actions and examples."
             Ok(exit_reason)
         } else {
             loop {
-                let control = if let Some(request) = deferred_composer_requests.pop_front() {
-                    app.handle_composer_control_request(
-                        &mut app_server,
-                        &mut composer_control_state,
-                        request,
-                        &composer_correction_tx,
-                        &mut composer_control_rx,
-                        &mut deferred_composer_requests,
-                        &mut deferred_tui_events,
-                        &mut tui_events,
-                    )
-                    .await;
-                    AppRunControl::Continue
-                } else if let Some(event) = pop_deferred_tui_event(&mut deferred_tui_events) {
-                    match app
-                        .handle_composer_tui_event(
-                            tui,
-                            &mut app_server,
-                            &mut composer_control_state,
-                            event,
-                        )
-                        .await
-                    {
-                        Ok(control) => control,
-                        Err(err) => break Err(err),
+                let control = if let Some(event) =
+                    pop_deferred_submission_event(&mut deferred_submission_events)
+                {
+                    match event {
+                        DeferredSubmissionEvent::ComposerControl(request) => {
+                            app.handle_composer_control_request(
+                                &mut app_server,
+                                &mut composer_control_state,
+                                request,
+                                &composer_correction_tx,
+                                &mut composer_control_rx,
+                                &mut deferred_submission_events,
+                                &mut tui_events,
+                            )
+                            .await;
+                            AppRunControl::Continue
+                        }
+                        DeferredSubmissionEvent::Tui(event) => {
+                            let event = match event {
+                                DeferredTuiEvent::StreamClosed => None,
+                                event @ DeferredTuiEvent::Event { .. } => Some(event),
+                            };
+                            match app
+                                .handle_composer_tui_event(
+                                    tui,
+                                    &mut app_server,
+                                    &mut composer_control_state,
+                                    event,
+                                )
+                                .await
+                            {
+                                Ok(control) => control,
+                                Err(err) => break Err(err),
+                            }
+                        }
                     }
                 } else {
                     select! {
@@ -1606,8 +1644,7 @@ See the Codex keymap documentation for supported actions and examples."
                                 request,
                                 &composer_correction_tx,
                                 &mut composer_control_rx,
-                                &mut deferred_composer_requests,
-                                &mut deferred_tui_events,
+                                &mut deferred_submission_events,
                                 &mut tui_events,
                             )
                             .await;

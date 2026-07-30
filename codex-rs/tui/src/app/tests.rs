@@ -6457,35 +6457,72 @@ async fn side_backtrack_rejection_reports_unavailable_message_snapshot() {
 }
 
 #[test]
-fn deferred_tui_events_preserve_fifo_and_stream_close_after_buffered_input() {
-    let mut deferred = VecDeque::from([
-        DeferredTuiEvent::Event {
-            event: TuiEvent::Draw,
+fn deferred_submission_events_preserve_both_cross_source_interleavings() {
+    let mut tui_then_control = VecDeque::new();
+    defer_submission_event(
+        &mut tui_then_control,
+        DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
+            event: TuiEvent::Paste("terminal first".to_string()),
             submission_fence: None,
-        },
-        DeferredTuiEvent::Event {
-            event: TuiEvent::Paste("typed before dispatch completed".to_string()),
-            submission_fence: None,
-        },
-        DeferredTuiEvent::StreamClosed,
-    ]);
-
+        }),
+    );
+    defer_submission_event(
+        &mut tui_then_control,
+        DeferredSubmissionEvent::ComposerControl(
+            crate::composer_control::ComposerControlRequest::keep_for_test(
+                Instant::now() + Duration::from_secs(1),
+            ),
+        ),
+    );
     assert!(matches!(
-        pop_deferred_tui_event(&mut deferred),
-        Some(Some(DeferredTuiEvent::Event {
-            event: TuiEvent::Draw,
-            ..
-        }))
-    ));
-    assert!(matches!(
-        pop_deferred_tui_event(&mut deferred),
-        Some(Some(DeferredTuiEvent::Event {
+        pop_deferred_submission_event(&mut tui_then_control),
+        Some(DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
             event: TuiEvent::Paste(text),
             ..
-        })) if text == "typed before dispatch completed"
+        })) if text == "terminal first"
     ));
-    assert!(matches!(pop_deferred_tui_event(&mut deferred), Some(None)));
-    assert!(pop_deferred_tui_event(&mut deferred).is_none());
+    assert!(matches!(
+        pop_deferred_submission_event(&mut tui_then_control),
+        Some(DeferredSubmissionEvent::ComposerControl(_))
+    ));
+    assert!(pop_deferred_submission_event(&mut tui_then_control).is_none());
+
+    let mut control_then_tui = VecDeque::new();
+    defer_submission_event(
+        &mut control_then_tui,
+        DeferredSubmissionEvent::ComposerControl(
+            crate::composer_control::ComposerControlRequest::keep_for_test(
+                Instant::now() + Duration::from_secs(1),
+            ),
+        ),
+    );
+    defer_submission_event(
+        &mut control_then_tui,
+        DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
+            event: TuiEvent::Paste("control first".to_string()),
+            submission_fence: None,
+        }),
+    );
+    defer_submission_event(
+        &mut control_then_tui,
+        DeferredSubmissionEvent::Tui(DeferredTuiEvent::StreamClosed),
+    );
+    assert!(matches!(
+        pop_deferred_submission_event(&mut control_then_tui),
+        Some(DeferredSubmissionEvent::ComposerControl(_))
+    ));
+    assert!(matches!(
+        pop_deferred_submission_event(&mut control_then_tui),
+        Some(DeferredSubmissionEvent::Tui(DeferredTuiEvent::Event {
+            event: TuiEvent::Paste(text),
+            ..
+        })) if text == "control first"
+    ));
+    assert!(matches!(
+        pop_deferred_submission_event(&mut control_then_tui),
+        Some(DeferredSubmissionEvent::Tui(DeferredTuiEvent::StreamClosed))
+    ));
+    assert!(pop_deferred_submission_event(&mut control_then_tui).is_none());
 }
 
 #[tokio::test]

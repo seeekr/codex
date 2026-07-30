@@ -355,6 +355,17 @@ impl ComposerControlRequest {
             reply,
         }
     }
+
+    pub(crate) fn keep_for_test(deadline: Instant) -> Self {
+        let (reply, _reply_rx) = std::sync::mpsc::sync_channel(1);
+        Self {
+            command: ComposerCommand::Keep {
+                lease_id: Uuid::new_v4(),
+            },
+            deadline,
+            reply,
+        }
+    }
 }
 
 /// Correction ready for the async app-server acknowledgement boundary.
