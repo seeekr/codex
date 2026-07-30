@@ -10,12 +10,14 @@ use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 
 pub(super) async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    let (mut chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
+    let composer_user_chronology_epoch = Arc::new(AtomicU64::new(0));
+    chat_widget.set_user_chronology_epoch(Arc::clone(&composer_user_chronology_epoch));
     App {
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
@@ -57,6 +59,7 @@ pub(super) async fn make_test_app() -> App {
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
         active_thread_id: None,
+        composer_user_chronology_epoch,
         active_thread_rx: None,
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,

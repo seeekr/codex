@@ -20,7 +20,7 @@ use crate::composer_control::SubmitFence;
 pub(crate) struct PreparedNativeComposerSubmit {
     op: AppCommand,
     submission: NativeComposerSubmission,
-    commit: Arc<NativeComposerCommit>,
+    commit: Option<Arc<NativeComposerCommit>>,
 }
 
 /// Exact local composer commit retained across an ambiguous app-server acknowledgement.
@@ -53,12 +53,34 @@ impl PreparedNativeComposerSubmit {
         &self.submission
     }
 
-    pub(crate) fn commit(&self) -> Arc<NativeComposerCommit> {
-        Arc::clone(&self.commit)
+    pub(crate) fn commit(&self) -> Option<Arc<NativeComposerCommit>> {
+        self.commit.as_ref().map(Arc::clone)
     }
 }
 
 impl ChatWidget {
+    fn koenig_composer_submission_available(&self) -> bool {
+        self.composer_control_available()
+            && self.is_session_configured()
+            && !self.is_plan_streaming_in_tui()
+            && !self.input_queue.suppress_queue_autosend
+            && !self.only_user_shell_commands_running()
+    }
+
+    pub(crate) fn direct_send_acquisition_available(&self) -> bool {
+        self.koenig_composer_submission_available()
+            && self.bottom_pane.composer_is_strict_plain_empty()
+    }
+
+    pub(crate) fn plain_draft_send_acquisition_available(&self) -> bool {
+        if !self.koenig_composer_submission_available() {
+            return false;
+        }
+        self.bottom_pane
+            .composer_strict_plain_submission_text()
+            .is_some_and(|text| !self.plain_text_resolves_rich_mentions(&text))
+    }
+
     pub(crate) fn prepare_native_composer_submit(
         &self,
         native: ComposerLeaseId,
@@ -66,12 +88,7 @@ impl ChatWidget {
         fence: SubmitFence,
     ) -> Result<PreparedNativeComposerSubmit, ErrorCode> {
         let thread_id = self.thread_id.ok_or(ErrorCode::ComposerUnavailable)?;
-        if !self.composer_control_available()
-            || !self.is_session_configured()
-            || self.is_plan_streaming_in_tui()
-            || self.input_queue.suppress_queue_autosend
-            || self.only_user_shell_commands_running()
-        {
+        if !self.koenig_composer_submission_available() {
             return Err(ErrorCode::SubmissionUnavailable);
         }
         let preview = self
@@ -94,8 +111,52 @@ impl ChatWidget {
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
         };
+        let (op, items) = self.prepare_koenig_user_turn(&user_message.text, submission.clone())?;
+        let commit = Arc::new(NativeComposerCommit {
+            preview,
+            native,
+            expected: expected.to_string(),
+            user_message,
+            render_in_history: !self.turn_lifecycle.agent_turn_running,
+            pending_steer_compare_key: Self::pending_steer_compare_key_from_items(&items),
+            submission: submission.clone(),
+            fence,
+        });
+        Ok(PreparedNativeComposerSubmit {
+            op,
+            submission,
+            commit: Some(commit),
+        })
+    }
+
+    pub(crate) fn prepare_reserved_send(
+        &self,
+        submission: NativeComposerSubmission,
+        text: &str,
+    ) -> Result<PreparedNativeComposerSubmit, ErrorCode> {
+        let thread_id = self.thread_id.ok_or(ErrorCode::ComposerUnavailable)?;
+        if submission.thread_id() != thread_id.to_string()
+            || !submission.is_direct()
+            || submission.submitted_text() != text
+            || !self.is_session_configured()
+        {
+            return Err(ErrorCode::SubmissionUnavailable);
+        }
+        let (op, _) = self.prepare_koenig_user_turn(text, submission.clone())?;
+        Ok(PreparedNativeComposerSubmit {
+            op,
+            submission,
+            commit: None,
+        })
+    }
+
+    fn prepare_koenig_user_turn(
+        &self,
+        text: &str,
+        submission: NativeComposerSubmission,
+    ) -> Result<(AppCommand, Vec<UserInput>), ErrorCode> {
         let mut items = vec![UserInput::Text {
-            text: user_message.text.clone(),
+            text: text.to_string(),
             text_elements: Vec::new(),
         }];
         if self.ide_context.is_enabled()
@@ -133,22 +194,8 @@ impl ChatWidget {
             collaboration_mode,
             personality,
         )
-        .with_composer_submission(Some(submission.clone()));
-        let commit = Arc::new(NativeComposerCommit {
-            preview,
-            native,
-            expected: expected.to_string(),
-            user_message,
-            render_in_history: !self.turn_lifecycle.agent_turn_running,
-            pending_steer_compare_key: Self::pending_steer_compare_key_from_items(&items),
-            submission: submission.clone(),
-            fence,
-        });
-        Ok(PreparedNativeComposerSubmit {
-            op,
-            submission,
-            commit,
-        })
+        .with_composer_submission(Some(submission));
+        Ok((op, items))
     }
 
     fn plain_text_resolves_rich_mentions(&self, text: &str) -> bool {
@@ -182,6 +229,8 @@ impl ChatWidget {
         self.set_status_header(String::from("Working"));
         self.append_message_history_entry(commit.user_message.text.clone());
         if commit.render_in_history {
+            self.locally_rendered_composer_submission_ids
+                .insert(commit.submission.client_user_message_id());
             self.input_queue.user_turn_pending_start = true;
             self.record_cancel_edit_candidate(commit.user_message.clone());
             self.on_user_message_display(user_message_display_for_history(

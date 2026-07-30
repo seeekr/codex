@@ -138,6 +138,16 @@ impl ChatWidget {
         pending_pastes: Vec<(String, String)>,
         composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
     ) {
+        let chronology_noted = if action == QueuedInputAction::Plain {
+            self.ensure_user_chronology_noted(
+                &user_message,
+                composer_submission.as_ref(),
+                /*chronology_noted*/ false,
+                ShellEscapePolicy::Allow,
+            )
+        } else {
+            false
+        };
         if !self.is_session_configured()
             || self.is_user_turn_pending_or_running()
             || self.input_queue.suppress_queue_autosend
@@ -149,13 +159,18 @@ impl ChatWidget {
                     action,
                     pending_pastes,
                     composer_submission,
+                    chronology_noted,
                 });
             self.input_queue
                 .queued_user_message_history_records
                 .push_back(UserMessageHistoryRecord::UserMessageText);
             self.refresh_pending_input_preview();
         } else {
-            self.submit_user_message_with_composer_submission(user_message, composer_submission);
+            self.submit_user_message_with_composer_submission_and_chronology(
+                user_message,
+                composer_submission,
+                chronology_noted,
+            );
         }
     }
 
@@ -174,12 +189,14 @@ impl ChatWidget {
             };
             match queued_message.action {
                 QueuedInputAction::Plain => {
-                    let (user_message, composer_submission) = queued_message.into_submission();
+                    let (user_message, composer_submission, chronology_noted) =
+                        queued_message.into_submission();
                     submitted_follow_up = self
-                        .submit_user_message_with_history_record_and_composer_submission(
+                        .submit_user_message_with_history_record_composer_submission_and_chronology(
                             user_message,
                             history_record,
                             composer_submission,
+                            chronology_noted,
                         );
                     break;
                 }
@@ -191,7 +208,7 @@ impl ChatWidget {
                     }
                 }
                 QueuedInputAction::RunShell => {
-                    let drain = self.submit_queued_shell_prompt(queued_message.into_user_message());
+                    let drain = self.submit_queued_shell_prompt(queued_message);
                     if drain == QueueDrain::Stop {
                         submitted_follow_up = self.is_user_turn_pending_or_running();
                         break;

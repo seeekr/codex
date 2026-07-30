@@ -110,6 +110,7 @@ impl ChatWidget {
                     action: QueuedInputAction::Plain,
                     pending_pastes: Vec::new(),
                     composer_submission,
+                    chronology_noted: true,
                 },
                 history_record,
             ))
@@ -157,6 +158,7 @@ impl ChatWidget {
             );
             return false;
         };
+        let chronology_noted = pending_steer.composer_submission.is_none();
         self.input_queue
             .rejected_steers_queue
             .push_back(QueuedUserMessage {
@@ -164,6 +166,7 @@ impl ChatWidget {
                 action: QueuedInputAction::Plain,
                 pending_pastes: Vec::new(),
                 composer_submission: pending_steer.composer_submission,
+                chronology_noted,
             });
         self.input_queue
             .rejected_steer_history_records
@@ -222,10 +225,11 @@ impl ChatWidget {
                     remapped_source_texts.into_iter().zip(submissions),
                     &user_message.text,
                 );
-                self.submit_user_message_with_history_record_and_composer_submission(
+                self.submit_user_message_with_history_record_composer_submission_and_chronology(
                     user_message,
                     history_record,
                     composer_submission,
+                    /*chronology_noted*/ true,
                 );
             } else if let Some(combined) = self.drain_pending_messages_for_restore() {
                 self.restore_composer_state(combined);

@@ -238,6 +238,7 @@ impl ChatWidget {
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
         self.last_rendered_user_message_display = None;
+        self.locally_rendered_composer_submission_ids.clear();
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;

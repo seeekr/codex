@@ -1371,6 +1371,14 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn composer_is_strict_plain_empty(&self) -> bool {
+        self.composer.is_strict_plain_empty()
+    }
+
+    pub(crate) fn composer_strict_plain_submission_text(&self) -> Option<String> {
+        self.composer.strict_plain_submission_text()
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()

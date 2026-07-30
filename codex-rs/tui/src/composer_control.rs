@@ -12,6 +12,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
@@ -37,6 +38,12 @@ use crate::bottom_pane::SubmittedComposerLease;
 use crate::chatwidget::ChatWidget;
 use crate::tui::TuiEvent;
 
+mod direct_send;
+
+use self::direct_send::DirectPreparedSubmission;
+use self::direct_send::DirectReplaceOutcome;
+use self::direct_send::DirectSendReservations;
+
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_CAPTURE_COUNT: usize = 64;
 const MAX_LEASE_COUNT: usize = 256;
@@ -56,6 +63,19 @@ pub(crate) struct ComposerSnapshot {
     thread_id: String,
     text: String,
     cursor: usize,
+}
+
+/// Content-opaque composer state frozen before a bounded semantic submit begins.
+///
+/// Terminal events are deferred while the submit is in flight. Acquire/capture requests that
+/// arrive first can therefore be answered against this exact snapshot without borrowing the
+/// live widget from the dispatch future.
+pub(crate) struct FrozenComposerAcquisition {
+    snapshot: Option<ComposerSnapshot>,
+    direct_send_available: bool,
+    plain_draft_send_available: bool,
+    input_epoch: u64,
+    nonempty_capture_allowed: bool,
 }
 
 impl ComposerSnapshot {
@@ -78,6 +98,7 @@ pub(crate) struct NativeComposerSubmission {
     thread_id: String,
     submitted_text: Arc<str>,
     leases: Vec<NativeSubmittedLease>,
+    direct_lease_id: Option<Uuid>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -94,6 +115,7 @@ impl fmt::Debug for NativeComposerSubmission {
             .field("thread_id", &self.thread_id)
             .field("submitted_text_bytes", &self.submitted_text.len())
             .field("lease_count", &self.leases.len())
+            .field("direct", &self.direct_lease_id.is_some())
             .finish()
     }
 }
@@ -120,7 +142,23 @@ impl NativeComposerSubmission {
             thread_id,
             submitted_text: Arc::from(submitted_text),
             leases,
+            direct_lease_id: None,
         })
+    }
+
+    pub(crate) fn new_direct(
+        submission_id: Uuid,
+        lease_id: Uuid,
+        thread_id: String,
+        submitted_text: &str,
+    ) -> Self {
+        Self {
+            submission_id,
+            thread_id,
+            submitted_text: Arc::from(submitted_text),
+            leases: Vec::new(),
+            direct_lease_id: Some(lease_id),
+        }
     }
 
     pub(crate) fn client_user_message_id(&self) -> String {
@@ -165,6 +203,9 @@ impl NativeComposerSubmission {
                 return None;
             }
             if let Some(submission) = submission {
+                if submission.direct_lease_id.is_some() {
+                    return None;
+                }
                 match thread_id.as_deref() {
                     None => thread_id = Some(submission.thread_id.clone()),
                     Some(existing) if existing == submission.thread_id => {}
@@ -188,6 +229,7 @@ impl NativeComposerSubmission {
             thread_id,
             submitted_text: Arc::from(merged_text),
             leases,
+            direct_lease_id: None,
         })
     }
 
@@ -201,6 +243,18 @@ impl NativeComposerSubmission {
 
     fn submitted_leases(&self) -> &[NativeSubmittedLease] {
         &self.leases
+    }
+
+    pub(crate) fn is_direct(&self) -> bool {
+        self.direct_lease_id.is_some()
+    }
+
+    pub(crate) fn submitted_text(&self) -> &str {
+        &self.submitted_text
+    }
+
+    fn direct_lease_id(&self) -> Option<Uuid> {
+        self.direct_lease_id
     }
 }
 
@@ -222,6 +276,8 @@ pub(crate) trait ComposerControlTarget {
         expected: &str,
         replacement: &str,
     ) -> Result<(), ComposerLeaseError>;
+    fn direct_send_acquisition_available(&self) -> bool;
+    fn plain_draft_send_acquisition_available(&self) -> bool;
     fn is_submission_event(&self, event: &TuiEvent) -> bool;
 }
 
@@ -268,6 +324,14 @@ impl ComposerControlTarget for ChatWidget {
         self.replace_composer_owned_text(lease, expected, replacement)
     }
 
+    fn direct_send_acquisition_available(&self) -> bool {
+        self.direct_send_acquisition_available()
+    }
+
+    fn plain_draft_send_acquisition_available(&self) -> bool {
+        self.plain_draft_send_acquisition_available()
+    }
+
     fn is_submission_event(&self, event: &TuiEvent) -> bool {
         self.is_composer_submission_event(event)
     }
@@ -281,12 +345,25 @@ pub(crate) struct ComposerControlRequest {
     reply: SyncSender<WireResult>,
 }
 
+#[cfg(test)]
+impl ComposerControlRequest {
+    pub(crate) fn acquire_send_for_test(deadline: Instant) -> Self {
+        let (reply, _reply_rx) = std::sync::mpsc::sync_channel(1);
+        Self {
+            command: ComposerCommand::AcquireSend,
+            deadline,
+            reply,
+        }
+    }
+}
+
 /// Correction ready for the async app-server acknowledgement boundary.
 ///
 /// This type carries transcript-derived context and therefore deliberately has no `Debug`
 /// implementation.
 pub(crate) struct PendingComposerCorrection {
     lease_id: Uuid,
+    origin: CorrectionOrigin,
     thread_id: String,
     correction_id: Uuid,
     expected_client_user_message_id: String,
@@ -320,9 +397,31 @@ impl<L: Copy> PendingComposerSubmission<L> {
     }
 }
 
+/// One direct reservation submission awaiting the bounded app-server acceptance boundary.
+///
+/// Transcript text is intentionally retained only in memory and this type has no `Debug`
+/// implementation.
+pub(crate) struct PendingDirectSubmission {
+    reservation_id: Uuid,
+    submission: NativeComposerSubmission,
+    expected: String,
+    reply: SyncSender<WireResult>,
+}
+
+impl PendingDirectSubmission {
+    pub(crate) fn submission(&self) -> &NativeComposerSubmission {
+        &self.submission
+    }
+
+    pub(crate) fn expected(&self) -> &str {
+        &self.expected
+    }
+}
+
 pub(crate) enum PendingComposerControlAction<L> {
     Correction(PendingComposerCorrection),
     Submission(PendingComposerSubmission<L>),
+    DirectSubmission(PendingDirectSubmission),
 }
 
 impl PendingComposerCorrection {
@@ -400,6 +499,7 @@ pub(crate) enum TuiEventDisposition {
 
 /// Transcript-bearing command. Do not derive or implement `Debug`.
 enum ComposerCommand {
+    AcquireSend,
     Capture,
     Insert {
         capture_id: Uuid,
@@ -425,16 +525,24 @@ enum ComposerCommand {
 
 struct PreparedCorrection {
     lease_id: Uuid,
+    origin: CorrectionOrigin,
     thread_id: String,
     correction_id: Uuid,
     expected_client_user_message_id: String,
     payload: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CorrectionOrigin {
+    Composer,
+    Direct,
+}
+
 enum CommandExecution<L> {
     Complete(WireResult),
     Correct(PreparedCorrection),
     Submit(PreparedSubmission<L>),
+    SubmitDirect(DirectPreparedSubmission),
 }
 
 struct PreparedSubmission<L> {
@@ -448,7 +556,7 @@ impl ComposerCommand {
     fn may_have_effect(&self) -> bool {
         matches!(
             self,
-            Self::Insert { .. } | Self::Submit { .. } | Self::Replace { .. }
+            Self::AcquireSend | Self::Insert { .. } | Self::Submit { .. } | Self::Replace { .. }
         )
     }
 }
@@ -600,23 +708,97 @@ fn has_unresolved_draft_provenance<L>(lease: &ExternalLease<L>) -> bool {
 
 pub(crate) struct ComposerControlState<L> {
     input_epoch: u64,
+    user_chronology_epoch: Arc<AtomicU64>,
     captures: HashMap<Uuid, Capture>,
     capture_order: VecDeque<Uuid>,
     leases: HashMap<Uuid, ExternalLease<L>>,
     lease_order: VecDeque<Uuid>,
+    kept_leases: HashSet<Uuid>,
+    kept_lease_order: VecDeque<Uuid>,
+    direct_sends: DirectSendReservations,
 }
 
 pub(crate) type NativeComposerControlState = ComposerControlState<ComposerLeaseId>;
 
 impl<L: Copy + Eq> ComposerControlState<L> {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_user_chronology_epoch(Arc::new(AtomicU64::new(0)))
+    }
+
+    pub(crate) fn with_user_chronology_epoch(user_chronology_epoch: Arc<AtomicU64>) -> Self {
         Self {
             input_epoch: 0,
+            user_chronology_epoch,
             captures: HashMap::new(),
             capture_order: VecDeque::new(),
             leases: HashMap::new(),
             lease_order: VecDeque::new(),
+            kept_leases: HashSet::new(),
+            kept_lease_order: VecDeque::new(),
+            direct_sends: DirectSendReservations::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_user_chronology_change(&self) {
+        self.user_chronology_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current_user_chronology_epoch(&self) -> u64 {
+        self.user_chronology_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn freeze_acquisition<T>(
+        &self,
+        target: &T,
+        app_overlay_active: bool,
+        nonempty_capture_allowed: bool,
+    ) -> FrozenComposerAcquisition
+    where
+        T: ComposerControlTarget<Lease = L>,
+    {
+        FrozenComposerAcquisition {
+            snapshot: available_snapshot(target, app_overlay_active),
+            direct_send_available: target.direct_send_acquisition_available(),
+            plain_draft_send_available: target.plain_draft_send_acquisition_available(),
+            input_epoch: self.input_epoch,
+            nonempty_capture_allowed,
+        }
+    }
+
+    /// Service only Stop-time acquisition operations while another semantic submit owns the live
+    /// widget. Other operations are returned unchanged for normal serialized processing.
+    pub(crate) fn handle_frozen_acquisition_request(
+        &mut self,
+        request: ComposerControlRequest,
+        frozen: &FrozenComposerAcquisition,
+        tainted_by_prior_terminal_input: bool,
+    ) -> Option<ComposerControlRequest> {
+        if !matches!(
+            &request.command,
+            ComposerCommand::AcquireSend | ComposerCommand::Capture
+        ) {
+            return Some(request);
+        }
+        let ComposerControlRequest {
+            command,
+            deadline,
+            reply,
+        } = request;
+        let result = if Instant::now() > deadline {
+            WireResult::not_applied(ErrorCode::UiTimeout)
+        } else if tainted_by_prior_terminal_input {
+            WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+        } else {
+            match command {
+                ComposerCommand::AcquireSend => self.acquire_send_frozen(frozen),
+                ComposerCommand::Capture => self.capture_frozen(frozen),
+                _ => unreachable!("acquisition operations checked above"),
+            }
+        };
+        let _ = reply.send(result);
+        None
     }
 
     /// Conservatively invalidate capture compare-and-swap tokens before any terminal input is
@@ -765,6 +947,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             CommandExecution::Correct(correction) => Some(
                 PendingComposerControlAction::Correction(PendingComposerCorrection {
                     lease_id: correction.lease_id,
+                    origin: correction.origin,
                     thread_id: correction.thread_id,
                     correction_id: correction.correction_id,
                     expected_client_user_message_id: correction.expected_client_user_message_id,
@@ -781,6 +964,14 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     reply,
                 },
             )),
+            CommandExecution::SubmitDirect(submission) => Some(
+                PendingComposerControlAction::DirectSubmission(PendingDirectSubmission {
+                    reservation_id: submission.reservation_id,
+                    submission: submission.submission,
+                    expected: submission.expected,
+                    reply,
+                }),
+            ),
         }
     }
 
@@ -805,11 +996,33 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         let _ = pending.reply.send(result);
     }
 
+    pub(crate) fn finish_direct_submission(
+        &mut self,
+        pending: PendingDirectSubmission,
+        outcome: SubmissionDispatchOutcome,
+    ) {
+        let result = self.direct_sends.finish_submission(
+            pending.reservation_id,
+            pending.submission.submission_id(),
+            outcome,
+        );
+        let _ = pending.reply.send(result);
+    }
+
     pub(crate) fn finish_correction(
         &mut self,
         pending: PendingComposerCorrection,
         outcome: CorrectionDispatchOutcome,
     ) {
+        if pending.origin == CorrectionOrigin::Direct {
+            let result = self.direct_sends.finish_correction(
+                pending.lease_id,
+                pending.correction_id,
+                outcome,
+            );
+            let _ = pending.reply.send(result);
+            return;
+        }
         let result = match outcome {
             CorrectionDispatchOutcome::Accepted => {
                 let is_superseded = self.leases.get(&pending.lease_id).is_some_and(|lease| {
@@ -861,6 +1074,13 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         match self.prepare_command(command, target, app_overlay_active) {
             CommandExecution::Complete(result) => result,
             CommandExecution::Correct(correction) => {
+                if correction.origin == CorrectionOrigin::Direct {
+                    return self.direct_sends.finish_correction(
+                        correction.lease_id,
+                        correction.correction_id,
+                        CorrectionDispatchOutcome::NotApplied,
+                    );
+                }
                 if let Some(lease) = self.leases.get_mut(&correction.lease_id)
                     && let ExternalLeaseState::CorrectionPending { receipt, .. } = &lease.state
                 {
@@ -871,6 +1091,9 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 WireResult::not_applied(ErrorCode::CorrectionUnavailable)
             }
             CommandExecution::Submit(_) => {
+                WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+            }
+            CommandExecution::SubmitDirect(_) => {
                 WireResult::not_applied(ErrorCode::SubmissionUnavailable)
             }
         }
@@ -886,6 +1109,9 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         T: ComposerControlTarget<Lease = L>,
     {
         match command {
+            ComposerCommand::AcquireSend => {
+                CommandExecution::Complete(self.acquire_send(target, app_overlay_active))
+            }
             ComposerCommand::Capture => {
                 CommandExecution::Complete(self.capture(target, app_overlay_active))
             }
@@ -909,6 +1135,47 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         }
     }
 
+    fn acquire_send<T>(&mut self, target: &T, app_overlay_active: bool) -> WireResult
+    where
+        T: ComposerControlTarget<Lease = L>,
+    {
+        let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
+            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+        };
+        if snapshot.text.is_empty() {
+            if !target.direct_send_acquisition_available() {
+                return WireResult::not_applied(ErrorCode::SubmissionUnavailable);
+            }
+            let user_chronology_epoch = self.current_user_chronology_epoch();
+            return self
+                .direct_sends
+                .acquire(snapshot.thread_id, user_chronology_epoch);
+        }
+        if !target.plain_draft_send_acquisition_available() {
+            return WireResult::not_applied(ErrorCode::SubmissionUnavailable);
+        }
+        self.capture(target, app_overlay_active)
+    }
+
+    fn acquire_send_frozen(&mut self, frozen: &FrozenComposerAcquisition) -> WireResult {
+        let Some(snapshot) = frozen.snapshot.as_ref() else {
+            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+        };
+        if snapshot.text.is_empty() {
+            if !frozen.direct_send_available {
+                return WireResult::not_applied(ErrorCode::SubmissionUnavailable);
+            }
+            return self.direct_sends.acquire(
+                snapshot.thread_id.clone(),
+                self.current_user_chronology_epoch(),
+            );
+        }
+        if !frozen.nonempty_capture_allowed || !frozen.plain_draft_send_available {
+            return WireResult::not_applied(ErrorCode::SubmissionUnavailable);
+        }
+        self.capture_snapshot(snapshot, frozen.input_epoch)
+    }
+
     fn capture<T>(&mut self, target: &T, app_overlay_active: bool) -> WireResult
     where
         T: ComposerControlTarget<Lease = L>,
@@ -916,14 +1183,28 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         let Some(snapshot) = available_snapshot(target, app_overlay_active) else {
             return WireResult::not_applied(ErrorCode::ComposerUnavailable);
         };
+        self.capture_snapshot(&snapshot, self.input_epoch)
+    }
+
+    fn capture_frozen(&mut self, frozen: &FrozenComposerAcquisition) -> WireResult {
+        let Some(snapshot) = frozen.snapshot.as_ref() else {
+            return WireResult::not_applied(ErrorCode::ComposerUnavailable);
+        };
+        if !snapshot.text.is_empty() && !frozen.nonempty_capture_allowed {
+            return WireResult::not_applied(ErrorCode::SubmissionUnavailable);
+        }
+        self.capture_snapshot(snapshot, frozen.input_epoch)
+    }
+
+    fn capture_snapshot(&mut self, snapshot: &ComposerSnapshot, input_epoch: u64) -> WireResult {
         let capture_id = fresh_id(&self.captures);
         self.captures.insert(
             capture_id,
             Capture {
-                thread_id: snapshot.thread_id,
+                thread_id: snapshot.thread_id.clone(),
                 text_hash: text_hash(&snapshot.text),
                 cursor: snapshot.cursor,
-                input_epoch: self.input_epoch,
+                input_epoch,
             },
         );
         self.capture_order.push_back(capture_id);
@@ -985,7 +1266,12 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             return WireResult::not_applied(ErrorCode::ComposerUnavailable);
         }
         self.rebase_matching_captures(target, &snapshot);
-        let lease_id = fresh_id(&self.leases);
+        let lease_id = loop {
+            let candidate = Uuid::new_v4();
+            if !self.leases.contains_key(&candidate) && !self.kept_leases.contains(&candidate) {
+                break candidate;
+            }
+        };
         self.leases.insert(
             lease_id,
             ExternalLease {
@@ -1014,6 +1300,19 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     where
         T: ComposerControlTarget<Lease = L>,
     {
+        if self.direct_sends.contains(lease_id) {
+            let current_thread_id = target.thread_id();
+            let current_user_chronology_epoch = self.current_user_chronology_epoch();
+            return match self.direct_sends.prepare_submission(
+                lease_id,
+                expected,
+                current_thread_id.as_deref(),
+                current_user_chronology_epoch,
+            ) {
+                Ok(submission) => CommandExecution::SubmitDirect(submission),
+                Err(result) => CommandExecution::Complete(result),
+            };
+        }
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
             return CommandExecution::Complete(WireResult::not_applied(
                 ErrorCode::LeaseUnavailable,
@@ -1178,6 +1477,15 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     where
         T: ComposerControlTarget<Lease = L>,
     {
+        if self.direct_sends.contains(lease_id) {
+            let current_thread_id = target.thread_id();
+            return self.direct_sends.verify(
+                lease_id,
+                &expected,
+                current_thread_id.as_deref(),
+                self.current_user_chronology_epoch(),
+            );
+        }
         let Some(lease) = self.leases.get(&lease_id) else {
             return WireResult::not_applied(ErrorCode::LeaseUnavailable);
         };
@@ -1235,8 +1543,15 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     where
         T: ComposerControlTarget<Lease = L>,
     {
+        if self.direct_sends.contains_keep_id(lease_id) {
+            return self.direct_sends.keep(lease_id);
+        }
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
-            return WireResult::not_applied(ErrorCode::LeaseUnavailable);
+            return if self.kept_leases.contains(&lease_id) {
+                WireResult::Kept
+            } else {
+                WireResult::not_applied(ErrorCode::LeaseUnavailable)
+            };
         };
         if has_live_submit_fence(&lease) {
             return WireResult::Unknown;
@@ -1259,27 +1574,40 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 if lease.thread_id != snapshot.thread_id {
                     return WireResult::not_applied(ErrorCode::ComposerUnavailable);
                 }
-                self.leases.remove(&lease_id);
-                self.lease_order.retain(|queued| *queued != lease_id);
                 match target.keep_owned_text(native) {
-                    Ok(()) => WireResult::Kept,
+                    Ok(()) => {
+                        self.remove_lease_kept(lease_id);
+                        WireResult::Kept
+                    }
                     Err(err) => WireResult::not_applied(map_lease_error(err)),
                 }
             }
             ExternalLeaseState::SubmissionPending { .. } => unreachable!("handled above"),
             ExternalLeaseState::SubmittedIntact { .. } => {
-                self.leases.remove(&lease_id);
-                self.lease_order.retain(|queued| *queued != lease_id);
+                self.remove_lease_kept(lease_id);
                 WireResult::Kept
             }
             ExternalLeaseState::SubmissionAbandoned { .. } => {
-                self.leases.remove(&lease_id);
-                self.lease_order.retain(|queued| *queued != lease_id);
+                self.remove_lease_kept(lease_id);
                 WireResult::Kept
             }
             ExternalLeaseState::CorrectionPending { .. } => {
                 WireResult::not_applied(ErrorCode::LeaseUnavailable)
             }
+        }
+    }
+
+    fn remove_lease_kept(&mut self, lease_id: Uuid) {
+        self.leases.remove(&lease_id);
+        self.lease_order.retain(|queued| *queued != lease_id);
+        if self.kept_leases.insert(lease_id) {
+            self.kept_lease_order.push_back(lease_id);
+        }
+        while self.kept_leases.len() > MAX_LEASE_COUNT {
+            let Some(expired) = self.kept_lease_order.pop_front() else {
+                break;
+            };
+            self.kept_leases.remove(&expired);
         }
     }
 
@@ -1294,6 +1622,12 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     where
         T: ComposerControlTarget<Lease = L>,
     {
+        if self.direct_sends.contains(lease_id) {
+            return match self.direct_sends.replace(lease_id, expected, replacement) {
+                DirectReplaceOutcome::Complete(result) => CommandExecution::Complete(result),
+                DirectReplaceOutcome::Correct(correction) => CommandExecution::Correct(correction),
+            };
+        }
         let Some(lease) = self.leases.get(&lease_id).cloned() else {
             return CommandExecution::Complete(WireResult::not_applied(
                 ErrorCode::LeaseUnavailable,
@@ -1407,6 +1741,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
                 CommandExecution::Correct(PreparedCorrection {
                     lease_id,
+                    origin: CorrectionOrigin::Composer,
                     thread_id: lease.thread_id,
                     correction_id,
                     expected_client_user_message_id,
@@ -1431,6 +1766,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 }
                 CommandExecution::Correct(PreparedCorrection {
                     lease_id,
+                    origin: CorrectionOrigin::Composer,
                     thread_id: lease.thread_id,
                     correction_id,
                     expected_client_user_message_id: format!(
@@ -1568,6 +1904,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         thread_id: &str,
         surviving_submission_ids: &HashSet<Uuid>,
     ) {
+        self.direct_sends
+            .note_thread_rolled_back(thread_id, surviving_submission_ids);
         self.captures
             .retain(|_, capture| capture.thread_id != thread_id);
         self.capture_order
@@ -1612,6 +1950,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
 
 impl NativeComposerControlState {
     pub(crate) fn note_submission_pending(&mut self, submission: &NativeComposerSubmission) {
+        self.direct_sends.note_submission_pending(submission);
         let native_leases = submission
             .submitted_leases()
             .iter()
@@ -1627,11 +1966,13 @@ impl NativeComposerControlState {
 
     pub(crate) fn note_submission_committed(&mut self, submission: &NativeComposerSubmission) {
         self.note_submission_pending(submission);
+        self.direct_sends.note_submission_committed(submission);
         self.note_submission_committed_id(submission.thread_id(), submission.submission_id());
     }
 
     pub(crate) fn note_submission_abandoned(&mut self, submission: &NativeComposerSubmission) {
         self.note_submission_pending(submission);
+        self.direct_sends.note_submission_abandoned(submission);
         self.note_submission_abandoned_id(submission.thread_id(), submission.submission_id());
     }
 }
@@ -1973,6 +2314,12 @@ pub(crate) fn start() -> (
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum WireRequest {
+    AcquireSend {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u8,
+        #[serde(rename = "instanceId")]
+        instance_id: Uuid,
+    },
     Capture {
         #[serde(rename = "protocolVersion")]
         protocol_version: u8,
@@ -2029,6 +2376,10 @@ enum WireRequest {
 impl WireRequest {
     fn into_command(self, expected_instance_id: Uuid) -> Result<ComposerCommand, ErrorCode> {
         let (protocol_version, instance_id, command) = match self {
+            Self::AcquireSend {
+                protocol_version,
+                instance_id,
+            } => (protocol_version, instance_id, ComposerCommand::AcquireSend),
             Self::Capture {
                 protocol_version,
                 instance_id,
@@ -2134,6 +2485,7 @@ pub(crate) enum ErrorCode {
     CursorConflict,
     CorrectionUnavailable,
     SubmissionUnavailable,
+    ReservationChanged,
     UiUnavailable,
     UiTimeout,
 }
@@ -2148,6 +2500,10 @@ enum MutationOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum WireResult {
+    Reserved {
+        #[serde(rename = "leaseId")]
+        lease_id: Uuid,
+    },
     Captured {
         #[serde(rename = "captureId")]
         capture_id: Uuid,
@@ -2280,7 +2636,7 @@ fn listener_loop(
     use std::sync::atomic::Ordering;
 
     while !shutdown.load(Ordering::Acquire) {
-        let Ok((mut stream, _address)) = listener.accept() else {
+        let Ok((stream, _address)) = listener.accept() else {
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -2291,27 +2647,27 @@ fn listener_loop(
         }
         let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
         let _ = stream.set_write_timeout(Some(SOCKET_READ_TIMEOUT));
-        handle_connection(&mut stream, instance_id, &request_tx);
+        enqueue_connection(stream, instance_id, &request_tx);
     }
 }
 
 #[cfg(unix)]
-fn handle_connection(
-    stream: &mut std::os::unix::net::UnixStream,
+fn enqueue_connection(
+    mut stream: std::os::unix::net::UnixStream,
     instance_id: Uuid,
     request_tx: &UnboundedSender<ComposerControlRequest>,
 ) {
-    let request = match read_wire_request(stream) {
+    let request = match read_wire_request(&stream) {
         Ok(request) => request,
         Err(code) => {
-            write_response(stream, instance_id, WireResult::not_applied(code));
+            write_response(&mut stream, instance_id, WireResult::not_applied(code));
             return;
         }
     };
     let command = match request.into_command(instance_id) {
         Ok(command) => command,
         Err(code) => {
-            write_response(stream, instance_id, WireResult::not_applied(code));
+            write_response(&mut stream, instance_id, WireResult::not_applied(code));
             return;
         }
     };
@@ -2325,20 +2681,28 @@ fn handle_connection(
     };
     if request_tx.send(ui_request).is_err() {
         write_response(
-            stream,
+            &mut stream,
             instance_id,
             WireResult::not_applied(ErrorCode::UiUnavailable),
         );
         return;
     }
-    let result = match reply_rx.recv_timeout(UI_REPLY_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) if may_have_effect => {
-            WireResult::error(ErrorCode::UiTimeout, MutationOutcome::Unknown)
-        }
-        Err(_) => WireResult::not_applied(ErrorCode::UiTimeout),
-    };
-    write_response(stream, instance_id, result);
+    std::thread::spawn(move || {
+        let result = match reply_rx.recv_timeout(UI_REPLY_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => ui_reply_timeout_result(may_have_effect),
+        };
+        write_response(&mut stream, instance_id, result);
+    });
+}
+
+#[cfg(unix)]
+fn ui_reply_timeout_result(may_have_effect: bool) -> WireResult {
+    if may_have_effect {
+        WireResult::error(ErrorCode::UiTimeout, MutationOutcome::Unknown)
+    } else {
+        WireResult::not_applied(ErrorCode::UiTimeout)
+    }
 }
 
 #[cfg(unix)]

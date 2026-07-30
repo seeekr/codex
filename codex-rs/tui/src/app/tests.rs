@@ -13,6 +13,7 @@ use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::user_count;
 use crate::bottom_pane::ComposerLeaseId;
 use crate::bottom_pane::SubmittedComposerLease;
+use crate::composer_control::NativeComposerControlState;
 use crate::composer_control::SubmitFence;
 
 use crate::chatwidget::ChatWidgetInit;
@@ -4052,12 +4053,14 @@ async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
 }
 
 async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    let (mut chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
+    let composer_user_chronology_epoch = Arc::new(AtomicU64::new(0));
+    chat_widget.set_user_chronology_epoch(Arc::clone(&composer_user_chronology_epoch));
     App {
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
@@ -4099,6 +4102,7 @@ async fn make_test_app() -> App {
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
         active_thread_id: None,
+        composer_user_chronology_epoch,
         active_thread_rx: None,
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
@@ -4118,12 +4122,14 @@ async fn make_test_app_with_channels() -> (
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
-    let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
+    let (mut chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
+    let composer_user_chronology_epoch = Arc::new(AtomicU64::new(0));
+    chat_widget.set_user_chronology_epoch(Arc::clone(&composer_user_chronology_epoch));
     (
         App {
             model_catalog: chat_widget.model_catalog(),
@@ -4166,6 +4172,7 @@ async fn make_test_app_with_channels() -> (
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
             active_thread_id: None,
+            composer_user_chronology_epoch,
             active_thread_rx: None,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
@@ -5700,6 +5707,43 @@ async fn inactive_composer_submission_commits_at_notification_ingress() {
 }
 
 #[tokio::test]
+async fn overlay_enter_with_a_hidden_nonempty_draft_does_not_advance_chronology() {
+    let mut app = make_test_app().await;
+    app.chat_widget
+        .set_composer_text("hidden draft".to_string(), Vec::new(), Vec::new());
+    app.overlay = Some(Overlay::new_transcript(
+        Vec::new(),
+        app.keymap.pager.clone(),
+    ));
+    let mut composer_control = NativeComposerControlState::with_user_chronology_epoch(Arc::clone(
+        &app.composer_user_chronology_epoch,
+    ));
+    let initial_epoch = app.composer_user_chronology_epoch.load(Ordering::Acquire);
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test TUI");
+    let mut app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+
+    app.handle_composer_tui_event(
+        &mut tui,
+        &mut app_server,
+        &mut composer_control,
+        Some(DeferredTuiEvent::Event {
+            event: TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            submission_fence: None,
+        }),
+    )
+    .await
+    .expect("overlay Enter should be handled");
+
+    assert_eq!(
+        app.composer_user_chronology_epoch.load(Ordering::Acquire),
+        initial_epoch,
+        "a raw submit key is not a semantic user-message admission"
+    );
+}
+
+#[tokio::test]
 async fn committed_external_submission_resolves_after_failed_clear_is_relinquished() {
     let mut app = make_test_app().await;
     let mut app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -5733,7 +5777,7 @@ async fn committed_external_submission_resolves_after_failed_clear_is_relinquish
         PendingComposerSubmissionCommit {
             submission: submission.clone(),
             turn_id: Some("turn-1".to_string()),
-            external_commit: Some(prepared.commit()),
+            external_commit: prepared.commit(),
             item_committed: false,
         },
     );
@@ -5772,6 +5816,7 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
     let (tx, rx) = mpsc::channel(8);
     app.active_thread_id = Some(thread_id);
     app.active_thread_rx = Some(rx);
+    let initial_chronology = app.composer_user_chronology_epoch.load(Ordering::Acquire);
     tx.send(ThreadBufferedEvent::Notification(
         ServerNotification::ConfigWarning(ConfigWarningNotification {
             summary: "stale warning".to_string(),
@@ -5828,6 +5873,11 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
             surviving_submission_ids,
         }) if invalidated == thread_id.to_string() && surviving_submission_ids.is_empty()
     ));
+    assert_eq!(
+        app.composer_user_chronology_epoch.load(Ordering::Acquire),
+        initial_chronology + 1,
+        "successful active-thread rollback invalidates pre-rollback direct reservations"
+    );
 }
 
 #[tokio::test]
@@ -6436,6 +6486,34 @@ fn deferred_tui_events_preserve_fifo_and_stream_close_after_buffered_input() {
     ));
     assert!(matches!(pop_deferred_tui_event(&mut deferred), Some(None)));
     assert!(pop_deferred_tui_event(&mut deferred).is_none());
+}
+
+#[tokio::test]
+async fn delayed_submit_prefers_pre_ready_terminal_input_over_a_later_acquire() {
+    let (tui_tx, tui_rx) = mpsc::unbounded_channel();
+    let mut tui_events: Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>> =
+        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(tui_rx));
+    tui_tx
+        .send(TuiEvent::Paste("draft arrived first".to_string()))
+        .expect("terminal event receiver");
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let request = crate::composer_control::ComposerControlRequest::acquire_send_for_test(
+        Instant::now() + Duration::from_secs(1),
+    );
+    control_tx.send(request).expect("composer control receiver");
+
+    let dispatch = std::future::pending::<SubmissionDispatchOutcome>();
+    tokio::pin!(dispatch);
+    assert!(matches!(
+        next_submission_wait_event(&mut control_rx, &mut tui_events, dispatch.as_mut()).await,
+        SubmissionWaitEvent::Tui(Some(TuiEvent::Paste(text)))
+            if text == "draft arrived first"
+    ));
+    assert!(matches!(
+        next_submission_wait_event(&mut control_rx, &mut tui_events, dispatch.as_mut()).await,
+        SubmissionWaitEvent::ComposerControl(_)
+    ));
 }
 
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {

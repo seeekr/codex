@@ -189,6 +189,7 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
+            user_chronology_epoch: Arc::new(AtomicU64::new(0)),
             dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
             thread_rename_block_message: None,
@@ -240,6 +241,7 @@ impl ChatWidget {
             current_goal_status: None,
             external_editor_state: ExternalEditorState::Closed,
             last_rendered_user_message_display: None,
+            locally_rendered_composer_submission_ids: HashSet::new(),
             last_non_retry_error: None,
         };
 

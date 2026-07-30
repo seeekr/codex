@@ -193,11 +193,14 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -209,6 +212,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
+use tokio_stream::StreamExt;
 use toml::Value as TomlValue;
 use uuid::Uuid;
 mod agent_message_consolidation;
@@ -259,6 +263,35 @@ enum DeferredTuiEvent {
         submission_fence: Option<SubmitFence>,
     },
     StreamClosed,
+}
+
+enum SubmissionWaitEvent {
+    Tui(Option<TuiEvent>),
+    ComposerControl(crate::composer_control::ComposerControlRequest),
+    Dispatch(SubmissionDispatchOutcome),
+}
+
+/// Poll terminal ingress before composer control when both are already ready. The channels do not
+/// share an arrival sequence, so refusing an acquisition after concurrent terminal input is the
+/// conservative alternative to reserving a stale pre-input snapshot.
+async fn next_submission_wait_event<F>(
+    composer_control_rx: &mut mpsc::UnboundedReceiver<
+        crate::composer_control::ComposerControlRequest,
+    >,
+    tui_events: &mut Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>>,
+    mut dispatch: Pin<&mut F>,
+) -> SubmissionWaitEvent
+where
+    F: Future<Output = SubmissionDispatchOutcome>,
+{
+    select! {
+        biased;
+        event = tui_events.next() => SubmissionWaitEvent::Tui(event),
+        Some(request) = composer_control_rx.recv() => {
+            SubmissionWaitEvent::ComposerControl(request)
+        }
+        outcome = dispatch.as_mut() => SubmissionWaitEvent::Dispatch(outcome),
+    }
 }
 
 fn pop_deferred_tui_event(
@@ -619,6 +652,7 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     side_threads: HashMap<ThreadId, SideThreadState>,
     active_thread_id: Option<ThreadId>,
+    composer_user_chronology_epoch: Arc<AtomicU64>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
@@ -778,6 +812,14 @@ fn active_turn_interrupt_race(error: &TypedRequestError) -> Option<String> {
 }
 
 impl App {
+    fn set_active_thread_id(&mut self, thread_id: Option<ThreadId>) {
+        if self.active_thread_id != thread_id {
+            self.composer_user_chronology_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            self.active_thread_id = thread_id;
+        }
+    }
+
     pub fn chatwidget_init_for_forked_or_resumed_thread(
         &self,
         tui: &mut tui::Tui,
@@ -864,6 +906,176 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn handle_composer_control_request(
+        &mut self,
+        app_server: &mut AppServerSession,
+        composer_control_state: &mut crate::composer_control::NativeComposerControlState,
+        request: crate::composer_control::ComposerControlRequest,
+        composer_correction_tx: &mpsc::UnboundedSender<(
+            PendingComposerCorrection,
+            CorrectionDispatchOutcome,
+        )>,
+        composer_control_rx: &mut mpsc::UnboundedReceiver<
+            crate::composer_control::ComposerControlRequest,
+        >,
+        deferred_composer_requests: &mut VecDeque<crate::composer_control::ComposerControlRequest>,
+        deferred_tui_events: &mut VecDeque<DeferredTuiEvent>,
+        tui_events: &mut Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>>,
+    ) {
+        let app_overlay_active = self.overlay.is_some();
+        let Some(action) = composer_control_state.handle_ui_request(
+            request,
+            &mut self.chat_widget,
+            app_overlay_active,
+        ) else {
+            return;
+        };
+        match action {
+            PendingComposerControlAction::Correction(correction) => {
+                match self.composer_correction_thread_id(&correction) {
+                    Ok(thread_id) => {
+                        let request_handle = app_server.request_handle();
+                        let correction_tx = composer_correction_tx.clone();
+                        tokio::spawn(async move {
+                            let outcome = thread_routing::dispatch_composer_correction(
+                                request_handle,
+                                thread_id,
+                                &correction,
+                            )
+                            .await;
+                            let _ = correction_tx.send((correction, outcome));
+                        });
+                    }
+                    Err(outcome) => {
+                        composer_control_state.finish_correction(correction, outcome);
+                    }
+                }
+            }
+            PendingComposerControlAction::Submission(submission) => {
+                let submission_fence = submission.fence();
+                let outcome = match self.chat_widget.prepare_native_composer_submit(
+                    submission.native(),
+                    submission.expected(),
+                    submission_fence.clone(),
+                ) {
+                    Ok(prepared) => {
+                        let frozen = composer_control_state.freeze_acquisition(
+                            &self.chat_widget,
+                            app_overlay_active,
+                            /*nonempty_capture_allowed*/ false,
+                        );
+                        let dispatch = self.dispatch_native_composer_submit(app_server, &prepared);
+                        tokio::pin!(dispatch);
+                        let mut frozen_tainted = false;
+                        let outcome = loop {
+                            match next_submission_wait_event(
+                                composer_control_rx,
+                                tui_events,
+                                dispatch.as_mut(),
+                            )
+                            .await
+                            {
+                                SubmissionWaitEvent::ComposerControl(request) => {
+                                    if let Some(request) = composer_control_state
+                                        .handle_frozen_acquisition_request(
+                                            request,
+                                            &frozen,
+                                            frozen_tainted,
+                                        )
+                                    {
+                                        deferred_composer_requests.push_back(request);
+                                    }
+                                }
+                                SubmissionWaitEvent::Tui(event) => {
+                                    let Some(event) = event else {
+                                        deferred_tui_events
+                                            .push_back(DeferredTuiEvent::StreamClosed);
+                                        break dispatch.await;
+                                    };
+                                    if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+                                        frozen_tainted = true;
+                                    }
+                                    deferred_tui_events.push_back(DeferredTuiEvent::Event {
+                                        event,
+                                        submission_fence: Some(submission_fence.clone()),
+                                    });
+                                }
+                                SubmissionWaitEvent::Dispatch(outcome) => break outcome,
+                            }
+                        };
+                        if matches!(
+                            outcome,
+                            SubmissionDispatchOutcome::Accepted
+                                | SubmissionDispatchOutcome::AcceptedButUncommitted
+                        ) {
+                            composer_control_state.note_submission_pending(prepared.submission());
+                        }
+                        outcome
+                    }
+                    Err(code) => SubmissionDispatchOutcome::NotApplied(code),
+                };
+                composer_control_state.finish_submission(submission, outcome);
+            }
+            PendingComposerControlAction::DirectSubmission(submission) => {
+                let outcome = match self
+                    .chat_widget
+                    .prepare_reserved_send(submission.submission().clone(), submission.expected())
+                {
+                    Ok(prepared) => {
+                        let frozen = composer_control_state.freeze_acquisition(
+                            &self.chat_widget,
+                            app_overlay_active,
+                            /*nonempty_capture_allowed*/ true,
+                        );
+                        let dispatch = self.dispatch_native_composer_submit(app_server, &prepared);
+                        tokio::pin!(dispatch);
+                        let mut frozen_tainted = false;
+                        let outcome = loop {
+                            match next_submission_wait_event(
+                                composer_control_rx,
+                                tui_events,
+                                dispatch.as_mut(),
+                            )
+                            .await
+                            {
+                                SubmissionWaitEvent::ComposerControl(request) => {
+                                    if let Some(request) = composer_control_state
+                                        .handle_frozen_acquisition_request(
+                                            request,
+                                            &frozen,
+                                            frozen_tainted,
+                                        )
+                                    {
+                                        deferred_composer_requests.push_back(request);
+                                    }
+                                }
+                                SubmissionWaitEvent::Tui(event) => {
+                                    let Some(event) = event else {
+                                        deferred_tui_events
+                                            .push_back(DeferredTuiEvent::StreamClosed);
+                                        break dispatch.await;
+                                    };
+                                    if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+                                        frozen_tainted = true;
+                                    }
+                                    deferred_tui_events.push_back(DeferredTuiEvent::Event {
+                                        event,
+                                        submission_fence: None,
+                                    });
+                                }
+                                SubmissionWaitEvent::Dispatch(outcome) => break outcome,
+                            }
+                        };
+                        outcome
+                    }
+                    Err(code) => SubmissionDispatchOutcome::NotApplied(code),
+                };
+                composer_control_state.finish_direct_submission(submission, outcome);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
         mut app_server: AppServerSession,
@@ -885,7 +1097,6 @@ impl App {
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
     ) -> Result<AppExitInfo> {
-        use tokio_stream::StreamExt;
         let startup_started_at = Instant::now();
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
@@ -1126,6 +1337,8 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let composer_user_chronology_epoch = Arc::new(AtomicU64::new(0));
+        chat_widget.set_user_chronology_epoch(Arc::clone(&composer_user_chronology_epoch));
         let mut app = Self {
             model_catalog,
             session_telemetry: session_telemetry.clone(),
@@ -1167,6 +1380,7 @@ See the Codex keymap documentation for supported actions and examples."
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
             active_thread_id: None,
+            composer_user_chronology_epoch,
             active_thread_rx: None,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
@@ -1225,8 +1439,7 @@ See the Codex keymap documentation for supported actions and examples."
         }
 
         let event_stream_started_at = Instant::now();
-        let tui_events = tui.event_stream();
-        tokio::pin!(tui_events);
+        let mut tui_events = tui.event_stream();
 
         tui.frame_requester().schedule_frame();
         tracing::info!(
@@ -1256,7 +1469,11 @@ See the Codex keymap documentation for supported actions and examples."
         // ready to answer within the transport deadline.
         let (mut composer_control_rx, _composer_control_server) = crate::composer_control::start();
         let (composer_correction_tx, mut composer_correction_rx) = mpsc::unbounded_channel();
-        let mut composer_control_state = crate::composer_control::NativeComposerControlState::new();
+        let mut composer_control_state =
+            crate::composer_control::NativeComposerControlState::with_user_chronology_epoch(
+                Arc::clone(&app.composer_user_chronology_epoch),
+            );
+        let mut deferred_composer_requests = VecDeque::new();
         let mut deferred_tui_events = VecDeque::new();
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
@@ -1286,8 +1503,20 @@ See the Codex keymap documentation for supported actions and examples."
             Ok(exit_reason)
         } else {
             loop {
-                let control = if let Some(event) = pop_deferred_tui_event(&mut deferred_tui_events)
-                {
+                let control = if let Some(request) = deferred_composer_requests.pop_front() {
+                    app.handle_composer_control_request(
+                        &mut app_server,
+                        &mut composer_control_state,
+                        request,
+                        &composer_correction_tx,
+                        &mut composer_control_rx,
+                        &mut deferred_composer_requests,
+                        &mut deferred_tui_events,
+                        &mut tui_events,
+                    )
+                    .await;
+                    AppRunControl::Continue
+                } else if let Some(event) = pop_deferred_tui_event(&mut deferred_tui_events) {
                     match app
                         .handle_composer_tui_event(
                             tui,
@@ -1309,79 +1538,17 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                     }
                     Some(request) = composer_control_rx.recv() => {
-                        let app_overlay_active = app.overlay.is_some();
-                        if let Some(action) = composer_control_state.handle_ui_request(
+                        app.handle_composer_control_request(
+                            &mut app_server,
+                            &mut composer_control_state,
                             request,
-                            &mut app.chat_widget,
-                            app_overlay_active,
-                        ) {
-                            match action {
-                                PendingComposerControlAction::Correction(correction) => {
-                                    match app.composer_correction_thread_id(&correction) {
-                                        Ok(thread_id) => {
-                                            let request_handle = app_server.request_handle();
-                                            let correction_tx = composer_correction_tx.clone();
-                                            tokio::spawn(async move {
-                                                let outcome = thread_routing::dispatch_composer_correction(
-                                                    request_handle,
-                                                    thread_id,
-                                                    &correction,
-                                                )
-                                                .await;
-                                                let _ = correction_tx.send((correction, outcome));
-                                            });
-                                        }
-                                        Err(outcome) => {
-                                            composer_control_state.finish_correction(correction, outcome);
-                                        }
-                                    }
-                                }
-                                PendingComposerControlAction::Submission(submission) => {
-                                    let submission_fence = submission.fence();
-                                    let outcome = match app.chat_widget.prepare_native_composer_submit(
-                                        submission.native(),
-                                        submission.expected(),
-                                        submission_fence.clone(),
-                                    ) {
-                                        Ok(prepared) => {
-                                            let dispatch = app.dispatch_native_composer_submit(
-                                                &mut app_server,
-                                                &prepared,
-                                            );
-                                            tokio::pin!(dispatch);
-                                            let outcome = loop {
-                                                select! {
-                                                    biased;
-                                                    event = tui_events.next() => {
-                                                        let Some(event) = event else {
-                                                            deferred_tui_events
-                                                                .push_back(DeferredTuiEvent::StreamClosed);
-                                                            break dispatch.await;
-                                                        };
-                                                        deferred_tui_events.push_back(DeferredTuiEvent::Event {
-                                                            event,
-                                                            submission_fence: Some(submission_fence.clone()),
-                                                        });
-                                                    }
-                                                    outcome = &mut dispatch => break outcome,
-                                                }
-                                            };
-                                            if matches!(
-                                                outcome,
-                                                SubmissionDispatchOutcome::Accepted
-                                                    | SubmissionDispatchOutcome::AcceptedButUncommitted
-                                            ) {
-                                                composer_control_state
-                                                    .note_submission_pending(prepared.submission());
-                                            }
-                                            outcome
-                                        }
-                                        Err(code) => SubmissionDispatchOutcome::NotApplied(code),
-                                    };
-                                    composer_control_state.finish_submission(submission, outcome);
-                                }
-                            }
-                        }
+                            &composer_correction_tx,
+                            &mut composer_control_rx,
+                            &mut deferred_composer_requests,
+                            &mut deferred_tui_events,
+                            &mut tui_events,
+                        )
+                        .await;
                         AppRunControl::Continue
                     }
                     Some((correction, outcome)) = composer_correction_rx.recv() => {

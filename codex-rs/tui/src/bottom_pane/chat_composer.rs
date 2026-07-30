@@ -67,7 +67,9 @@
 //! Native composer control uses a stricter two-phase path: it first projects an exact plain-text
 //! submission without mutating the draft, rejecting queues, rich elements, attachments, pending
 //! or active paste state, and command modes. Only after app-server acceptance does an exact
-//! compare-and-swap record history and clear that same draft.
+//! compare-and-swap record history and clear that same draft. Its send-acquisition path uses the
+//! same strict state test to distinguish a fully plain-empty composer from an admissible plain
+//! non-empty draft.
 //!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
@@ -1544,31 +1546,51 @@ impl ChatComposer {
         true
     }
 
+    fn strict_plain_state(&self) -> bool {
+        !self.draft.is_bash_mode
+            && !self.queue_submissions
+            && !self.draft.paste_burst.is_active()
+            && self.draft.pending_pastes.is_empty()
+            && self.current_text_elements().is_empty()
+            && self.draft.mention_bindings.is_empty()
+            && self.attachments.is_empty()
+    }
+
+    /// Return true only for a fully settled composer with no text or rich draft state.
+    pub(crate) fn is_strict_plain_empty(&self) -> bool {
+        self.strict_plain_state() && self.draft.textarea.is_empty()
+    }
+
+    /// Project the current draft only when ordinary native submission can treat it as plain text.
+    pub(crate) fn strict_plain_submission_text(&self) -> Option<String> {
+        if !self.strict_plain_state() {
+            return None;
+        }
+        let draft_text = self.current_text();
+        let submitted_text = draft_text.trim().to_string();
+        if submitted_text.is_empty()
+            || submitted_text.starts_with('/')
+            || submitted_text.starts_with('!')
+        {
+            return None;
+        }
+        Some(submitted_text)
+    }
+
     /// Project an exact plain submission without clearing or otherwise mutating the composer.
     pub(crate) fn preview_owned_plain_submission(
         &self,
         native: ComposerLeaseId,
         expected: &str,
     ) -> Option<PlainComposerSubmission> {
-        if self.draft.is_bash_mode
-            || self.queue_submissions
-            || self.draft.paste_burst.is_active()
-            || !self.draft.pending_pastes.is_empty()
-            || !self.current_text_elements().is_empty()
-            || !self.draft.mention_bindings.is_empty()
-            || !self.attachments.is_empty()
-            || self.verify_owned_text(native, expected).is_err()
-        {
+        if self.verify_owned_text(native, expected).is_err() {
             return None;
         }
         let draft_text = self.current_text();
         let trim_start = draft_text.len() - draft_text.trim_start().len();
         let trim_end = draft_text.trim_end().len();
-        let submitted_text = draft_text.get(trim_start..trim_end)?.to_string();
-        if submitted_text.is_empty()
-            || submitted_text.starts_with('/')
-            || submitted_text.starts_with('!')
-        {
+        let submitted_text = self.strict_plain_submission_text()?;
+        if draft_text.get(trim_start..trim_end) != Some(submitted_text.as_str()) {
             return None;
         }
         let leases = self

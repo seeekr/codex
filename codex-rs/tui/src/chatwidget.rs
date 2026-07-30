@@ -37,6 +37,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -645,6 +646,9 @@ pub(crate) struct ChatWidget {
     #[cfg(test)]
     pet_image_support_override: Option<crate::pets::PetImageSupport>,
     thread_id: Option<ThreadId>,
+    /// Shared with composer control so ordinary user-turn admission invalidates older direct
+    /// reservations synchronously, before an eventually queued turn is drained.
+    user_chronology_epoch: Arc<AtomicU64>,
     /// Nudge dismissals that should survive draft edits within the current thread scope.
     ///
     /// The nudge is only a discovery aid, so once a user dismisses it or enters Plan mode we keep it
@@ -753,6 +757,7 @@ pub(crate) struct ChatWidget {
     current_goal_status: Option<GoalStatusState>,
     external_editor_state: ExternalEditorState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
+    locally_rendered_composer_submission_ids: HashSet<String>,
     last_non_retry_error: Option<(String, String)>,
 }
 
@@ -1272,7 +1277,12 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_committed_user_message(&mut self, items: &[UserInput], from_replay: bool) {
+    fn on_committed_user_message(
+        &mut self,
+        items: &[UserInput],
+        client_id: Option<&str>,
+        from_replay: bool,
+    ) {
         let display = Self::user_message_display_from_inputs(items);
         if from_replay {
             if self.review.is_review_mode {
@@ -1343,6 +1353,33 @@ impl ChatWidget {
                     mention_bindings,
                     pending_pastes: Vec::new(),
                 });
+            self.on_user_message_display(display);
+            return;
+        }
+
+        if let Some(client_id) = client_id.filter(|id| id.starts_with("koenig-composer-")) {
+            if self
+                .locally_rendered_composer_submission_ids
+                .remove(client_id)
+            {
+                return;
+            }
+            if let Some(index) = self.input_queue.pending_steers.iter().position(|pending| {
+                pending
+                    .composer_submission
+                    .as_ref()
+                    .is_some_and(|submission| submission.client_user_message_id() == client_id)
+            }) {
+                if let Some(pending) = self.input_queue.pending_steers.remove(index) {
+                    self.refresh_pending_input_preview();
+                    let pending_display = user_message_display_for_history(
+                        pending.user_message,
+                        &pending.history_record,
+                    );
+                    self.on_user_message_display(pending_display);
+                }
+                return;
+            }
             self.on_user_message_display(display);
             return;
         }
@@ -1956,6 +1993,14 @@ impl ChatWidget {
 
     pub(crate) fn thread_id(&self) -> Option<ThreadId> {
         self.thread_id
+    }
+
+    pub(crate) fn set_user_chronology_epoch(&mut self, epoch: Arc<AtomicU64>) {
+        self.user_chronology_epoch = epoch;
+    }
+
+    fn note_user_turn_admitted(&self) {
+        self.user_chronology_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn thread_name(&self) -> Option<String> {

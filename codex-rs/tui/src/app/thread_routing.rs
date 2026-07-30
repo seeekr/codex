@@ -90,7 +90,7 @@ impl App {
             super::PendingComposerSubmissionCommit {
                 submission: submission.clone(),
                 turn_id: None,
-                external_commit: Some(prepared.commit()),
+                external_commit: prepared.commit(),
                 item_committed: false,
             },
         );
@@ -108,11 +108,15 @@ impl App {
                 Err(_) => return SubmissionDispatchOutcome::Unknown,
             };
 
-        let committed = self
+        let external_commit = self
             .pending_composer_submissions
             .get(&client_id)
-            .and_then(|pending| pending.external_commit.as_ref().cloned())
-            .is_some_and(|commit| self.chat_widget.commit_native_composer_submit(&commit));
+            .map(|pending| pending.external_commit.clone());
+        let committed = match external_commit {
+            Some(Some(commit)) => self.chat_widget.commit_native_composer_submit(&commit),
+            Some(None) => true,
+            None => false,
+        };
         if let Some(pending) = self.pending_composer_submissions.get_mut(&client_id) {
             pending.turn_id = Some(accepted_turn_id);
             if committed {
@@ -396,7 +400,7 @@ impl App {
         } else {
             None
         };
-        self.active_thread_id = Some(thread_id);
+        self.set_active_thread_id(Some(thread_id));
         self.active_thread_rx = receiver;
         self.refresh_pending_thread_approvals().await;
     }
@@ -1791,6 +1795,10 @@ impl App {
         response: &ThreadRollbackResponse,
         origin: ThreadRollbackOrigin,
     ) {
+        if self.active_thread_id == Some(thread_id) {
+            self.composer_user_chronology_epoch
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let (surviving_client_ids, surviving_submission_ids) =
             surviving_composer_submission_ids(&response.thread);
         let pending_client_ids = self

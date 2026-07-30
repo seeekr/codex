@@ -325,6 +325,7 @@ impl App {
     /// This helper copies every known nickname/role from `AgentNavigationState` into the
     /// replacement widget so that replayed collab items render agent names immediately.
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
+        chat_widget.set_user_chronology_epoch(Arc::clone(&self.composer_user_chronology_epoch));
         // Transfer the last-written terminal title to the replacement widget
         // so it knows what OSC title is currently displayed. Without this, the
         // new widget would redundantly clear and rewrite the same title, causing
@@ -395,7 +396,7 @@ impl App {
 
         let previous_thread_id = self.active_thread_id;
         self.store_active_thread_receiver().await;
-        self.active_thread_id = None;
+        self.set_active_thread_id(None);
         let Some((receiver, mut snapshot)) = self.activate_thread_for_replay(thread_id).await
         else {
             self.chat_widget
@@ -414,7 +415,7 @@ impl App {
         )
         .await;
 
-        self.active_thread_id = Some(thread_id);
+        self.set_active_thread_id(Some(thread_id));
         self.active_thread_rx = Some(receiver);
 
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
@@ -477,7 +478,7 @@ impl App {
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
-        self.active_thread_id = None;
+        self.set_active_thread_id(None);
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.last_subagent_backfill_attempt = None;

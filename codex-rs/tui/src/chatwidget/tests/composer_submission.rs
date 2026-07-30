@@ -10,6 +10,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn native_two_phase_submit_commits_exact_draft_and_history_once() {
@@ -23,10 +24,13 @@ async fn native_two_phase_submit_commits_exact_draft_and_history_once() {
     let prepared = chat
         .prepare_native_composer_submit(native, "dictated", SubmitFence::new())
         .expect("plain exact draft should prepare");
+    let commit = prepared
+        .commit()
+        .expect("composer submit has a local commit");
     assert_eq!(chat.composer_text(), "dictated");
-    assert!(chat.commit_native_composer_submit(&prepared.commit()));
+    assert!(chat.commit_native_composer_submit(&commit));
     assert_eq!(chat.composer_text(), "");
-    assert!(!chat.commit_native_composer_submit(&prepared.commit()));
+    assert!(!chat.commit_native_composer_submit(&commit));
 
     let user_history_cells = std::iter::from_fn(|| rx.try_recv().ok())
         .filter(|event| {
@@ -38,6 +42,129 @@ async fn native_two_phase_submit_commits_exact_draft_and_history_once() {
         })
         .count();
     assert_eq!(user_history_cells, 1);
+}
+
+#[tokio::test]
+async fn reserved_send_keeps_syntax_inert_and_has_no_local_composer_commit() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.set_composer_text("unrelated human draft".to_string(), Vec::new(), Vec::new());
+    while rx.try_recv().is_ok() {}
+
+    for text in [
+        "!echo must stay text",
+        "/compact must stay text",
+        "$use-compute must stay text",
+        "@github must stay text",
+    ] {
+        let submission = crate::composer_control::NativeComposerSubmission::new_direct(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            thread_id.to_string(),
+            text,
+        );
+        let prepared = chat
+            .prepare_reserved_send(submission.clone(), text)
+            .expect("reserved raw text should prepare");
+        assert!(
+            prepared.commit().is_none(),
+            "a direct send must never clear or render the visible composer locally"
+        );
+        let AppCommand::UserTurn {
+            items,
+            composer_submission: Some(prepared_submission),
+            ..
+        } = prepared.op()
+        else {
+            panic!("reserved send should produce a user turn");
+        };
+        assert_eq!(prepared_submission, &submission);
+        assert_eq!(
+            items.first(),
+            Some(&UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            })
+        );
+        assert_eq!(chat.composer_text(), "unrelated human draft");
+    }
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
+            !matches!(
+                event,
+                AppEvent::InsertHistoryCell(cell)
+                    if cell.as_any().downcast_ref::<UserHistoryCell>().is_some()
+            )
+        }),
+        "preparing a direct send must not create a duplicate local user-history item"
+    );
+}
+
+#[tokio::test]
+async fn queued_manual_input_advances_user_chronology_exactly_once_before_queue_drain() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    let chronology = Arc::new(AtomicU64::new(0));
+    chat.set_user_chronology_epoch(Arc::clone(&chronology));
+
+    chat.handle_composer_input_result(
+        InputResult::Queued {
+            text: "manual A".to_string(),
+            text_elements: Vec::new(),
+            action: QueuedInputAction::Plain,
+            pending_pastes: Vec::new(),
+            composer_leases: Vec::new(),
+        },
+        /*had_modal_or_popup*/ false,
+    );
+
+    assert_eq!(
+        chronology.load(Ordering::Acquire),
+        1,
+        "queue admission synchronously invalidates older direct reservations"
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "the chronology boundary precedes eventual queued user-turn dispatch"
+    );
+
+    let (queued, history_record) = chat
+        .pop_next_queued_user_message()
+        .expect("queued manual input");
+    let (message, composer_submission, chronology_noted) = queued.into_submission();
+    chat.submit_user_message_with_history_record_composer_submission_and_chronology(
+        message,
+        history_record,
+        composer_submission,
+        chronology_noted,
+    );
+    assert_eq!(
+        chronology.load(Ordering::Acquire),
+        1,
+        "draining or requeueing the same semantic admission must not advance twice"
+    );
+}
+
+#[tokio::test]
+async fn programmatic_side_modal_user_turn_uses_the_same_chronology_boundary() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let chronology = Arc::new(AtomicU64::new(0));
+    chat.set_user_chronology_epoch(Arc::clone(&chronology));
+
+    let result = chat.submit_user_message_as_plain_user_turn(UserMessage::from(
+        "!literal side-conversation input",
+    ));
+
+    assert!(result.is_none(), "unconfigured modal input is queued");
+    assert_eq!(
+        chronology.load(Ordering::Acquire),
+        1,
+        "non-composer modal user turns funnel through semantic admission; shell syntax is inert"
+    );
 }
 
 #[tokio::test]

@@ -547,6 +547,70 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
 }
 
 #[tokio::test]
+async fn distinct_identical_direct_submissions_each_render_one_user_item() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    for (item_id, client_id) in [
+        ("user-direct-1", "koenig-composer-direct-1"),
+        ("user-direct-2", "koenig-composer-direct-2"),
+    ] {
+        chat.handle_server_notification(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+                item: AppServerThreadItem::UserMessage {
+                    id: item_id.to_string(),
+                    client_id: Some(client_id.to_string()),
+                    content: vec![AppServerUserInput::Text {
+                        text: "continue".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+    }
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 2);
+    assert!(
+        inserted
+            .iter()
+            .all(|cell| lines_to_single_string(cell).contains("continue"))
+    );
+}
+
+#[tokio::test]
+async fn direct_submission_renders_during_review_mode_without_a_local_echo() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.review.is_review_mode = true;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::UserMessage {
+                id: "user-direct-review".to_string(),
+                client_id: Some("koenig-composer-direct-review".to_string()),
+                content: vec![AppServerUserInput::Text {
+                    text: "review-mode dictation".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 1);
+    assert!(lines_to_single_string(&inserted[0]).contains("review-mode dictation"));
+}
+
+#[tokio::test]
 async fn live_app_server_turn_completed_clears_working_status_after_answer_item() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

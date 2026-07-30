@@ -64,6 +64,9 @@ pub(super) struct QueuedUserMessage {
     pub(super) action: QueuedInputAction,
     pub(super) pending_pastes: Vec<(String, String)>,
     pub(super) composer_submission: Option<NativeComposerSubmission>,
+    /// True once this ordinary user turn has advanced the shared chronology. Queue drains and
+    /// rejected-steer retries preserve it so one semantic admission advances exactly once.
+    pub(super) chronology_noted: bool,
 }
 
 impl QueuedUserMessage {
@@ -73,15 +76,16 @@ impl QueuedUserMessage {
             action,
             pending_pastes: Vec::new(),
             composer_submission: None,
+            chronology_noted: false,
         }
     }
 
-    pub(super) fn into_user_message(self) -> UserMessage {
-        self.user_message
-    }
-
-    pub(super) fn into_submission(self) -> (UserMessage, Option<NativeComposerSubmission>) {
-        (self.user_message, self.composer_submission)
+    pub(super) fn into_submission(self) -> (UserMessage, Option<NativeComposerSubmission>, bool) {
+        (
+            self.user_message,
+            self.composer_submission,
+            self.chronology_noted,
+        )
     }
 }
 

@@ -49,14 +49,27 @@ impl ChatWidget {
         drain
     }
 
-    pub(super) fn submit_queued_shell_prompt(&mut self, user_message: UserMessage) -> QueueDrain {
+    pub(super) fn submit_queued_shell_prompt(
+        &mut self,
+        queued_message: QueuedUserMessage,
+    ) -> QueueDrain {
+        let QueuedUserMessage {
+            user_message,
+            composer_submission,
+            chronology_noted,
+            ..
+        } = queued_message;
         match user_message.text.strip_prefix('!') {
             Some(command) => {
                 let history_text = user_message.text.clone();
                 self.submit_shell_command_with_history(command, &history_text)
             }
             None => {
-                self.submit_user_message(user_message);
+                self.submit_user_message_with_composer_submission_and_chronology(
+                    user_message,
+                    composer_submission,
+                    chronology_noted,
+                );
                 QueueDrain::Stop
             }
         }
@@ -74,11 +87,26 @@ impl ChatWidget {
         user_message: UserMessage,
         composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
     ) {
-        let _accepted = self.submit_user_message_with_history_record_and_composer_submission(
+        self.submit_user_message_with_composer_submission_and_chronology(
             user_message,
-            UserMessageHistoryRecord::UserMessageText,
             composer_submission,
+            /*chronology_noted*/ false,
         );
+    }
+
+    pub(super) fn submit_user_message_with_composer_submission_and_chronology(
+        &mut self,
+        user_message: UserMessage,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+        chronology_noted: bool,
+    ) {
+        let _accepted = self
+            .submit_user_message_with_history_record_composer_submission_and_chronology(
+                user_message,
+                UserMessageHistoryRecord::UserMessageText,
+                composer_submission,
+                chronology_noted,
+            );
     }
 
     pub(super) fn submit_user_message_with_history_record(
@@ -99,11 +127,27 @@ impl ChatWidget {
         history_record: UserMessageHistoryRecord,
         composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
     ) -> bool {
+        self.submit_user_message_with_history_record_composer_submission_and_chronology(
+            user_message,
+            history_record,
+            composer_submission,
+            /*chronology_noted*/ false,
+        )
+    }
+
+    pub(super) fn submit_user_message_with_history_record_composer_submission_and_chronology(
+        &mut self,
+        user_message: UserMessage,
+        history_record: UserMessageHistoryRecord,
+        composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+        chronology_noted: bool,
+    ) -> bool {
         self.submit_user_message_with_history_and_shell_escape_policy(
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
             composer_submission,
+            chronology_noted,
         )
         .0
     }
@@ -118,6 +162,7 @@ impl ChatWidget {
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
             None,
+            /*chronology_noted*/ false,
         )
         .1
     }
@@ -128,9 +173,16 @@ impl ChatWidget {
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
         composer_submission: Option<crate::composer_control::NativeComposerSubmission>,
+        chronology_noted: bool,
     ) -> (bool, Option<AppCommand>) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
+            let chronology_noted = self.ensure_user_chronology_noted(
+                &user_message,
+                composer_submission.as_ref(),
+                chronology_noted,
+                shell_escape_policy,
+            );
             self.input_queue
                 .queued_user_messages
                 .push_front(QueuedUserMessage {
@@ -138,6 +190,7 @@ impl ChatWidget {
                     action: QueuedInputAction::Plain,
                     pending_pastes: Vec::new(),
                     composer_submission,
+                    chronology_noted,
                 });
             self.input_queue
                 .queued_user_message_history_records
@@ -193,6 +246,19 @@ impl ChatWidget {
             };
             return (app_command.is_some(), app_command);
         }
+
+        let _chronology_noted = self.ensure_user_chronology_noted(
+            &UserMessage {
+                text: text.clone(),
+                local_images: local_images.clone(),
+                remote_image_urls: remote_image_urls.clone(),
+                text_elements: text_elements.clone(),
+                mention_bindings: mention_bindings.clone(),
+            },
+            composer_submission.as_ref(),
+            chronology_noted,
+            shell_escape_policy,
+        );
 
         for image_url in &remote_image_urls {
             items.push(UserInput::Image {
@@ -453,6 +519,29 @@ impl ChatWidget {
 
         self.transcript.needs_final_message_separator = false;
         (true, Some(op))
+    }
+
+    pub(super) fn ensure_user_chronology_noted(
+        &self,
+        user_message: &UserMessage,
+        composer_submission: Option<&crate::composer_control::NativeComposerSubmission>,
+        chronology_noted: bool,
+        shell_escape_policy: ShellEscapePolicy,
+    ) -> bool {
+        if chronology_noted {
+            return true;
+        }
+        if composer_submission.is_some()
+            || (shell_escape_policy == ShellEscapePolicy::Allow
+                && user_message.text.starts_with('!'))
+            || (user_message.text.is_empty()
+                && user_message.local_images.is_empty()
+                && user_message.remote_image_urls.is_empty())
+        {
+            return false;
+        }
+        self.note_user_turn_admitted();
+        true
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.
