@@ -47,6 +47,9 @@ use crate::notifications::detect_backend;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
+#[cfg(test)]
+pub(crate) use crate::tui::event_stream::TuiEventReader;
+pub(crate) use crate::tui::event_stream::TuiEventReaderHandle;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
@@ -713,7 +716,7 @@ impl Tui {
         }
     }
 
-    pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
+    fn make_event_stream(&self) -> TuiEventStream {
         #[cfg(unix)]
         let stream = TuiEventStream::new(
             self.event_broker.clone(),
@@ -728,7 +731,15 @@ impl Tui {
             self.draw_tx.subscribe(),
             self.terminal_focused.clone(),
         );
-        Box::pin(stream)
+        stream
+    }
+
+    pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
+        Box::pin(self.make_event_stream())
+    }
+
+    pub(crate) fn event_reader(&self) -> TuiEventReaderHandle {
+        Box::pin(self.make_event_stream())
     }
 
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current

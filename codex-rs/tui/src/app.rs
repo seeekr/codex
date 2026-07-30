@@ -87,6 +87,7 @@ use crate::token_usage::TokenUsage;
 use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
+use crate::tui::TuiEventReaderHandle;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
 use crate::workspace_command::AppServerWorkspaceCommandRunner;
@@ -202,6 +203,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -274,15 +276,16 @@ enum SubmissionWaitEvent {
 /// Poll terminal ingress before composer control when both are already ready. The channels do not
 /// share an arrival sequence, so refusing an acquisition after concurrent terminal input is the
 /// conservative alternative to reserving a stale pre-input snapshot.
-async fn next_submission_wait_event<F>(
+async fn next_submission_wait_event<F, S>(
     composer_control_rx: &mut mpsc::UnboundedReceiver<
         crate::composer_control::ComposerControlRequest,
     >,
-    tui_events: &mut Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>>,
+    tui_events: &mut S,
     mut dispatch: Pin<&mut F>,
 ) -> SubmissionWaitEvent
 where
     F: Future<Output = SubmissionDispatchOutcome>,
+    S: tokio_stream::Stream<Item = TuiEvent> + Unpin + ?Sized,
 {
     select! {
         biased;
@@ -292,6 +295,34 @@ where
         }
         outcome = dispatch.as_mut() => SubmissionWaitEvent::Dispatch(outcome),
     }
+}
+
+/// Drain terminal input that is already ready without polling the independent draw channel.
+///
+/// The drain ends as soon as crossterm reports `Pending`, so redraw traffic cannot starve a
+/// composer-control request. A closed terminal stream is retained as the final event.
+async fn drain_ready_terminal_events(
+    tui_events: &mut TuiEventReaderHandle,
+) -> Vec<Option<TuiEvent>> {
+    let mut ready = Vec::new();
+    loop {
+        let event = std::future::poll_fn(|cx| {
+            Poll::Ready(match tui_events.as_mut().poll_terminal_event(cx) {
+                Poll::Ready(event) => Some(event),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        match event {
+            Some(Some(event)) => ready.push(Some(event)),
+            Some(None) => {
+                ready.push(None);
+                break;
+            }
+            None => break,
+        }
+    }
+    ready
 }
 
 fn pop_deferred_tui_event(
@@ -920,7 +951,7 @@ impl App {
         >,
         deferred_composer_requests: &mut VecDeque<crate::composer_control::ComposerControlRequest>,
         deferred_tui_events: &mut VecDeque<DeferredTuiEvent>,
-        tui_events: &mut Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>>,
+        tui_events: &mut TuiEventReaderHandle,
     ) {
         let app_overlay_active = self.overlay.is_some();
         let Some(action) = composer_control_state.handle_ui_request(
@@ -1439,7 +1470,7 @@ See the Codex keymap documentation for supported actions and examples."
         }
 
         let event_stream_started_at = Instant::now();
-        let mut tui_events = tui.event_stream();
+        let mut tui_events = tui.event_reader();
 
         tui.frame_requester().schedule_frame();
         tracing::info!(
@@ -1538,18 +1569,50 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                     }
                     Some(request) = composer_control_rx.recv() => {
-                        app.handle_composer_control_request(
-                            &mut app_server,
-                            &mut composer_control_state,
-                            request,
-                            &composer_correction_tx,
-                            &mut composer_control_rx,
-                            &mut deferred_composer_requests,
-                            &mut deferred_tui_events,
-                            &mut tui_events,
-                        )
-                        .await;
-                        AppRunControl::Continue
+                        let mut terminal_control = AppRunControl::Continue;
+                        let mut terminal_error = None;
+                        for event in drain_ready_terminal_events(&mut tui_events).await {
+                            let event = event.map(|event| DeferredTuiEvent::Event {
+                                event,
+                                submission_fence: None,
+                            });
+                            match app
+                                .handle_composer_tui_event(
+                                    tui,
+                                    &mut app_server,
+                                    &mut composer_control_state,
+                                    event,
+                                )
+                                .await
+                            {
+                                Ok(AppRunControl::Continue) => {}
+                                Ok(control @ AppRunControl::Exit(_)) => {
+                                    terminal_control = control;
+                                    break;
+                                }
+                                Err(err) => {
+                                    terminal_error = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(err) = terminal_error {
+                            break Err(err);
+                        }
+                        if matches!(terminal_control, AppRunControl::Continue) {
+                            app.handle_composer_control_request(
+                                &mut app_server,
+                                &mut composer_control_state,
+                                request,
+                                &composer_correction_tx,
+                                &mut composer_control_rx,
+                                &mut deferred_composer_requests,
+                                &mut deferred_tui_events,
+                                &mut tui_events,
+                            )
+                            .await;
+                        }
+                        terminal_control
                     }
                     Some((correction, outcome)) = composer_correction_rx.recv() => {
                         composer_control_state.finish_correction(correction, outcome);

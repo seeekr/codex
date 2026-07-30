@@ -44,6 +44,16 @@ pub trait EventSource: Send + 'static {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>>;
 }
 
+/// A TUI event stream that can poll terminal ingress independently of redraw notifications.
+///
+/// Composer acquisition uses the terminal-only poll to consume input that was already queued
+/// without allowing a continuously ready draw channel to delay the acquisition indefinitely.
+pub(crate) trait TuiEventReader: Stream<Item = TuiEvent> + Send {
+    fn poll_terminal_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>>;
+}
+
+pub(crate) type TuiEventReaderHandle = Pin<Box<dyn TuiEventReader + 'static>>;
+
 /// Shared crossterm input state for all [`TuiEventStream`] instances. A single crossterm EventStream
 /// is reused so all streams still see the same input source.
 ///
@@ -270,6 +280,15 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
 }
 
 impl<S: EventSource + Default + Unpin> Unpin for TuiEventStream<S> {}
+
+impl<S: EventSource + Default + Unpin> TuiEventReader for TuiEventStream<S> {
+    fn poll_terminal_event(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<TuiEvent>> {
+        self.poll_crossterm_event(cx)
+    }
+}
 
 impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
     type Item = TuiEvent;

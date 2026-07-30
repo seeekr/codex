@@ -6516,6 +6516,72 @@ async fn delayed_submit_prefers_pre_ready_terminal_input_over_a_later_acquire() 
     ));
 }
 
+struct AlwaysReadyDrawWithTerminalInput {
+    terminal_events: VecDeque<TuiEvent>,
+}
+
+impl tokio_stream::Stream for AlwaysReadyDrawWithTerminalInput {
+    type Item = TuiEvent;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(Some(TuiEvent::Draw))
+    }
+}
+
+impl crate::tui::TuiEventReader for AlwaysReadyDrawWithTerminalInput {
+    fn poll_terminal_event(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<TuiEvent>> {
+        match self.terminal_events.pop_front() {
+            Some(event) => Poll::Ready(Some(event)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_acquire_drains_pre_ready_terminal_input_past_ready_draws() {
+    let mut tui_events: TuiEventReaderHandle = Box::pin(AlwaysReadyDrawWithTerminalInput {
+        terminal_events: VecDeque::from([
+            TuiEvent::Resize,
+            TuiEvent::Paste("draft already queued".to_string()),
+        ]),
+    });
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    control_tx
+        .send(
+            crate::composer_control::ComposerControlRequest::acquire_send_for_test(
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .expect("composer control receiver");
+
+    let request = control_rx.recv().await.expect("pre-ready acquire request");
+    let terminal_events = time::timeout(
+        Duration::from_millis(100),
+        drain_ready_terminal_events(&mut tui_events),
+    )
+    .await
+    .expect("ready draw traffic must not keep the terminal drain alive");
+
+    assert!(matches!(
+        terminal_events.as_slice(),
+        [
+            Some(TuiEvent::Resize),
+            Some(TuiEvent::Paste(text))
+        ] if text == "draft already queued"
+    ));
+    assert!(matches!(
+        time::timeout(Duration::from_millis(100), tui_events.next()).await,
+        Ok(Some(TuiEvent::Draw))
+    ));
+    drop(request);
+}
+
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {
     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
 }
