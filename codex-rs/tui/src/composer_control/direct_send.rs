@@ -24,6 +24,7 @@ use super::text_hash;
 
 pub(super) const MAX_DIRECT_SEND_RESERVATIONS: usize = 256;
 const MAX_DIRECT_SEND_KEEP_TOMBSTONES: usize = 256;
+const MAX_DIRECT_SEND_UNKNOWN_ACKNOWLEDGEMENT_TOMBSTONES: usize = 256;
 
 #[derive(Clone)]
 enum DirectSendState {
@@ -82,6 +83,8 @@ pub(super) struct DirectSendReservations {
     order: VecDeque<Uuid>,
     kept: HashSet<Uuid>,
     kept_order: VecDeque<Uuid>,
+    unknown_acknowledged: HashSet<Uuid>,
+    unknown_acknowledged_order: VecDeque<Uuid>,
 }
 
 impl DirectSendReservations {
@@ -91,6 +94,8 @@ impl DirectSendReservations {
             order: VecDeque::new(),
             kept: HashSet::new(),
             kept_order: VecDeque::new(),
+            unknown_acknowledged: HashSet::new(),
+            unknown_acknowledged_order: VecDeque::new(),
         }
     }
 
@@ -102,6 +107,10 @@ impl DirectSendReservations {
         self.reservations.contains_key(&lease_id) || self.kept.contains(&lease_id)
     }
 
+    pub(super) fn contains_acknowledgement_id(&self, lease_id: Uuid) -> bool {
+        self.reservations.contains_key(&lease_id) || self.unknown_acknowledged.contains(&lease_id)
+    }
+
     pub(super) fn acquire(&mut self, thread_id: String, user_chronology_epoch: u64) -> WireResult {
         self.retire_terminal();
         if self.reservations.len() >= MAX_DIRECT_SEND_RESERVATIONS {
@@ -109,7 +118,10 @@ impl DirectSendReservations {
         }
         let lease_id = loop {
             let candidate = Uuid::new_v4();
-            if !self.reservations.contains_key(&candidate) && !self.kept.contains(&candidate) {
+            if !self.reservations.contains_key(&candidate)
+                && !self.kept.contains(&candidate)
+                && !self.unknown_acknowledged.contains(&candidate)
+            {
                 break candidate;
             }
         };
@@ -306,6 +318,30 @@ impl DirectSendReservations {
                 WireResult::not_applied(ErrorCode::LeaseUnavailable)
             }
             DirectSendState::Resolved { result, .. } => result,
+        }
+    }
+
+    pub(super) fn acknowledge_unknown(&mut self, lease_id: Uuid) -> WireResult {
+        let Some(state) = self
+            .reservations
+            .get(&lease_id)
+            .map(|reservation| reservation.state.clone())
+        else {
+            return if self.unknown_acknowledged.contains(&lease_id) {
+                WireResult::UnknownAcknowledged
+            } else {
+                WireResult::not_applied(ErrorCode::LeaseUnavailable)
+            };
+        };
+        match state {
+            DirectSendState::Resolved {
+                result: WireResult::Unknown,
+                ..
+            } => {
+                self.remove_unknown_acknowledged(lease_id);
+                WireResult::UnknownAcknowledged
+            }
+            state => state_wire_result(&state),
         }
     }
 
@@ -627,6 +663,19 @@ impl DirectSendReservations {
                 break;
             };
             self.kept.remove(&expired);
+        }
+    }
+
+    fn remove_unknown_acknowledged(&mut self, lease_id: Uuid) {
+        self.remove(lease_id);
+        if self.unknown_acknowledged.insert(lease_id) {
+            self.unknown_acknowledged_order.push_back(lease_id);
+        }
+        while self.unknown_acknowledged.len() > MAX_DIRECT_SEND_UNKNOWN_ACKNOWLEDGEMENT_TOMBSTONES {
+            let Some(expired) = self.unknown_acknowledged_order.pop_front() else {
+                break;
+            };
+            self.unknown_acknowledged.remove(&expired);
         }
     }
 }

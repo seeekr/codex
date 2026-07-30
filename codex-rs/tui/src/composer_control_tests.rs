@@ -786,6 +786,99 @@ fn ambiguous_direct_keep_intent_releases_on_late_commit_or_abandon() {
 }
 
 #[test]
+fn direct_unknown_acknowledgement_is_idempotent_and_releases_the_reservation() {
+    let (mut state, mut target, lease_id, submission, _) =
+        direct_at_stage(DirectReceiptStage::Unknown);
+
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged
+    );
+    assert!(!state.direct_sends.contains(lease_id));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged,
+        "retrying after a lost acknowledgement response must converge"
+    );
+
+    state.direct_sends.note_submission_committed(&submission);
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged,
+        "a late commit remains possible but cannot reclaim local reservation ownership"
+    );
+
+    let following = acquire_direct(&mut state, &mut target);
+    let following_submission =
+        prepare_direct(&mut state, &mut target, following, "following recording");
+    assert_eq!(following_submission.expected, "following recording");
+}
+
+#[test]
+fn direct_terminal_truth_wins_over_unknown_acknowledgement() {
+    for (stage, expected) in [
+        (DirectReceiptStage::Pending, WireResult::SubmissionPending),
+        (DirectReceiptStage::Intact, WireResult::SubmittedIntact),
+        (
+            DirectReceiptStage::Abandoned,
+            WireResult::SubmissionAbandoned,
+        ),
+    ] {
+        let (mut state, mut target, lease_id, submission, _) =
+            direct_at_stage(DirectReceiptStage::Unknown);
+        match stage {
+            DirectReceiptStage::Pending => {
+                state.direct_sends.note_submission_pending(&submission);
+            }
+            DirectReceiptStage::Intact => {
+                state.direct_sends.note_submission_committed(&submission);
+            }
+            DirectReceiptStage::Abandoned => {
+                state.direct_sends.note_submission_abandoned(&submission);
+            }
+            DirectReceiptStage::Dispatching
+            | DirectReceiptStage::Unknown
+            | DirectReceiptStage::CorrectionPending => unreachable!("terminal stages only"),
+        }
+        assert_eq!(
+            state.execute(
+                ComposerCommand::AcknowledgeUnknown { lease_id },
+                &mut target,
+                /*app_overlay_active*/ false,
+            ),
+            expected,
+            "{stage:?} truth must win the serialized acknowledgement race"
+        );
+        assert!(state.direct_sends.contains(lease_id));
+    }
+
+    let (mut state, mut target, lease_id, _submission, _) =
+        direct_at_stage(DirectReceiptStage::Dispatching);
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown,
+        "a dispatch still in progress has no resolved ambiguity to acknowledge"
+    );
+    assert!(state.direct_sends.contains(lease_id));
+}
+
+#[test]
 fn direct_keep_retries_converge_after_a_lost_ack_and_late_settlement() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
@@ -1812,6 +1905,141 @@ fn accepted_submit_is_pending_until_commit_and_retries_observe_stable_state() {
         ),
         CommandExecution::Complete(WireResult::SendAccepted)
     ));
+}
+
+#[test]
+fn captured_unknown_acknowledgement_is_idempotent_and_releases_the_fence() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (native, range) = match &state.leases.get(&lease_id).expect("lease").state {
+        ExternalLeaseState::Draft { native } => (
+            *native,
+            target.leases.get(native).expect("native range").clone(),
+        ),
+        _ => panic!("new lease must own the draft"),
+    };
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let fence = pending.fence();
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged
+    );
+    assert!(fence.is_relinquished());
+    assert!(!state.leases.contains_key(&lease_id));
+    assert!(!target.leases.contains_key(&native));
+    assert_eq!(target.text, "dictated");
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged,
+        "retrying after a lost acknowledgement response must converge"
+    );
+
+    let late_submission_id = Uuid::new_v4();
+    state.note_submission_pending_by_native(
+        "synthetic-thread",
+        late_submission_id,
+        Arc::from("dictated"),
+        &[(native, range)],
+    );
+    state.note_submission_committed_id("synthetic-thread", late_submission_id);
+    assert_eq!(target.text, "dictated");
+    assert_eq!(
+        state.execute(
+            ComposerCommand::AcknowledgeUnknown { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::UnknownAcknowledged
+    );
+
+    let following_capture = capture(&mut state, &mut target);
+    let following = insert(
+        &mut state,
+        &mut target,
+        following_capture,
+        " following recording",
+    );
+    assert!(state.leases.contains_key(&following));
+    assert_eq!(target.text, "dictated following recording");
+}
+
+#[test]
+fn captured_terminal_truth_wins_over_unknown_acknowledgement() {
+    let (mut pending_state, mut pending_target, pending_lease) = inserted_draft("pending");
+    let (pending, reply_rx) = start_submit(
+        &mut pending_state,
+        &mut pending_target,
+        pending_lease,
+        "pending",
+    );
+    let pending_submission_id =
+        mark_submission_pending(&mut pending_state, &pending_target, &[pending_lease]);
+    pending_state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+    assert_eq!(
+        pending_state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: pending_lease,
+            },
+            &mut pending_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionPending
+    );
+    assert!(pending_state.leases.contains_key(&pending_lease));
+    pending_state.note_submission_committed_id("synthetic-thread", pending_submission_id);
+    assert_eq!(
+        pending_state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: pending_lease,
+            },
+            &mut pending_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmittedIntact
+    );
+
+    let (mut abandoned_state, mut abandoned_target, abandoned_lease) = inserted_draft("abandoned");
+    let (pending, reply_rx) = start_submit(
+        &mut abandoned_state,
+        &mut abandoned_target,
+        abandoned_lease,
+        "abandoned",
+    );
+    let abandoned_submission_id =
+        mark_submission_pending(&mut abandoned_state, &abandoned_target, &[abandoned_lease]);
+    abandoned_state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+    abandoned_state.note_submission_abandoned_id("synthetic-thread", abandoned_submission_id);
+    assert_eq!(
+        abandoned_state.execute(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: abandoned_lease,
+            },
+            &mut abandoned_target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionAbandoned
+    );
 }
 
 #[test]
@@ -3368,6 +3596,20 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
         }) if parsed_lease == lease_id && expected == "line\nsubmit"
     ));
 
+    let request: WireRequest = serde_json::from_value(serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "instanceId": instance_id,
+        "op": "acknowledge_unknown",
+        "leaseId": lease_id,
+    }))
+    .expect("wire request");
+    assert!(matches!(
+        request.into_command(instance_id),
+        Ok(ComposerCommand::AcknowledgeUnknown {
+            lease_id: parsed_lease,
+        }) if parsed_lease == lease_id
+    ));
+
     assert!(
         serde_json::from_value::<WireRequest>(serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -3435,6 +3677,7 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
         (WireResult::SendAccepted, "send_accepted"),
         (WireResult::SubmissionAbandoned, "submission_abandoned"),
         (WireResult::Unknown, "unknown"),
+        (WireResult::UnknownAcknowledged, "unknown_acknowledged"),
     ] {
         assert_eq!(
             serde_json::to_value(WireResponse {
@@ -3450,7 +3693,7 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
 }
 
 #[test]
-fn insert_submit_and_replace_can_have_unknown_ui_timeout_effects() {
+fn insert_submit_acknowledge_and_replace_can_have_unknown_ui_timeout_effects() {
     let acquire = ComposerCommand::AcquireSend;
     let capture = ComposerCommand::Capture;
     let insert = ComposerCommand::Insert {
@@ -3468,6 +3711,9 @@ fn insert_submit_and_replace_can_have_unknown_ui_timeout_effects() {
     let keep = ComposerCommand::Keep {
         lease_id: Uuid::new_v4(),
     };
+    let acknowledge_unknown = ComposerCommand::AcknowledgeUnknown {
+        lease_id: Uuid::new_v4(),
+    };
     let replace = ComposerCommand::Replace {
         lease_id: Uuid::new_v4(),
         expected: "fast".to_string(),
@@ -3480,6 +3726,7 @@ fn insert_submit_and_replace_can_have_unknown_ui_timeout_effects() {
     assert!(!verify.may_have_effect());
     assert!(submit.may_have_effect());
     assert!(!keep.may_have_effect());
+    assert!(acknowledge_unknown.may_have_effect());
     assert!(replace.may_have_effect());
 }
 
@@ -3496,6 +3743,19 @@ fn acquire_send_socket_timeout_is_unknown_because_a_reservation_may_exist() {
     assert_eq!(
         ui_reply_timeout_result(ComposerCommand::Capture.may_have_effect()),
         WireResult::not_applied(ErrorCode::UiTimeout)
+    );
+    assert_eq!(
+        ui_reply_timeout_result(
+            ComposerCommand::AcknowledgeUnknown {
+                lease_id: Uuid::new_v4(),
+            }
+            .may_have_effect(),
+        ),
+        WireResult::Error {
+            code: ErrorCode::UiTimeout,
+            outcome: MutationOutcome::Unknown,
+        },
+        "an acknowledgement retry must recover when its first response is lost"
     );
 }
 
