@@ -3585,13 +3585,14 @@ fn unix_listener_accepts_a_second_stop_while_the_first_ui_reply_is_blocked() {
     use std::os::unix::net::UnixStream;
 
     let root = tempfile::Builder::new()
-        .prefix("cc-overlap-")
+        .prefix("c")
         .tempdir_in("/tmp")
         .expect("short temporary root");
-    let session_guid = Uuid::new_v4().to_string();
+    // Keep every synthetic path component short: macOS limits AF_UNIX paths to 104 bytes.
+    let session_guid = "s";
     let instance_id = Uuid::new_v4();
     let (request_tx, mut request_rx) = unbounded_channel();
-    let server = ComposerControlServer::bind(root.path(), &session_guid, instance_id, request_tx)
+    let server = ComposerControlServer::bind(root.path(), session_guid, instance_id, request_tx)
         .expect("bind synthetic composer-control listener");
     let (seen_tx, seen_rx) = std::sync::mpsc::channel();
     let responder = std::thread::spawn(move || {

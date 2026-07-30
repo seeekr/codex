@@ -109,6 +109,7 @@ async fn queued_manual_input_advances_user_chronology_exactly_once_before_queue_
     chat.thread_id = Some(thread_id);
     let chronology = Arc::new(AtomicU64::new(0));
     chat.set_user_chronology_epoch(Arc::clone(&chronology));
+    chat.bottom_pane.set_task_running(/*running*/ true);
 
     chat.handle_composer_input_result(
         InputResult::Queued {
@@ -126,14 +127,12 @@ async fn queued_manual_input_advances_user_chronology_exactly_once_before_queue_
         1,
         "queue admission synchronously invalidates older direct reservations"
     );
-    assert!(
-        op_rx.try_recv().is_err(),
-        "the chronology boundary precedes eventual queued user-turn dispatch"
-    );
+    assert_no_submit_op(&mut op_rx);
 
     let (queued, history_record) = chat
         .pop_next_queued_user_message()
         .expect("queued manual input");
+    chat.bottom_pane.set_task_running(/*running*/ false);
     let (message, composer_submission, chronology_noted) = queued.into_submission();
     chat.submit_user_message_with_history_record_composer_submission_and_chronology(
         message,
@@ -146,11 +145,15 @@ async fn queued_manual_input_advances_user_chronology_exactly_once_before_queue_
         1,
         "draining or requeueing the same semantic admission must not advance twice"
     );
+    assert!(matches!(
+        next_submit_op(&mut op_rx),
+        AppCommand::UserTurn { .. }
+    ));
 }
 
 #[tokio::test]
 async fn programmatic_side_modal_user_turn_uses_the_same_chronology_boundary() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     let chronology = Arc::new(AtomicU64::new(0));
     chat.set_user_chronology_epoch(Arc::clone(&chronology));
@@ -159,7 +162,14 @@ async fn programmatic_side_modal_user_turn_uses_the_same_chronology_boundary() {
         "!literal side-conversation input",
     ));
 
-    assert!(result.is_none(), "unconfigured modal input is queued");
+    assert!(
+        matches!(result, Some(AppCommand::UserTurn { .. })),
+        "a configured modal input is submitted as an ordinary user turn"
+    );
+    assert!(matches!(
+        next_submit_op(&mut op_rx),
+        AppCommand::UserTurn { .. }
+    ));
     assert_eq!(
         chronology.load(Ordering::Acquire),
         1,
