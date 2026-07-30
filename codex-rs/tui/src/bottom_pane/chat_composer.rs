@@ -64,6 +64,11 @@
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
 //!
+//! Native composer control uses a stricter two-phase path: it first projects an exact plain-text
+//! submission without mutating the draft, rejecting queues, rich elements, attachments, pending
+//! or active paste state, and command modes. Only after app-server acceptance does an exact
+//! compare-and-swap record history and clear that same draft.
+//!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
 //! of a draft, perform a composer action such as changing reasoning level, and then `Ctrl+Y` the
@@ -211,6 +216,7 @@ use super::slash_commands::BuiltinCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandItem;
 use super::textarea::ComposerLeaseId;
+use super::textarea::ComposerLeasesSnapshot;
 use super::textarea::SubmittedComposerLease;
 use crate::bottom_pane::paste_burst::FlushResult;
 use crate::history_cell::sanitize_user_text;
@@ -435,6 +441,14 @@ pub(crate) struct ComposerDraftSnapshot {
     pub(crate) remote_image_urls: Vec<String>,
     pub(crate) mention_bindings: Vec<MentionBinding>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+}
+
+/// Immutable, strict plain-draft projection used by native semantic submission. It deliberately
+/// has no `Debug` implementation because it carries the composer text.
+pub(crate) struct PlainComposerSubmission {
+    pub(crate) draft_text: String,
+    pub(crate) submitted_text: String,
+    pub(crate) leases: Vec<SubmittedComposerLease>,
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
@@ -695,6 +709,10 @@ impl ChatComposer {
         self.footer.history_search_key = primary_binding(&keymap.composer.history_search_previous);
         self.footer.reasoning_down_key = primary_binding(&keymap.chat.decrease_reasoning_effort);
         self.footer.reasoning_up_key = primary_binding(&keymap.chat.increase_reasoning_effort);
+    }
+
+    pub(crate) fn is_submit_key(&self, key_event: KeyEvent) -> bool {
+        self.submit_keys.is_pressed(key_event)
     }
 
     pub fn set_collaboration_mode_indicator(
@@ -1508,6 +1526,111 @@ impl ChatComposer {
 
     pub(crate) fn take_recent_submission_composer_leases(&mut self) -> Vec<SubmittedComposerLease> {
         std::mem::take(&mut self.draft.recent_submission_composer_leases)
+    }
+
+    pub(crate) fn composer_leases_state(&self) -> ComposerLeasesSnapshot {
+        self.draft.textarea.composer_leases_state()
+    }
+
+    pub(crate) fn restore_owned_draft_state(
+        &mut self,
+        cursor: usize,
+        leases: &ComposerLeasesSnapshot,
+    ) -> bool {
+        if !self.draft.textarea.restore_composer_leases(leases) {
+            return false;
+        }
+        self.draft.textarea.set_cursor(cursor);
+        true
+    }
+
+    /// Project an exact plain submission without clearing or otherwise mutating the composer.
+    pub(crate) fn preview_owned_plain_submission(
+        &self,
+        native: ComposerLeaseId,
+        expected: &str,
+    ) -> Option<PlainComposerSubmission> {
+        if self.draft.is_bash_mode
+            || self.queue_submissions
+            || self.draft.paste_burst.is_active()
+            || !self.draft.pending_pastes.is_empty()
+            || !self.current_text_elements().is_empty()
+            || !self.draft.mention_bindings.is_empty()
+            || !self.attachments.is_empty()
+            || self.verify_owned_text(native, expected).is_err()
+        {
+            return None;
+        }
+        let draft_text = self.current_text();
+        let trim_start = draft_text.len() - draft_text.trim_start().len();
+        let trim_end = draft_text.trim_end().len();
+        let submitted_text = draft_text.get(trim_start..trim_end)?.to_string();
+        if submitted_text.is_empty()
+            || submitted_text.starts_with('/')
+            || submitted_text.starts_with('!')
+        {
+            return None;
+        }
+        let leases = self
+            .draft
+            .textarea
+            .composer_lease_snapshots()
+            .into_iter()
+            .filter_map(|(id, range)| {
+                (range.start >= trim_start && range.end <= trim_end).then(|| {
+                    SubmittedComposerLease {
+                        id,
+                        range: range.start - trim_start..range.end - trim_start,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if !leases.iter().any(|lease| {
+            lease.id == native
+                && submitted_text
+                    .get(lease.range.clone())
+                    .is_some_and(|text| text == expected)
+        }) {
+            return None;
+        }
+        Some(PlainComposerSubmission {
+            draft_text,
+            submitted_text,
+            leases,
+        })
+    }
+
+    /// Atomically commit a previously projected plain submission after app-server acceptance.
+    pub(crate) fn commit_owned_plain_submission(
+        &mut self,
+        preview: &PlainComposerSubmission,
+        native: ComposerLeaseId,
+        expected: &str,
+    ) -> bool {
+        let Some(current) = self.preview_owned_plain_submission(native, expected) else {
+            return false;
+        };
+        if current.draft_text != preview.draft_text
+            || current.submitted_text != preview.submitted_text
+            || current.leases != preview.leases
+        {
+            return false;
+        }
+
+        self.history.record_local_submission(HistoryEntry {
+            text: preview.submitted_text.clone(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+            mention_bindings: Vec::new(),
+            pending_pastes: Vec::new(),
+        });
+        self.draft.recent_submission_mention_bindings.clear();
+        self.draft.recent_submission_composer_leases.clear();
+        self.draft.textarea.set_text_clearing_elements("");
+        self.draft.is_bash_mode = false;
+        self.draft.pending_pastes.clear();
+        true
     }
 
     /// Commit the staged slash-command draft to local Up-arrow recall.
@@ -4670,6 +4793,14 @@ mod tests {
         )
     }
 
+    fn new_owned_test_composer(expected: &str) -> (ChatComposer, ComposerLeaseId) {
+        let (mut composer, _rx) = new_test_composer();
+        let lease = composer
+            .insert_owned_text(expected)
+            .expect("owned insertion");
+        (composer, lease)
+    }
+
     #[test]
     fn owned_text_redraw_sync_does_not_emit_draft_fragments() {
         let (mut composer, mut rx) = new_test_composer();
@@ -4728,6 +4859,136 @@ mod tests {
         assert_eq!(
             &text[composer_leases[0].range.end..composer_leases[1].range.start],
             " unowned "
+        );
+    }
+
+    #[test]
+    fn plain_owned_submission_commits_only_the_exact_preview_after_acceptance() {
+        let (mut composer, _rx) = new_test_composer();
+        composer
+            .draft
+            .textarea
+            .set_text_clearing_elements("  prefix ");
+        composer.draft.textarea.set_cursor("  prefix ".len());
+        let lease = composer
+            .insert_owned_text("dictated")
+            .expect("owned insertion");
+        composer.draft.textarea.insert_str(" suffix  ");
+
+        let preview = composer
+            .preview_owned_plain_submission(lease, "dictated")
+            .expect("strict plain preview");
+        assert_eq!(preview.draft_text, "  prefix dictated suffix  ");
+        assert_eq!(preview.submitted_text, "prefix dictated suffix");
+        assert_eq!(composer.current_text(), "  prefix dictated suffix  ");
+
+        composer
+            .draft
+            .textarea
+            .set_cursor(composer.current_text().len());
+        composer.draft.textarea.insert_str("x");
+        assert!(!composer.commit_owned_plain_submission(&preview, lease, "dictated"));
+        assert_eq!(composer.current_text(), "  prefix dictated suffix  x");
+
+        let trailing = composer.current_text().len() - 1..composer.current_text().len();
+        composer.draft.textarea.replace_range(trailing, "");
+        assert!(composer.commit_owned_plain_submission(&preview, lease, "dictated"));
+        assert!(composer.current_text().is_empty());
+    }
+
+    #[test]
+    fn plain_owned_submission_rejects_non_plain_or_unsettled_composer_state() {
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        composer.set_queue_submissions(/*queue_submissions*/ true);
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        composer
+            .draft
+            .pending_pastes
+            .push(("[Pasted Content]".to_string(), "payload".to_string()));
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(composer.is_in_paste_burst());
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        composer.draft.is_bash_mode = true;
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        for command in ["/review ", "!echo "] {
+            let (mut composer, _rx) = new_test_composer();
+            composer.draft.textarea.set_text_clearing_elements(command);
+            composer.draft.textarea.set_cursor(command.len());
+            let lease = composer
+                .insert_owned_text("dictated")
+                .expect("owned insertion");
+            assert!(
+                composer
+                    .preview_owned_plain_submission(lease, "dictated")
+                    .is_none()
+            );
+        }
+
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        assert!(
+            composer
+                .draft
+                .textarea
+                .add_element_range(0.."dictated".len())
+                .is_some()
+        );
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content_with_mention_bindings(
+            "$skill ".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![MentionBinding {
+                sigil: '$',
+                mention: "skill".to_string(),
+                path: "skill:///tmp/SKILL.md".to_string(),
+            }],
+        );
+        composer.move_cursor_to_end();
+        let lease = composer
+            .insert_owned_text("dictated")
+            .expect("owned insertion");
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
+        );
+
+        let (mut composer, lease) = new_owned_test_composer("dictated");
+        composer.attach_image(PathBuf::from("/tmp/image.png"));
+        assert!(
+            composer
+                .preview_owned_plain_submission(lease, "dictated")
+                .is_none()
         );
     }
 

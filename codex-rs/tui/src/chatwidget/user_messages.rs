@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::path::PathBuf;
 
+use crate::bottom_pane::ComposerLeasesSnapshot;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QueuedInputAction;
@@ -112,6 +113,8 @@ pub(super) struct ThreadComposerState {
     pub(super) text_elements: Vec<TextElement>,
     pub(super) mention_bindings: Vec<MentionBinding>,
     pub(super) pending_pastes: Vec<(String, String)>,
+    pub(super) cursor: Option<usize>,
+    pub(super) composer_leases: Option<ComposerLeasesSnapshot>,
 }
 
 impl ThreadComposerState {

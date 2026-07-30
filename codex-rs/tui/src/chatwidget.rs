@@ -376,6 +376,7 @@ use self::plugins::PluginsCacheState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod model_popups;
+mod native_composer_submit;
 mod notifications;
 use self::notifications::Notification;
 mod permission_popups;
@@ -425,6 +426,8 @@ mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
 mod usage;
 mod user_messages;
+pub(crate) use self::native_composer_submit::NativeComposerCommit;
+pub(crate) use self::native_composer_submit::PreparedNativeComposerSubmit;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
 use self::user_messages::QueueDrain;
@@ -1764,6 +1767,10 @@ impl ChatWidget {
             && self.bottom_pane.no_modal_or_popup_active()
             && !self.bottom_pane.is_in_paste_burst()
             && !self.bottom_pane.composer_has_pending_pastes()
+    }
+
+    pub(crate) fn is_composer_submit_event(&self, event: &crate::tui::TuiEvent) -> bool {
+        matches!(event, crate::tui::TuiEvent::Key(key) if self.bottom_pane.is_composer_submit_key(*key))
     }
 
     pub(crate) fn composer_text(&self) -> String {

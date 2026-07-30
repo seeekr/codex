@@ -136,6 +136,16 @@ impl ComposerControlTarget for FakeTarget {
         };
         Ok(())
     }
+
+    fn is_submit_event(&self, event: &TuiEvent) -> bool {
+        matches!(
+            event,
+            TuiEvent::Key(crossterm::event::KeyEvent {
+                code: crossterm::event::KeyCode::Enter,
+                ..
+            })
+        )
+    }
 }
 
 fn capture<L: Copy + Eq, T: ComposerControlTarget<Lease = L>>(
@@ -231,7 +241,46 @@ fn pending_correction(
     ) {
         CommandExecution::Correct(correction) => correction,
         CommandExecution::Complete(_) => panic!("submitted replacement should dispatch correction"),
+        CommandExecution::Submit(_) => panic!("replacement must not dispatch a submission"),
     }
+}
+
+fn start_submit(
+    state: &mut ComposerControlState<u64>,
+    target: &mut FakeTarget,
+    lease_id: Uuid,
+    expected: &str,
+) -> (
+    PendingComposerSubmission<u64>,
+    std::sync::mpsc::Receiver<WireResult>,
+) {
+    let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let action = state
+        .handle_ui_request(
+            ComposerControlRequest {
+                command: ComposerCommand::Submit {
+                    lease_id,
+                    expected: expected.to_string(),
+                },
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            },
+            target,
+            /*app_overlay_active*/ false,
+        )
+        .expect("exact draft should produce a pending submit action");
+    let PendingComposerControlAction::Submission(pending) = action else {
+        panic!("submit request must not produce a correction action");
+    };
+    (pending, reply_rx)
+}
+
+fn inserted_draft(expected: &str) -> (ComposerControlState<u64>, FakeTarget, Uuid) {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, expected);
+    (state, target, lease_id)
 }
 
 #[test]
@@ -365,6 +414,108 @@ fn capture_compare_and_swap_rejects_intervening_input_and_snapshot_changes() {
 }
 
 #[test]
+fn lease_capacity_never_evicts_unknown_provenance_or_its_enter_fence() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let pinned_id = Uuid::new_v4();
+    state.leases.insert(
+        pinned_id,
+        ExternalLease {
+            state: ExternalLeaseState::Draft { native: 10_000 },
+            thread_id: "other-thread".to_string(),
+            expected_hash: text_hash("pinned"),
+            draft_witness: DraftWitness {
+                text_hash: text_hash("pinned"),
+                cursor: "pinned".len(),
+                input_epoch: 0,
+            },
+            submit_attempt: Some(SubmitAttempt::Resolved {
+                result: WireResult::Unknown,
+                fence: Some(SubmitFence::new()),
+            }),
+        },
+    );
+    state.lease_order.push_back(pinned_id);
+    for index in 1..MAX_LEASE_COUNT {
+        let lease_id = Uuid::new_v4();
+        state.leases.insert(
+            lease_id,
+            ExternalLease {
+                state: ExternalLeaseState::SubmissionAbandoned {
+                    receipt: SubmittedLeaseReceipt {
+                        submission_id: Uuid::new_v4(),
+                        submitted_text: Arc::from(""),
+                        range: 0..0,
+                    },
+                },
+                thread_id: format!("settled-{index}"),
+                expected_hash: text_hash(""),
+                draft_witness: DraftWitness {
+                    text_hash: text_hash(""),
+                    cursor: 0,
+                    input_epoch: 0,
+                },
+                submit_attempt: Some(SubmitAttempt::Resolved {
+                    result: WireResult::SubmissionAbandoned,
+                    fence: None,
+                }),
+            },
+        );
+        state.lease_order.push_back(lease_id);
+    }
+
+    let capture_id = capture(&mut state, &mut target);
+    let inserted_id = insert(&mut state, &mut target, capture_id, "new");
+    assert!(state.leases.contains_key(&pinned_id));
+    assert!(state.leases.contains_key(&inserted_id));
+    assert_eq!(state.leases.len(), MAX_LEASE_COUNT);
+
+    let mut all_pinned = ComposerControlState::<u64>::new();
+    let mut untouched = FakeTarget::new("");
+    for index in 0..MAX_LEASE_COUNT {
+        let lease_id = Uuid::new_v4();
+        all_pinned.leases.insert(
+            lease_id,
+            ExternalLease {
+                state: ExternalLeaseState::Draft {
+                    native: index as u64,
+                },
+                thread_id: format!("pinned-{index}"),
+                expected_hash: text_hash("pinned"),
+                draft_witness: DraftWitness {
+                    text_hash: text_hash("pinned"),
+                    cursor: "pinned".len(),
+                    input_epoch: 0,
+                },
+                submit_attempt: Some(SubmitAttempt::Resolved {
+                    result: WireResult::Unknown,
+                    fence: Some(SubmitFence::new()),
+                }),
+            },
+        );
+        all_pinned.lease_order.push_back(lease_id);
+    }
+    let blocked_capture = capture(&mut all_pinned, &mut untouched);
+    assert!(matches!(
+        all_pinned.execute(
+            ComposerCommand::Insert {
+                capture_id: blocked_capture,
+                text: "must not appear".to_string(),
+            },
+            &mut untouched,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        }
+    ));
+    assert_eq!(untouched.text, "");
+    assert!(all_pinned.captures.contains_key(&blocked_capture));
+    assert_eq!(all_pinned.leases.len(), MAX_LEASE_COUNT);
+}
+
+#[test]
 fn captures_rebase_only_across_acknowledged_native_mutations() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("draft");
@@ -452,6 +603,757 @@ fn accepted_submission_survives_composer_clear_for_verify_and_keep() {
 }
 
 #[test]
+fn explicit_submit_refusal_preserves_the_draft_and_consumes_queued_submit_events() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let dispatch_fence = pending.fence();
+
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+    );
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+    );
+    assert_eq!(target.text, "dictated");
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&enter, &target, &dispatch_fence),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: true }
+    );
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&enter, &target, &dispatch_fence),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: false }
+    );
+    assert_eq!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::Allow
+    );
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::SubmissionUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Verified
+    ));
+}
+
+#[test]
+fn accepted_submit_consumes_dispatch_window_enter_after_the_draft_is_cleared() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let dispatch_fence = pending.fence();
+    mark_submission_pending(&mut state, &target, &[lease_id]);
+
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::SendAccepted
+    );
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&enter, &target, &dispatch_fence),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: true }
+    );
+}
+
+#[test]
+fn dispatch_window_enter_is_consumed_after_an_earlier_buffered_edit() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, _reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let dispatch_fence = pending.fence();
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+    );
+
+    let edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&edit, &target, &dispatch_fence),
+        TuiEventDisposition::Allow
+    );
+    state.note_tui_event(&edit);
+    target.user_insert(target.text.len(), "x");
+    state.finish_tui_event(&target);
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&enter, &target, &dispatch_fence),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: true }
+    );
+}
+
+#[test]
+fn accepted_submit_is_pending_until_commit_and_retries_observe_stable_state() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+
+    let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::SendAccepted
+    );
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionPending
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::SendAccepted)
+    ));
+
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::SendAccepted)
+    ));
+}
+
+#[test]
+fn unknown_submit_fences_exact_enter_until_the_user_relinquishes_the_draft() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let fence = pending.fence();
+    mark_submission_pending(&mut state, &target, &[lease_id]);
+    state.finish_submission(pending, SubmissionDispatchOutcome::AcceptedButUncommitted);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { disclose: true }
+    );
+    assert_eq!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { disclose: false }
+    );
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+
+    let edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event(&edit, &target),
+        TuiEventDisposition::Allow
+    );
+    assert!(!fence.is_relinquished());
+    state.note_tui_event(&edit);
+    target.user_insert(target.text.len(), "x");
+    state.finish_tui_event(&target);
+    assert!(fence.is_relinquished());
+    assert_eq!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::Allow
+    );
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+}
+
+#[test]
+fn unknown_submit_latch_blocks_native_mutation_and_survives_malformed_retries() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (native, range) = match &state.leases.get(&lease_id).expect("lease").state {
+        ExternalLeaseState::Draft { native } => (
+            *native,
+            target.leases.get(native).expect("native range").clone(),
+        ),
+        _ => panic!("new lease must own the draft"),
+    };
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let fence = pending.fence();
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "wrong".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { .. }
+    ));
+
+    let second_capture = capture(&mut state, &mut target);
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Insert {
+                capture_id: second_capture,
+                text: " more".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    );
+    assert_eq!(target.text, "dictated");
+    assert!(state.captures.contains_key(&second_capture));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    );
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "dictated".to_string(),
+                replacement: "corrected".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+    assert_eq!(target.text, "dictated");
+
+    let edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    state.note_tui_event(&edit);
+    target.user_insert(target.text.len(), "x");
+    state.finish_tui_event(&target);
+    assert!(fence.is_relinquished());
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "dictated".to_string(),
+                replacement: "corrected".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+    let recovery_capture = capture(&mut state, &mut target);
+    let recovery_lease = insert(&mut state, &mut target, recovery_capture, " new recording");
+    assert_eq!(target.text, "dictatedx new recording");
+    assert!(state.leases.contains_key(&recovery_lease));
+
+    let submission_id = Uuid::new_v4();
+    state.note_submission_pending_by_native(
+        "synthetic-thread",
+        submission_id,
+        Arc::from("dictated"),
+        &[(native, range)],
+    );
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "dictated".to_string(),
+                replacement: "corrected".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Correct(_)
+    ));
+}
+
+#[test]
+fn live_unknown_draft_does_not_block_an_independent_submitted_correction() {
+    let (mut state, mut target, submitted_lease) = inserted_draft("first");
+    mark_submitted(&mut state, &target, &[submitted_lease]);
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+
+    let unknown_capture = capture(&mut state, &mut target);
+    let unknown_lease = insert(&mut state, &mut target, unknown_capture, "second");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, unknown_lease, "second");
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id: submitted_lease,
+                expected: "first".to_string(),
+                replacement: "corrected first".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Correct(_)
+    ));
+}
+
+#[test]
+fn pending_submission_cannot_be_retired_before_commit_truth() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::SendAccepted
+    );
+
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionPending
+    );
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "dictated".to_string(),
+                replacement: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::SubmissionPending)
+    ));
+    assert!(state.leases.contains_key(&lease_id));
+
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Kept
+    );
+}
+
+#[test]
+fn manual_enter_before_socket_submit_is_unknown_until_commit_notification() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (native, range) = match &state.leases.get(&lease_id).expect("lease").state {
+        ExternalLeaseState::Draft { native } => (
+            *native,
+            target.leases.get(native).expect("native range").clone(),
+        ),
+        _ => panic!("new lease must own the draft"),
+    };
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::Allow
+    );
+    state.note_tui_event(&enter);
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+
+    let submission_id = Uuid::new_v4();
+    state.note_submission_pending_by_native(
+        "synthetic-thread",
+        submission_id,
+        Arc::from("dictated"),
+        &[(native, range)],
+    );
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmittedIntact
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+}
+
+#[test]
+fn rejected_manual_enter_does_not_masquerade_as_an_in_flight_send() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    state.note_tui_event(&enter);
+
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+    assert_eq!(target.text, "dictated");
+}
+
+#[test]
+fn unrelated_or_rejected_actions_do_not_relinquish_an_unknown_fence() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Insert {
+                capture_id: Uuid::new_v4(),
+                text: "ignored".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::CaptureUnavailable,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Keep {
+                lease_id: Uuid::new_v4(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "wrong".to_string(),
+                replacement: "ignored".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    ));
+
+    let shortcut = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(
+        state.prepare_tui_event(&shortcut, &target),
+        TuiEventDisposition::Allow
+    );
+    state.note_tui_event(&shortcut);
+    target.cursor = 0;
+    state.finish_tui_event(&target);
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { .. }
+    ));
+}
+
+#[test]
+fn another_thread_cannot_relinquish_an_unknown_draft_fence() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    state.finish_submission(pending, SubmissionDispatchOutcome::Unknown);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    target.thread_id = "other-thread".to_string();
+    target.text = "other draft".to_string();
+    target.cursor = target.text.len();
+    let other_edit = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event(&other_edit, &target),
+        TuiEventDisposition::Allow
+    );
+    state.note_tui_event(&other_edit);
+    state.finish_tui_event(&target);
+
+    target.thread_id = "synthetic-thread".to_string();
+    target.text = "dictated".to_string();
+    target.cursor = target.text.len();
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { .. }
+    ));
+}
+
+#[test]
+fn submit_admission_requires_the_exact_inserted_draft_witness() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    target.user_insert(0, "changed ");
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    target.cursor = 0;
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            ..
+        })
+    ));
+
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    state.note_tui_event(&TuiEvent::Paste("intervening".to_string()));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::CaptureChanged,
+            ..
+        })
+    ));
+
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    target.thread_id = "other-thread".to_string();
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "different".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::ExpectedMismatch,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::ExpectedMismatch,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+}
+
+#[test]
 fn submission_stays_pending_until_matching_user_message_commit() {
     let mut state = ComposerControlState::<u64>::new();
     let mut target = FakeTarget::new("");
@@ -509,12 +1411,27 @@ fn rollback_invalidates_uncommitted_state_but_preserves_surviving_submission_lea
     let first_lease = insert(&mut state, &mut target, first_capture, "first");
     let submission_id = mark_submission_pending(&mut state, &target, &[first_lease]);
     state.note_submission_abandoned_id("synthetic-thread", submission_id);
-    assert!(!state.leases.contains_key(&first_lease));
+    assert!(matches!(
+        state.leases.get(&first_lease).map(|lease| &lease.state),
+        Some(ExternalLeaseState::SubmissionAbandoned { .. })
+    ));
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id: first_lease,
+                expected: "first".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionAbandoned
+    ));
 
     let second_capture = capture(&mut state, &mut target);
     let second_lease = insert(&mut state, &mut target, second_capture, " second");
-    mark_submitted(&mut state, &target, &[second_lease]);
-    state.note_thread_rolled_back("synthetic-thread");
+    let second_submission_id = mark_submitted(&mut state, &target, &[second_lease]);
+    let surviving = HashSet::from([second_submission_id]);
+    state.note_thread_rolled_back("synthetic-thread", &surviving);
     assert!(state.captures.is_empty());
     assert!(matches!(
         state.leases.get(&second_lease).map(|lease| &lease.state),
@@ -535,12 +1452,115 @@ fn rollback_invalidates_uncommitted_state_but_preserves_surviving_submission_lea
     };
     assert_eq!(pending.thread_id, "synthetic-thread");
 
-    state.note_thread_rolled_back("synthetic-thread");
+    state.note_thread_rolled_back("synthetic-thread", &surviving);
     assert!(matches!(
         state.prepare_command(replacement(), &mut target, /*app_overlay_active*/ false),
         CommandExecution::Correct(retry)
             if retry.thread_id == "synthetic-thread"
                 && retry.correction_id == pending.correction_id
+    ));
+}
+
+#[test]
+fn rollback_survivor_keeps_the_local_clear_fence_until_disposition() {
+    let (mut state, mut target, lease_id) = inserted_draft("retained");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "retained");
+    let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+    state.finish_submission(pending, SubmissionDispatchOutcome::AcceptedButUncommitted);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::Unknown
+    );
+
+    state.note_thread_rolled_back("synthetic-thread", &HashSet::from([submission_id]));
+    assert!(matches!(
+        state.leases.get(&lease_id).map(|lease| &lease.state),
+        Some(ExternalLeaseState::SubmittedIntact { .. })
+    ));
+
+    let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::BlockUnknownSubmission { .. }
+    ));
+    let insert_capture = capture(&mut state, &mut target);
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Insert {
+                capture_id: insert_capture,
+                text: " duplicate".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Unknown
+    );
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "retained".to_string(),
+                replacement: "corrected".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Unknown)
+    ));
+    assert_eq!(target.text, "retained");
+
+    target.text.clear();
+    target.cursor = 0;
+    target.leases.clear();
+    state.note_submission_committed_id("synthetic-thread", submission_id);
+    let post_commit_capture = capture(&mut state, &mut target);
+    let inserted_id = insert(&mut state, &mut target, post_commit_capture, "after commit");
+    assert!(state.leases.contains_key(&inserted_id));
+    assert_eq!(target.text, "after commit");
+}
+
+#[test]
+fn rollback_marks_a_removed_committed_submission_abandoned() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let capture_id = capture(&mut state, &mut target);
+    let lease_id = insert(&mut state, &mut target, capture_id, "removed");
+    mark_submitted(&mut state, &target, &[lease_id]);
+
+    state.note_thread_rolled_back("synthetic-thread", &HashSet::new());
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id,
+                expected: "removed".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::SubmissionAbandoned
+    ));
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Replace {
+                lease_id,
+                expected: "removed".to_string(),
+                replacement: "replacement".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::SubmissionAbandoned)
     ));
 }
 
@@ -1246,6 +2266,7 @@ fn unavailable_surfaces_and_expired_ui_requests_do_not_mutate() {
 fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
     let instance_id = Uuid::new_v4();
     let capture_id = Uuid::new_v4();
+    let lease_id = Uuid::new_v4();
     let request: WireRequest = serde_json::from_value(serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
         "instanceId": instance_id,
@@ -1257,6 +2278,22 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
     assert!(matches!(
         request.into_command(instance_id),
         Ok(ComposerCommand::Insert { text, .. }) if text == "line\nsubmit"
+    ));
+
+    let request: WireRequest = serde_json::from_value(serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "instanceId": instance_id,
+        "op": "submit",
+        "leaseId": lease_id,
+        "expected": "line\nsubmit"
+    }))
+    .expect("wire request");
+    assert!(matches!(
+        request.into_command(instance_id),
+        Ok(ComposerCommand::Submit {
+            lease_id: parsed_lease,
+            expected,
+        }) if parsed_lease == lease_id && expected == "line\nsubmit"
     ));
 
     assert!(
@@ -1308,16 +2345,36 @@ fn wire_validation_is_strict_and_accepts_literal_multiline_composer_text() {
         }),
         "acceptance only claims that the correction was queued"
     );
+    for (result, status) in [
+        (WireResult::SendAccepted, "send_accepted"),
+        (WireResult::SubmissionAbandoned, "submission_abandoned"),
+        (WireResult::Unknown, "unknown"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(WireResponse {
+                protocol_version: PROTOCOL_VERSION,
+                instance_id,
+                result,
+            })
+            .expect("wire response")
+            .get("status"),
+            Some(&serde_json::json!(status))
+        );
+    }
 }
 
 #[test]
-fn only_insert_and_replace_can_have_unknown_ui_timeout_text_effects() {
+fn insert_submit_and_replace_can_have_unknown_ui_timeout_effects() {
     let capture = ComposerCommand::Capture;
     let insert = ComposerCommand::Insert {
         capture_id: Uuid::new_v4(),
         text: "fast".to_string(),
     };
     let verify = ComposerCommand::Verify {
+        lease_id: Uuid::new_v4(),
+        expected: "fast".to_string(),
+    };
+    let submit = ComposerCommand::Submit {
         lease_id: Uuid::new_v4(),
         expected: "fast".to_string(),
     };
@@ -1330,11 +2387,12 @@ fn only_insert_and_replace_can_have_unknown_ui_timeout_text_effects() {
         replacement: "final".to_string(),
     };
 
-    assert!(!capture.may_change_text());
-    assert!(insert.may_change_text());
-    assert!(!verify.may_change_text());
-    assert!(!keep.may_change_text());
-    assert!(replace.may_change_text());
+    assert!(!capture.may_have_effect());
+    assert!(insert.may_have_effect());
+    assert!(!verify.may_have_effect());
+    assert!(submit.may_have_effect());
+    assert!(!keep.may_have_effect());
+    assert!(replace.may_have_effect());
 }
 
 #[cfg(unix)]

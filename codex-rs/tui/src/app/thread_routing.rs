@@ -10,6 +10,31 @@ use crate::session_resume::read_session_model;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const COMPOSER_CORRECTION_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const COMPOSER_SUBMISSION_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+fn surviving_composer_submission_ids(thread: &Thread) -> (HashSet<String>, HashSet<Uuid>) {
+    let client_ids = thread
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            ThreadItem::UserMessage {
+                client_id: Some(client_id),
+                ..
+            } if client_id.starts_with("koenig-composer-") => Some(client_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let submission_ids = client_ids
+        .iter()
+        .filter_map(|client_id| {
+            client_id
+                .strip_prefix("koenig-composer-")
+                .and_then(|id| Uuid::parse_str(id).ok())
+        })
+        .collect();
+    (client_ids, submission_ids)
+}
 
 fn correction_server_error_outcome(code: i64) -> CorrectionDispatchOutcome {
     if matches!(code, JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS) {
@@ -26,6 +51,14 @@ pub(super) enum ThreadRollbackOrigin {
 }
 
 impl App {
+    pub(super) fn finish_composer_tui_event(
+        &mut self,
+        state: &mut crate::composer_control::NativeComposerControlState,
+    ) {
+        state.finish_tui_event(&self.chat_widget);
+        self.resolve_notified_composer_submissions_for_active_thread();
+    }
+
     pub(super) fn composer_correction_thread_id(
         &self,
         pending: &PendingComposerCorrection,
@@ -34,6 +67,207 @@ impl App {
             return Err(CorrectionDispatchOutcome::NotApplied);
         };
         Ok(thread_id)
+    }
+
+    pub(super) async fn dispatch_native_composer_submit(
+        &mut self,
+        app_server: &mut AppServerSession,
+        prepared: &PreparedNativeComposerSubmit,
+    ) -> SubmissionDispatchOutcome {
+        let submission = prepared.submission();
+        let Ok(thread_id) = ThreadId::from_string(submission.thread_id()) else {
+            return SubmissionDispatchOutcome::NotApplied(ErrorCode::ComposerUnavailable);
+        };
+        if self.active_thread_id != Some(thread_id)
+            || self.chat_widget.thread_id() != Some(thread_id)
+        {
+            return SubmissionDispatchOutcome::NotApplied(ErrorCode::ComposerUnavailable);
+        }
+
+        let client_id = submission.client_user_message_id();
+        self.pending_composer_submissions.insert(
+            client_id.clone(),
+            super::PendingComposerSubmissionCommit {
+                submission: submission.clone(),
+                turn_id: None,
+                external_commit: Some(prepared.commit()),
+                item_committed: false,
+            },
+        );
+        let dispatch =
+            self.dispatch_native_composer_submit_unbounded(app_server, thread_id, prepared.op());
+        let accepted_turn_id =
+            match tokio::time::timeout(COMPOSER_SUBMISSION_REQUEST_TIMEOUT, dispatch).await {
+                Ok(Ok(turn_id)) => turn_id,
+                Ok(Err(outcome)) => {
+                    if matches!(outcome, SubmissionDispatchOutcome::NotApplied(_)) {
+                        self.pending_composer_submissions.remove(&client_id);
+                    }
+                    return outcome;
+                }
+                Err(_) => return SubmissionDispatchOutcome::Unknown,
+            };
+
+        let committed = self
+            .pending_composer_submissions
+            .get(&client_id)
+            .and_then(|pending| pending.external_commit.as_ref().cloned())
+            .is_some_and(|commit| self.chat_widget.commit_native_composer_submit(&commit));
+        if let Some(pending) = self.pending_composer_submissions.get_mut(&client_id) {
+            pending.turn_id = Some(accepted_turn_id);
+            if committed {
+                pending.external_commit = None;
+            }
+        }
+        if committed {
+            SubmissionDispatchOutcome::Accepted
+        } else {
+            self.chat_widget.add_error_message(
+                "Koenig send was accepted, but the exact draft could not be cleared. Automatic resubmission is disabled."
+                    .to_string(),
+            );
+            SubmissionDispatchOutcome::AcceptedButUncommitted
+        }
+    }
+
+    async fn dispatch_native_composer_submit_unbounded(
+        &mut self,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+        op: &AppCommand,
+    ) -> std::result::Result<String, SubmissionDispatchOutcome> {
+        let AppCommand::UserTurn {
+            items,
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            active_permission_profile,
+            model,
+            effort,
+            summary,
+            service_tier,
+            final_output_json_schema,
+            collaboration_mode,
+            personality,
+            composer_submission: Some(composer_submission),
+        } = op
+        else {
+            return Err(SubmissionDispatchOutcome::NotApplied(
+                ErrorCode::SubmissionUnavailable,
+            ));
+        };
+        let client_user_message_id = Some(composer_submission.client_user_message_id());
+        let composer_receipt = Some(composer_submission.receipt_context());
+        if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
+            let mut steer_turn_id = turn_id;
+            let mut retried_after_turn_mismatch = false;
+            loop {
+                match app_server
+                    .turn_steer(
+                        thread_id,
+                        steer_turn_id.clone(),
+                        client_user_message_id.clone(),
+                        composer_receipt.clone(),
+                        items.to_vec(),
+                    )
+                    .await
+                {
+                    Ok(response) => return Ok(response.turn_id),
+                    Err(error) => {
+                        if active_turn_not_steerable_turn_error(&error).is_some() {
+                            return Err(SubmissionDispatchOutcome::NotApplied(
+                                ErrorCode::SubmissionUnavailable,
+                            ));
+                        }
+                        match active_turn_steer_race(&error) {
+                            Some(ActiveTurnSteerRace::Missing) => {
+                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                    let mut store = channel.store.lock().await;
+                                    store.clear_active_turn_id();
+                                }
+                                break;
+                            }
+                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id })
+                                if !retried_after_turn_mismatch
+                                    && actual_turn_id != steer_turn_id =>
+                            {
+                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                    let mut store = channel.store.lock().await;
+                                    store.active_turn_id = Some(actual_turn_id.clone());
+                                }
+                                steer_turn_id = actual_turn_id;
+                                retried_after_turn_mismatch = true;
+                            }
+                            Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id }) => {
+                                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                                    let mut store = channel.store.lock().await;
+                                    store.active_turn_id = Some(actual_turn_id);
+                                }
+                                return Err(SubmissionDispatchOutcome::NotApplied(
+                                    ErrorCode::SubmissionUnavailable,
+                                ));
+                            }
+                            None => return Err(submission_typed_error_outcome(&error)),
+                        }
+                    }
+                }
+            }
+        }
+        let config = self.chat_widget.config_ref();
+        let approvals_reviewer = approvals_reviewer.unwrap_or(config.approvals_reviewer);
+        let permissions_override = Self::turn_permissions_override_from_config(
+            config,
+            active_permission_profile.as_ref(),
+            self.runtime_permission_profile_override
+                .as_ref()
+                .map(|profile| &profile.permission_profile),
+        );
+        match app_server
+            .turn_start(
+                thread_id,
+                client_user_message_id,
+                composer_receipt,
+                items.to_vec(),
+                cwd.clone(),
+                *approval_policy,
+                approvals_reviewer,
+                permissions_override,
+                config.permissions.user_visible_workspace_roots(),
+                model.to_string(),
+                effort.clone(),
+                *summary,
+                service_tier.clone(),
+                collaboration_mode.clone(),
+                *personality,
+                final_output_json_schema.clone(),
+            )
+            .await
+        {
+            Ok(response) => {
+                if self.active_thread_id == Some(thread_id)
+                    && self.chat_widget.thread_id() == Some(thread_id)
+                {
+                    self.chat_widget
+                        .record_safety_buffering_turn(response.turn.id.clone(), op);
+                }
+                Ok(response.turn.id)
+            }
+            Err(error) => Err(error
+                .downcast_ref::<TypedRequestError>()
+                .map(submission_typed_error_outcome)
+                .unwrap_or(SubmissionDispatchOutcome::Unknown)),
+        }
+    }
+}
+
+fn submission_typed_error_outcome(error: &TypedRequestError) -> SubmissionDispatchOutcome {
+    match error {
+        TypedRequestError::Server { .. } => {
+            SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable)
+        }
+        TypedRequestError::Transport { .. } | TypedRequestError::Deserialize { .. } => {
+            SubmissionDispatchOutcome::Unknown
+        }
     }
 }
 
@@ -1469,6 +1703,7 @@ impl App {
             .set_queue_autosend_suppressed(/*suppressed*/ true);
         self.chat_widget
             .restore_thread_input_state(snapshot.input_state);
+        self.resolve_notified_composer_submissions_for_active_thread();
         if !snapshot.turns.is_empty() {
             self.chat_widget
                 .replay_thread_turns(snapshot.turns, ReplayKind::ThreadSnapshot);
@@ -1556,10 +1791,36 @@ impl App {
         response: &ThreadRollbackResponse,
         origin: ThreadRollbackOrigin,
     ) {
-        self.pending_composer_submissions
-            .retain(|_, pending| pending.submission.thread_id() != thread_id.to_string());
+        let (surviving_client_ids, surviving_submission_ids) =
+            surviving_composer_submission_ids(&response.thread);
+        let pending_client_ids = self
+            .pending_composer_submissions
+            .iter()
+            .filter_map(|(client_id, pending)| {
+                (pending.submission.thread_id() == thread_id.to_string())
+                    .then_some(client_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for client_id in pending_client_ids {
+            if surviving_client_ids.contains(&client_id) {
+                if let Some(pending) = self.pending_composer_submissions.get_mut(&client_id) {
+                    pending.item_committed = true;
+                    self.composer_submission_transitions.push_back(
+                        super::ComposerSubmissionTransition::Pending(pending.submission.clone()),
+                    );
+                }
+                self.resolve_notified_composer_submission(&client_id);
+            } else if let Some(pending) = self.pending_composer_submissions.remove(&client_id) {
+                self.composer_submission_transitions.push_back(
+                    super::ComposerSubmissionTransition::Abandoned(pending.submission),
+                );
+            }
+        }
         self.composer_submission_transitions.push_back(
-            super::ComposerSubmissionTransition::ThreadRolledBack(thread_id.to_string()),
+            super::ComposerSubmissionTransition::ThreadRolledBack {
+                thread_id: thread_id.to_string(),
+                surviving_submission_ids,
+            },
         );
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
@@ -1655,7 +1916,9 @@ impl App {
             client_id,
             super::PendingComposerSubmissionCommit {
                 submission: submission.clone(),
-                turn_id,
+                turn_id: Some(turn_id),
+                external_commit: None,
+                item_committed: false,
             },
         );
         self.composer_submission_transitions
@@ -1675,19 +1938,19 @@ impl App {
                 else {
                     return;
                 };
-                let Some(pending) = self.pending_composer_submissions.remove(client_id) else {
+                let Some(pending) = self.pending_composer_submissions.get_mut(client_id) else {
                     return;
                 };
-                self.composer_submission_transitions.push_back(
-                    super::ComposerSubmissionTransition::Committed(pending.submission),
-                );
+                pending.item_committed = true;
+                self.resolve_notified_composer_submission(client_id);
             }
             ServerNotification::TurnCompleted(notification) => {
                 let abandoned_ids = self
                     .pending_composer_submissions
                     .iter()
                     .filter_map(|(client_id, pending)| {
-                        (pending.turn_id == notification.turn.id
+                        (!pending.item_committed
+                            && pending.turn_id.as_deref() == Some(notification.turn.id.as_str())
                             && pending.submission.thread_id() == notification.thread_id)
                             .then_some(client_id.clone())
                     })
@@ -1701,6 +1964,55 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn resolve_notified_composer_submission(&mut self, client_id: &str) {
+        let Some(pending) = self.pending_composer_submissions.get(client_id) else {
+            return;
+        };
+        if !pending.item_committed {
+            return;
+        }
+        let external_commit_waits_for_thread = pending.external_commit.is_some()
+            && self
+                .chat_widget
+                .thread_id()
+                .is_none_or(|thread_id| thread_id.to_string() != pending.submission.thread_id());
+        if external_commit_waits_for_thread {
+            return;
+        }
+
+        if let Some(commit) = pending.external_commit.as_ref()
+            && !commit.local_clear_relinquished()
+            && !self.chat_widget.commit_native_composer_submit(commit)
+        {
+            self.chat_widget.add_error_message(
+                "Koenig send committed, but its exact retained draft could not be cleared. Submission remains fenced."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let Some(pending) = self.pending_composer_submissions.remove(client_id) else {
+            return;
+        };
+        self.composer_submission_transitions.push_back(
+            super::ComposerSubmissionTransition::Committed(pending.submission),
+        );
+    }
+
+    pub(super) fn resolve_notified_composer_submissions_for_active_thread(&mut self) {
+        let client_ids = self
+            .pending_composer_submissions
+            .iter()
+            .filter_map(|(client_id, pending)| {
+                (pending.item_committed && pending.external_commit.is_some())
+                    .then_some(client_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for client_id in client_ids {
+            self.resolve_notified_composer_submission(&client_id);
         }
     }
 

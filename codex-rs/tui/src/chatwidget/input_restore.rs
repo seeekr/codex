@@ -353,6 +353,8 @@ impl ChatWidget {
             text_elements,
             mention_bindings,
             pending_pastes,
+            cursor,
+            composer_leases,
         } = composer;
         let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
         self.set_remote_image_urls(remote_image_urls);
@@ -363,6 +365,13 @@ impl ChatWidget {
             mention_bindings,
         );
         self.bottom_pane.set_composer_pending_pastes(pending_pastes);
+        if let (Some(cursor), Some(composer_leases)) = (cursor, composer_leases)
+            && !self
+                .bottom_pane
+                .restore_composer_owned_draft_state(cursor, &composer_leases)
+        {
+            tracing::warn!("failed to restore exact native composer ownership state");
+        }
     }
 
     fn composer_state_from_user_message(
@@ -383,6 +392,8 @@ impl ChatWidget {
             text_elements,
             mention_bindings,
             pending_pastes,
+            cursor: None,
+            composer_leases: None,
         }
     }
 
@@ -395,6 +406,8 @@ impl ChatWidget {
             remote_image_urls: draft.remote_image_urls,
             mention_bindings: draft.mention_bindings,
             pending_pastes: draft.pending_pastes,
+            cursor: Some(self.bottom_pane.composer_cursor()),
+            composer_leases: Some(self.bottom_pane.composer_leases_state()),
         };
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),

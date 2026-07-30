@@ -31,11 +31,18 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::NativeComposerCommit;
+use crate::chatwidget::PreparedNativeComposerSubmit;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::ThreadInputState;
 use crate::composer_control::CorrectionDispatchOutcome;
+use crate::composer_control::ErrorCode;
 use crate::composer_control::NativeComposerSubmission;
+use crate::composer_control::PendingComposerControlAction;
 use crate::composer_control::PendingComposerCorrection;
+use crate::composer_control::SubmissionDispatchOutcome;
+use crate::composer_control::SubmitFence;
+use crate::composer_control::TuiEventDisposition;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::split_command_string;
@@ -124,6 +131,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillErrorInfo;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadCorrectionCommitParams;
 use codex_app_server_protocol::ThreadCorrectionCommitResponse;
 use codex_app_server_protocol::ThreadItem;
@@ -183,6 +191,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
@@ -244,6 +253,23 @@ use self::thread_events::*;
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 
+enum DeferredTuiEvent {
+    Event {
+        event: TuiEvent,
+        submission_fence: Option<SubmitFence>,
+    },
+    StreamClosed,
+}
+
+fn pop_deferred_tui_event(
+    deferred: &mut VecDeque<DeferredTuiEvent>,
+) -> Option<Option<DeferredTuiEvent>> {
+    deferred.pop_front().map(|event| match event {
+        DeferredTuiEvent::StreamClosed => None,
+        event @ DeferredTuiEvent::Event { .. } => Some(event),
+    })
+}
+
 enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),
     Approval(ApprovalRequest),
@@ -252,14 +278,19 @@ enum ThreadInteractiveRequest {
 
 struct PendingComposerSubmissionCommit {
     submission: NativeComposerSubmission,
-    turn_id: String,
+    turn_id: Option<String>,
+    external_commit: Option<Arc<NativeComposerCommit>>,
+    item_committed: bool,
 }
 
 enum ComposerSubmissionTransition {
     Pending(NativeComposerSubmission),
     Committed(NativeComposerSubmission),
     Abandoned(NativeComposerSubmission),
-    ThreadRolledBack(String),
+    ThreadRolledBack {
+        thread_id: String,
+        surviving_submission_ids: HashSet<Uuid>,
+    },
 }
 
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
@@ -779,6 +810,59 @@ impl App {
         }
     }
 
+    async fn handle_composer_tui_event(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        composer_control_state: &mut crate::composer_control::NativeComposerControlState,
+        event: Option<DeferredTuiEvent>,
+    ) -> Result<AppRunControl> {
+        let Some(DeferredTuiEvent::Event {
+            event,
+            submission_fence,
+        }) = event
+        else {
+            tracing::warn!("terminal input stream closed; shutting down active thread");
+            return Ok(self
+                .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
+                .await);
+        };
+        let disposition = match submission_fence {
+            Some(fence) => composer_control_state.prepare_tui_event_during_submission(
+                &event,
+                &self.chat_widget,
+                &fence,
+            ),
+            None => composer_control_state.prepare_tui_event(&event, &self.chat_widget),
+        };
+        match disposition {
+            TuiEventDisposition::BlockUnknownSubmission { disclose } => {
+                if disclose {
+                    self.chat_widget.add_error_message(
+                        "Koenig send outcome is unknown. Edit or cancel the draft before submitting it again."
+                            .to_string(),
+                    );
+                }
+                Ok(AppRunControl::Continue)
+            }
+            TuiEventDisposition::BlockDispatchingSubmission { disclose } => {
+                if disclose {
+                    self.chat_widget.add_error_message(
+                        "A submit key pressed while Koenig was sending this exact draft was ignored to prevent a duplicate turn."
+                            .to_string(),
+                    );
+                }
+                Ok(AppRunControl::Continue)
+            }
+            TuiEventDisposition::Allow => {
+                composer_control_state.note_tui_event(&event);
+                let handled = self.handle_tui_event(tui, app_server, event).await;
+                self.finish_composer_tui_event(composer_control_state);
+                handled
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
@@ -1173,6 +1257,7 @@ See the Codex keymap documentation for supported actions and examples."
         let (mut composer_control_rx, _composer_control_server) = crate::composer_control::start();
         let (composer_correction_tx, mut composer_correction_rx) = mpsc::unbounded_channel();
         let mut composer_control_state = crate::composer_control::NativeComposerControlState::new();
+        let mut deferred_tui_events = VecDeque::new();
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
@@ -1201,7 +1286,22 @@ See the Codex keymap documentation for supported actions and examples."
             Ok(exit_reason)
         } else {
             loop {
-                let control = select! {
+                let control = if let Some(event) = pop_deferred_tui_event(&mut deferred_tui_events)
+                {
+                    match app
+                        .handle_composer_tui_event(
+                            tui,
+                            &mut app_server,
+                            &mut composer_control_state,
+                            event,
+                        )
+                        .await
+                    {
+                        Ok(control) => control,
+                        Err(err) => break Err(err),
+                    }
+                } else {
+                    select! {
                     Some(event) = app_event_rx.recv() => {
                         match Box::pin(app.handle_event(tui, &mut app_server, event)).await {
                             Ok(control) => control,
@@ -1210,27 +1310,75 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     Some(request) = composer_control_rx.recv() => {
                         let app_overlay_active = app.overlay.is_some();
-                        if let Some(correction) = composer_control_state.handle_ui_request(
+                        if let Some(action) = composer_control_state.handle_ui_request(
                             request,
                             &mut app.chat_widget,
                             app_overlay_active,
                         ) {
-                            match app.composer_correction_thread_id(&correction) {
-                                Ok(thread_id) => {
-                                    let request_handle = app_server.request_handle();
-                                    let correction_tx = composer_correction_tx.clone();
-                                    tokio::spawn(async move {
-                                        let outcome = thread_routing::dispatch_composer_correction(
-                                            request_handle,
-                                            thread_id,
-                                            &correction,
-                                        )
-                                        .await;
-                                        let _ = correction_tx.send((correction, outcome));
-                                    });
+                            match action {
+                                PendingComposerControlAction::Correction(correction) => {
+                                    match app.composer_correction_thread_id(&correction) {
+                                        Ok(thread_id) => {
+                                            let request_handle = app_server.request_handle();
+                                            let correction_tx = composer_correction_tx.clone();
+                                            tokio::spawn(async move {
+                                                let outcome = thread_routing::dispatch_composer_correction(
+                                                    request_handle,
+                                                    thread_id,
+                                                    &correction,
+                                                )
+                                                .await;
+                                                let _ = correction_tx.send((correction, outcome));
+                                            });
+                                        }
+                                        Err(outcome) => {
+                                            composer_control_state.finish_correction(correction, outcome);
+                                        }
+                                    }
                                 }
-                                Err(outcome) => {
-                                    composer_control_state.finish_correction(correction, outcome);
+                                PendingComposerControlAction::Submission(submission) => {
+                                    let submission_fence = submission.fence();
+                                    let outcome = match app.chat_widget.prepare_native_composer_submit(
+                                        submission.native(),
+                                        submission.expected(),
+                                        submission_fence.clone(),
+                                    ) {
+                                        Ok(prepared) => {
+                                            let dispatch = app.dispatch_native_composer_submit(
+                                                &mut app_server,
+                                                &prepared,
+                                            );
+                                            tokio::pin!(dispatch);
+                                            let outcome = loop {
+                                                select! {
+                                                    biased;
+                                                    event = tui_events.next() => {
+                                                        let Some(event) = event else {
+                                                            deferred_tui_events
+                                                                .push_back(DeferredTuiEvent::StreamClosed);
+                                                            break dispatch.await;
+                                                        };
+                                                        deferred_tui_events.push_back(DeferredTuiEvent::Event {
+                                                            event,
+                                                            submission_fence: Some(submission_fence.clone()),
+                                                        });
+                                                    }
+                                                    outcome = &mut dispatch => break outcome,
+                                                }
+                                            };
+                                            if matches!(
+                                                outcome,
+                                                SubmissionDispatchOutcome::Accepted
+                                                    | SubmissionDispatchOutcome::AcceptedButUncommitted
+                                            ) {
+                                                composer_control_state
+                                                    .note_submission_pending(prepared.submission());
+                                            }
+                                            outcome
+                                        }
+                                        Err(code) => SubmissionDispatchOutcome::NotApplied(code),
+                                    };
+                                    composer_control_state.finish_submission(submission, outcome);
                                 }
                             }
                         }
@@ -1260,15 +1408,21 @@ See the Codex keymap documentation for supported actions and examples."
                         AppRunControl::Continue
                     }
                     event = tui_events.next() => {
-                        if let Some(event) = event {
-                            composer_control_state.note_tui_event(&event);
-                            match app.handle_tui_event(tui, &mut app_server, event).await {
-                                Ok(control) => control,
-                                Err(err) => break Err(err),
-                            }
-                        } else {
-                            tracing::warn!("terminal input stream closed; shutting down active thread");
-                            app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
+                        let event = event.map(|event| DeferredTuiEvent::Event {
+                                event,
+                                submission_fence: None,
+                            });
+                        match app
+                            .handle_composer_tui_event(
+                                tui,
+                                &mut app_server,
+                                &mut composer_control_state,
+                                event,
+                            )
+                            .await
+                        {
+                            Ok(control) => control,
+                            Err(err) => break Err(err),
                         }
                     }
                     app_server_event = app_server.next_event(), if listen_for_app_server_events => {
@@ -1280,6 +1434,7 @@ See the Codex keymap documentation for supported actions and examples."
                             }
                         }
                         AppRunControl::Continue
+                    }
                     }
                 };
                 for transition in app.composer_submission_transitions.drain(..) {
@@ -1293,8 +1448,12 @@ See the Codex keymap documentation for supported actions and examples."
                         ComposerSubmissionTransition::Abandoned(submission) => {
                             composer_control_state.note_submission_abandoned(&submission);
                         }
-                        ComposerSubmissionTransition::ThreadRolledBack(thread_id) => {
-                            composer_control_state.note_thread_rolled_back(&thread_id);
+                        ComposerSubmissionTransition::ThreadRolledBack {
+                            thread_id,
+                            surviving_submission_ids,
+                        } => {
+                            composer_control_state
+                                .note_thread_rolled_back(&thread_id, &surviving_submission_ids);
                         }
                     }
                 }

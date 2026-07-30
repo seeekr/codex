@@ -147,6 +147,7 @@ mod selection_tabs;
 mod textarea;
 pub(crate) use textarea::ComposerLeaseError;
 pub(crate) use textarea::ComposerLeaseId;
+pub(crate) use textarea::ComposerLeasesSnapshot;
 pub(crate) use textarea::SubmittedComposerLease;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
@@ -186,6 +187,7 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
+pub(crate) use chat_composer::PlainComposerSubmission;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer_history::HistoryEntry;
 
@@ -800,6 +802,16 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn restore_composer_owned_draft_state(
+        &mut self,
+        cursor: usize,
+        leases: &ComposerLeasesSnapshot,
+    ) -> bool {
+        let restored = self.composer.restore_owned_draft_state(cursor, leases);
+        self.request_redraw();
+        restored
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_composer_input_enabled(
         &mut self,
@@ -839,6 +851,10 @@ impl BottomPane {
         self.composer.cursor()
     }
 
+    pub(crate) fn composer_leases_state(&self) -> ComposerLeasesSnapshot {
+        self.composer.composer_leases_state()
+    }
+
     pub(crate) fn insert_composer_owned_text(
         &mut self,
         text: &str,
@@ -873,6 +889,30 @@ impl BottomPane {
             .replace_owned_text(lease, expected, replacement)?;
         self.request_redraw();
         Ok(())
+    }
+
+    pub(crate) fn preview_owned_plain_submission(
+        &self,
+        native: ComposerLeaseId,
+        expected: &str,
+    ) -> Option<PlainComposerSubmission> {
+        self.composer
+            .preview_owned_plain_submission(native, expected)
+    }
+
+    pub(crate) fn commit_owned_plain_submission(
+        &mut self,
+        preview: &PlainComposerSubmission,
+        native: ComposerLeaseId,
+        expected: &str,
+    ) -> bool {
+        let committed = self
+            .composer
+            .commit_owned_plain_submission(preview, native, expected);
+        if committed {
+            self.request_redraw();
+        }
+        committed
     }
 
     pub(crate) fn composer_draft_snapshot(&self) -> chat_composer::ComposerDraftSnapshot {
@@ -1338,6 +1378,10 @@ impl BottomPane {
 
     pub(crate) fn composer_should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
         self.composer.should_handle_vim_insert_escape(key_event)
+    }
+
+    pub(crate) fn is_composer_submit_key(&self, key_event: KeyEvent) -> bool {
+        self.composer.is_submit_key(key_event)
     }
 
     pub(crate) fn is_task_running(&self) -> bool {

@@ -13,6 +13,7 @@ use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::user_count;
 use crate::bottom_pane::ComposerLeaseId;
 use crate::bottom_pane::SubmittedComposerLease;
+use crate::composer_control::SubmitFence;
 
 use crate::chatwidget::ChatWidgetInit;
 use crate::chatwidget::create_initial_user_message;
@@ -5699,6 +5700,72 @@ async fn inactive_composer_submission_commits_at_notification_ingress() {
 }
 
 #[tokio::test]
+async fn committed_external_submission_resolves_after_failed_clear_is_relinquished() {
+    let mut app = make_test_app().await;
+    let mut app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+    let started = app_server
+        .start_thread(app.chat_widget.config_ref())
+        .await
+        .expect("thread/start should succeed");
+    let thread_id = started.session.thread_id;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await
+        .expect("primary thread should be registered");
+
+    let native = app
+        .chat_widget
+        .insert_composer_owned_text("dictated")
+        .expect("owned insertion");
+    let fence = SubmitFence::new();
+    let prepared = app
+        .chat_widget
+        .prepare_native_composer_submit(native, "dictated", fence.clone())
+        .expect("plain exact draft should prepare");
+    let submission = prepared.submission().clone();
+    let client_id = submission.client_user_message_id();
+    app.chat_widget
+        .keep_composer_owned_text(native)
+        .expect("test should invalidate only the native clear lease");
+    app.pending_composer_submissions.insert(
+        client_id.clone(),
+        PendingComposerSubmissionCommit {
+            submission: submission.clone(),
+            turn_id: Some("turn-1".to_string()),
+            external_commit: Some(prepared.commit()),
+            item_committed: false,
+        },
+    );
+
+    app.note_composer_submission_notification(&ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: ThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                client_id: Some(client_id.clone()),
+                content: Vec::new(),
+            },
+        },
+    ));
+    assert!(app.pending_composer_submissions.contains_key(&client_id));
+    assert_eq!(app.chat_widget.composer_text(), "dictated");
+
+    app.chat_widget.insert_str("x");
+    fence.relinquish();
+    app.resolve_notified_composer_submissions_for_active_thread();
+
+    assert!(!app.pending_composer_submissions.contains_key(&client_id));
+    assert_eq!(app.chat_widget.composer_text(), "dictatedx");
+    assert!(matches!(
+        app.composer_submission_transitions.pop_front(),
+        Some(ComposerSubmissionTransition::Committed(committed)) if committed == submission
+    ));
+}
+
+#[tokio::test]
 async fn thread_rollback_response_discards_queued_active_thread_events() {
     let mut app = make_test_app().await;
     let thread_id = ThreadId::new();
@@ -5756,8 +5823,10 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     assert!(matches!(
         app.composer_submission_transitions.pop_front(),
-        Some(ComposerSubmissionTransition::ThreadRolledBack(invalidated))
-            if invalidated == thread_id.to_string()
+        Some(ComposerSubmissionTransition::ThreadRolledBack {
+            thread_id: invalidated,
+            surviving_submission_ids,
+        }) if invalidated == thread_id.to_string() && surviving_submission_ids.is_empty()
     ));
 }
 
@@ -6336,6 +6405,39 @@ async fn side_backtrack_rejection_reports_unavailable_message_snapshot() {
         rendered
     );
 }
+
+#[test]
+fn deferred_tui_events_preserve_fifo_and_stream_close_after_buffered_input() {
+    let mut deferred = VecDeque::from([
+        DeferredTuiEvent::Event {
+            event: TuiEvent::Draw,
+            submission_fence: None,
+        },
+        DeferredTuiEvent::Event {
+            event: TuiEvent::Paste("typed before dispatch completed".to_string()),
+            submission_fence: None,
+        },
+        DeferredTuiEvent::StreamClosed,
+    ]);
+
+    assert!(matches!(
+        pop_deferred_tui_event(&mut deferred),
+        Some(Some(DeferredTuiEvent::Event {
+            event: TuiEvent::Draw,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        pop_deferred_tui_event(&mut deferred),
+        Some(Some(DeferredTuiEvent::Event {
+            event: TuiEvent::Paste(text),
+            ..
+        })) if text == "typed before dispatch completed"
+    ));
+    assert!(matches!(pop_deferred_tui_event(&mut deferred), Some(None)));
+    assert!(pop_deferred_tui_event(&mut deferred).is_none());
+}
+
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {
     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::composer_control::SubmitFence;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -9,6 +10,35 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+
+#[tokio::test]
+async fn native_two_phase_submit_commits_exact_draft_and_history_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    while rx.try_recv().is_ok() {}
+
+    let native = chat
+        .insert_composer_owned_text("dictated")
+        .expect("owned insertion");
+    let prepared = chat
+        .prepare_native_composer_submit(native, "dictated", SubmitFence::new())
+        .expect("plain exact draft should prepare");
+    assert_eq!(chat.composer_text(), "dictated");
+    assert!(chat.commit_native_composer_submit(&prepared.commit()));
+    assert_eq!(chat.composer_text(), "");
+    assert!(!chat.commit_native_composer_submit(&prepared.commit()));
+
+    let user_history_cells = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event,
+                AppEvent::InsertHistoryCell(cell)
+                    if cell.as_any().downcast_ref::<UserHistoryCell>().is_some()
+            )
+        })
+        .count();
+    assert_eq!(user_history_cells, 1);
+}
 
 #[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {

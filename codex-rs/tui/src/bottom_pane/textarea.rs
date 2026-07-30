@@ -130,6 +130,13 @@ pub(crate) struct SubmittedComposerLease {
     pub(crate) range: Range<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComposerLeasesSnapshot {
+    generation: Uuid,
+    next_id: u64,
+    ranges: Vec<(ComposerLeaseId, Range<usize>)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ComposerLeaseError {
@@ -199,6 +206,28 @@ impl ComposerLeases {
             .iter()
             .map(|(id, range)| (*id, range.clone()))
             .collect()
+    }
+
+    fn snapshot(&self) -> ComposerLeasesSnapshot {
+        ComposerLeasesSnapshot {
+            generation: self.generation,
+            next_id: self.next_id,
+            ranges: self.snapshots(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: &ComposerLeasesSnapshot) -> bool {
+        if snapshot.next_id == 0
+            || snapshot.ranges.iter().any(|(id, _)| {
+                id.generation != snapshot.generation || id.sequence >= snapshot.next_id
+            })
+        {
+            return false;
+        }
+        self.generation = snapshot.generation;
+        self.next_id = snapshot.next_id;
+        self.ranges = snapshot.ranges.iter().cloned().collect();
+        true
     }
 
     /// Rebase leases around an ordinary editor mutation and revoke every intersecting lease.
@@ -642,6 +671,21 @@ impl TextArea {
     /// boundary.
     pub(crate) fn composer_lease_snapshots(&self) -> Vec<(ComposerLeaseId, Range<usize>)> {
         self.composer_leases.snapshots()
+    }
+
+    pub(crate) fn composer_leases_state(&self) -> ComposerLeasesSnapshot {
+        self.composer_leases.snapshot()
+    }
+
+    pub(crate) fn restore_composer_leases(&mut self, snapshot: &ComposerLeasesSnapshot) -> bool {
+        if snapshot
+            .ranges
+            .iter()
+            .any(|(_, range)| range.start > range.end || self.text.get(range.clone()).is_none())
+        {
+            return false;
+        }
+        self.composer_leases.restore(snapshot)
     }
 
     #[cfg(test)]
@@ -2334,6 +2378,40 @@ mod tests {
         assert_eq!(
             t.replace_owned_text(lease, "final ", "later "),
             Err(ComposerLeaseError::LeaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn composer_lease_state_restore_preserves_generation_and_high_water() {
+        let mut source = TextArea::new();
+        let first = source.insert_owned_text("first").expect("first lease");
+        source.set_cursor(source.text().len());
+        let revoked = source.insert_owned_text("second").expect("second lease");
+        let revoked_start = source
+            .composer_lease_range(revoked)
+            .expect("second range")
+            .start;
+        source.set_cursor(revoked_start);
+        source.insert_str("edited ");
+        assert_eq!(source.composer_lease_range(revoked), None);
+        let snapshot = source.composer_leases_state();
+
+        let mut restored = TextArea::new();
+        restored.set_text_clearing_elements(source.text());
+        assert!(restored.restore_composer_leases(&snapshot));
+        assert_eq!(restored.composer_lease_range(first), Some(0..5));
+        restored.set_cursor(restored.text().len());
+        let next = restored.insert_owned_text("third").expect("restored lease");
+        assert_ne!(
+            next, revoked,
+            "retired lease identifiers must never be reused"
+        );
+
+        let mut other = TextArea::new();
+        let other_first = other.insert_owned_text("other").expect("other lease");
+        assert_ne!(
+            first, other_first,
+            "independent composer generations must not alias"
         );
     }
 
