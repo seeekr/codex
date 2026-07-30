@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -11,6 +12,7 @@ struct FakeTarget {
     cursor: usize,
     next_lease: u64,
     leases: HashMap<u64, Range<usize>>,
+    submission_keys: Vec<crossterm::event::KeyEvent>,
 }
 
 impl FakeTarget {
@@ -22,6 +24,16 @@ impl FakeTarget {
             cursor: text.len(),
             next_lease: 1,
             leases: HashMap::new(),
+            submission_keys: vec![
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Tab,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            ],
         }
     }
 
@@ -137,14 +149,15 @@ impl ComposerControlTarget for FakeTarget {
         Ok(())
     }
 
-    fn is_submit_event(&self, event: &TuiEvent) -> bool {
-        matches!(
-            event,
-            TuiEvent::Key(crossterm::event::KeyEvent {
-                code: crossterm::event::KeyCode::Enter,
-                ..
-            })
-        )
+    fn is_submission_event(&self, event: &TuiEvent) -> bool {
+        let TuiEvent::Key(key) = event else {
+            return false;
+        };
+        self.submission_keys.iter().any(|binding| {
+            binding.code == key.code
+                && binding.modifiers == key.modifiers
+                && binding.kind == key.kind
+        })
     }
 }
 
@@ -283,6 +296,39 @@ fn inserted_draft(expected: &str) -> (ComposerControlState<u64>, FakeTarget, Uui
     (state, target, lease_id)
 }
 
+fn synthetic_receipt(text: &str) -> SubmittedLeaseReceipt {
+    SubmittedLeaseReceipt {
+        submission_id: Uuid::new_v4(),
+        submitted_text: Arc::from(text),
+        range: 0..text.len(),
+    }
+}
+
+fn stored_lease(
+    state: ExternalLeaseState<u64>,
+    thread_id: &str,
+    submit_attempt: Option<SubmitAttempt>,
+) -> ExternalLease<u64> {
+    ExternalLease {
+        state,
+        thread_id: thread_id.to_string(),
+        expected_hash: text_hash("pinned"),
+        draft_witness: DraftWitness {
+            text_hash: text_hash("pinned"),
+            cursor: "pinned".len(),
+            input_epoch: 0,
+        },
+        submit_attempt,
+    }
+}
+
+fn push_stored_lease(state: &mut ComposerControlState<u64>, lease: ExternalLease<u64>) -> Uuid {
+    let lease_id = Uuid::new_v4();
+    state.leases.insert(lease_id, lease);
+    state.lease_order.push_back(lease_id);
+    lease_id
+}
+
 #[test]
 fn capture_insert_verify_keep_and_replace_are_serialized() {
     let mut state = ComposerControlState::<u64>::new();
@@ -414,87 +460,224 @@ fn capture_compare_and_swap_rejects_intervening_input_and_snapshot_changes() {
 }
 
 #[test]
-fn lease_capacity_never_evicts_unknown_provenance_or_its_enter_fence() {
+fn lease_capacity_reclaims_oldest_confirmed_terminal_even_after_unknown_dispatch() {
     let mut state = ComposerControlState::<u64>::new();
-    let mut target = FakeTarget::new("");
-    let pinned_id = Uuid::new_v4();
-    state.leases.insert(
-        pinned_id,
-        ExternalLease {
-            state: ExternalLeaseState::Draft { native: 10_000 },
-            thread_id: "other-thread".to_string(),
-            expected_hash: text_hash("pinned"),
-            draft_witness: DraftWitness {
-                text_hash: text_hash("pinned"),
-                cursor: "pinned".len(),
-                input_epoch: 0,
-            },
-            submit_attempt: Some(SubmitAttempt::Resolved {
-                result: WireResult::Unknown,
-                fence: Some(SubmitFence::new()),
-            }),
-        },
-    );
-    state.lease_order.push_back(pinned_id);
-    for index in 1..MAX_LEASE_COUNT {
-        let lease_id = Uuid::new_v4();
-        state.leases.insert(
-            lease_id,
-            ExternalLease {
-                state: ExternalLeaseState::SubmissionAbandoned {
-                    receipt: SubmittedLeaseReceipt {
-                        submission_id: Uuid::new_v4(),
-                        submitted_text: Arc::from(""),
-                        range: 0..0,
+    let mut target = FakeTarget::new("human draft");
+    let mut oldest_id = None;
+    for index in 0..MAX_LEASE_COUNT {
+        let text = format!("submitted-{index}");
+        let lease_id = push_stored_lease(
+            &mut state,
+            stored_lease(
+                ExternalLeaseState::SubmittedIntact {
+                    receipt: synthetic_receipt(&text),
+                },
+                &format!("settled-{index}"),
+                Some(SubmitAttempt::Resolved {
+                    result: if index == 0 {
+                        WireResult::Unknown
+                    } else {
+                        WireResult::SendAccepted
                     },
-                },
-                thread_id: format!("settled-{index}"),
-                expected_hash: text_hash(""),
-                draft_witness: DraftWitness {
-                    text_hash: text_hash(""),
-                    cursor: 0,
-                    input_epoch: 0,
-                },
-                submit_attempt: Some(SubmitAttempt::Resolved {
-                    result: WireResult::SubmissionAbandoned,
                     fence: None,
                 }),
+            ),
+        );
+        oldest_id.get_or_insert(lease_id);
+    }
+
+    let capture_id = capture(&mut state, &mut target);
+    let inserted_id = insert(&mut state, &mut target, capture_id, " + dictated");
+    let oldest_id = oldest_id.expect("terminal lease");
+    assert_eq!(target.text, "human draft + dictated");
+    assert_eq!(target.leases.len(), 1);
+    assert!(!state.leases.contains_key(&oldest_id));
+    assert!(state.leases.contains_key(&inserted_id));
+    assert_eq!(state.leases.len(), MAX_LEASE_COUNT);
+    assert!(matches!(
+        state.execute(
+            ComposerCommand::Verify {
+                lease_id: oldest_id,
+                expected: "submitted-0".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        }
+    ));
+}
+
+#[test]
+fn lease_capacity_reclaims_oldest_settled_draft_without_removing_its_text() {
+    let mut state = ComposerControlState::<u64>::new();
+    let settled_text = "x".repeat(MAX_LEASE_COUNT);
+    let mut target = FakeTarget::new(&settled_text);
+    target.next_lease = MAX_LEASE_COUNT as u64 + 1;
+    let mut oldest_id = None;
+    for index in 0..MAX_LEASE_COUNT {
+        let native = index as u64 + 1;
+        target.leases.insert(native, index..index + 1);
+        let lease_id = push_stored_lease(
+            &mut state,
+            ExternalLease {
+                state: ExternalLeaseState::Draft { native },
+                thread_id: target.thread_id.clone(),
+                expected_hash: text_hash("x"),
+                draft_witness: DraftWitness {
+                    text_hash: text_hash(&settled_text),
+                    cursor: settled_text.len(),
+                    input_epoch: 0,
+                },
+                submit_attempt: None,
             },
         );
-        state.lease_order.push_back(lease_id);
+        oldest_id.get_or_insert(lease_id);
     }
 
     let capture_id = capture(&mut state, &mut target);
     let inserted_id = insert(&mut state, &mut target, capture_id, "new");
-    assert!(state.leases.contains_key(&pinned_id));
+    let oldest_id = oldest_id.expect("settled draft lease");
+    assert_eq!(target.text, format!("{settled_text}new"));
+    assert!(!target.leases.contains_key(&1));
+    assert!(!state.leases.contains_key(&oldest_id));
     assert!(state.leases.contains_key(&inserted_id));
     assert_eq!(state.leases.len(), MAX_LEASE_COUNT);
+    assert_eq!(target.leases.len(), MAX_LEASE_COUNT);
+}
 
+#[test]
+fn lease_capacity_keeps_unknown_and_correction_pending_leases_pinned() {
+    let mut state = ComposerControlState::<u64>::new();
+    let mut target = FakeTarget::new("");
+    let unknown_id = push_stored_lease(
+        &mut state,
+        stored_lease(
+            ExternalLeaseState::SubmittedIntact {
+                receipt: synthetic_receipt("submitted"),
+            },
+            "unknown-thread",
+            Some(SubmitAttempt::Resolved {
+                result: WireResult::Unknown,
+                fence: Some(SubmitFence::new()),
+            }),
+        ),
+    );
+    let correction_id = push_stored_lease(
+        &mut state,
+        stored_lease(
+            ExternalLeaseState::CorrectionPending {
+                receipt: synthetic_receipt("submitted"),
+                correction_id: Uuid::new_v4(),
+                expected: "submitted".to_string(),
+                replacement: "corrected".to_string(),
+                payload: "correction".to_string(),
+            },
+            "correction-thread",
+            Some(SubmitAttempt::Resolved {
+                result: WireResult::SendAccepted,
+                fence: None,
+            }),
+        ),
+    );
+    let mut oldest_terminal = None;
+    for index in 2..MAX_LEASE_COUNT {
+        let lease_id = push_stored_lease(
+            &mut state,
+            stored_lease(
+                if index % 2 == 0 {
+                    ExternalLeaseState::SubmissionAbandoned {
+                        receipt: synthetic_receipt("submitted"),
+                    }
+                } else {
+                    ExternalLeaseState::SubmittedIntact {
+                        receipt: synthetic_receipt("submitted"),
+                    }
+                },
+                &format!("settled-{index}"),
+                Some(SubmitAttempt::Resolved {
+                    result: if index % 2 == 0 {
+                        WireResult::SubmissionAbandoned
+                    } else {
+                        WireResult::SendAccepted
+                    },
+                    fence: None,
+                }),
+            ),
+        );
+        oldest_terminal.get_or_insert(lease_id);
+    }
+
+    let capture_id = capture(&mut state, &mut target);
+    let inserted_id = insert(&mut state, &mut target, capture_id, "new");
+    assert!(state.leases.contains_key(&unknown_id));
+    assert!(state.leases.contains_key(&correction_id));
+    assert!(
+        !state
+            .leases
+            .contains_key(&oldest_terminal.expect("terminal lease"))
+    );
+    assert!(state.leases.contains_key(&inserted_id));
+    assert_eq!(state.leases.len(), MAX_LEASE_COUNT);
+    assert_eq!(target.text, "new");
+}
+
+#[test]
+fn lease_capacity_fails_visibly_without_mutating_when_every_lease_is_pinned() {
     let mut all_pinned = ComposerControlState::<u64>::new();
     let mut untouched = FakeTarget::new("");
     for index in 0..MAX_LEASE_COUNT {
-        let lease_id = Uuid::new_v4();
-        all_pinned.leases.insert(
-            lease_id,
-            ExternalLease {
-                state: ExternalLeaseState::Draft {
-                    native: index as u64,
-                },
-                thread_id: format!("pinned-{index}"),
-                expected_hash: text_hash("pinned"),
-                draft_witness: DraftWitness {
-                    text_hash: text_hash("pinned"),
-                    cursor: "pinned".len(),
-                    input_epoch: 0,
-                },
-                submit_attempt: Some(SubmitAttempt::Resolved {
-                    result: WireResult::Unknown,
-                    fence: Some(SubmitFence::new()),
+        let lease = match index {
+            0 => stored_lease(
+                ExternalLeaseState::Draft { native: 10_000 },
+                "other-thread",
+                None,
+            ),
+            1 => stored_lease(
+                ExternalLeaseState::Draft { native: 10_001 },
+                "dispatching-thread",
+                Some(SubmitAttempt::Dispatching {
+                    fence: SubmitFence::new(),
                 }),
-            },
-        );
-        all_pinned.lease_order.push_back(lease_id);
+            ),
+            2 => stored_lease(
+                ExternalLeaseState::Draft { native: 10_002 },
+                "synthetic-thread",
+                Some(SubmitAttempt::Resolved {
+                    result: WireResult::Unknown,
+                    fence: None,
+                }),
+            ),
+            3 => stored_lease(
+                ExternalLeaseState::CorrectionPending {
+                    receipt: synthetic_receipt("submitted"),
+                    correction_id: Uuid::new_v4(),
+                    expected: "submitted".to_string(),
+                    replacement: "corrected".to_string(),
+                    payload: "correction".to_string(),
+                },
+                "correction-thread",
+                Some(SubmitAttempt::Resolved {
+                    result: WireResult::SendAccepted,
+                    fence: None,
+                }),
+            ),
+            _ => stored_lease(
+                ExternalLeaseState::SubmissionPending {
+                    receipt: synthetic_receipt("submitted"),
+                },
+                &format!("pending-{index}"),
+                Some(SubmitAttempt::Resolved {
+                    result: WireResult::SendAccepted,
+                    fence: None,
+                }),
+            ),
+        };
+        push_stored_lease(&mut all_pinned, lease);
     }
+    let pinned_ids = all_pinned.leases.keys().copied().collect::<HashSet<_>>();
     let blocked_capture = capture(&mut all_pinned, &mut untouched);
     assert!(matches!(
         all_pinned.execute(
@@ -511,8 +694,15 @@ fn lease_capacity_never_evicts_unknown_provenance_or_its_enter_fence() {
         }
     ));
     assert_eq!(untouched.text, "");
+    assert_eq!(untouched.cursor, 0);
+    assert_eq!(untouched.next_lease, 1);
+    assert!(untouched.leases.is_empty());
     assert!(all_pinned.captures.contains_key(&blocked_capture));
     assert_eq!(all_pinned.leases.len(), MAX_LEASE_COUNT);
+    assert_eq!(
+        all_pinned.leases.keys().copied().collect::<HashSet<_>>(),
+        pinned_ids
+    );
 }
 
 #[test]
@@ -600,6 +790,52 @@ fn accepted_submission_survives_composer_clear_for_verify_and_keep() {
         WireResult::Kept
     ));
     assert!(target.text.is_empty());
+}
+
+#[test]
+fn dispatching_submit_consumes_default_and_custom_queue_bindings() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let custom_queue = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    target.submission_keys.push(custom_queue);
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let dispatch_fence = pending.fence();
+
+    let default_queue = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&default_queue, &target, &dispatch_fence),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: true }
+    );
+    let ordinary_input = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event_during_submission(&ordinary_input, &target, &dispatch_fence),
+        TuiEventDisposition::Allow
+    );
+    assert_eq!(
+        state.prepare_tui_event_during_submission(
+            &TuiEvent::Key(custom_queue),
+            &target,
+            &dispatch_fence,
+        ),
+        TuiEventDisposition::BlockDispatchingSubmission { disclose: false }
+    );
+
+    state.finish_submission(
+        pending,
+        SubmissionDispatchOutcome::NotApplied(ErrorCode::SubmissionUnavailable),
+    );
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::not_applied(ErrorCode::SubmissionUnavailable)
+    );
 }
 
 #[test]
@@ -781,8 +1017,13 @@ fn accepted_submit_is_pending_until_commit_and_retries_observe_stable_state() {
 }
 
 #[test]
-fn unknown_submit_fences_exact_enter_until_the_user_relinquishes_the_draft() {
+fn unknown_submit_fences_submit_and_queue_bindings_until_the_user_edits() {
     let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let custom_queue = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    target.submission_keys.push(custom_queue);
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let fence = pending.fence();
     mark_submission_pending(&mut state, &target, &[lease_id]);
@@ -792,18 +1033,26 @@ fn unknown_submit_fences_exact_enter_until_the_user_relinquishes_the_draft() {
         WireResult::Unknown
     );
 
+    let default_queue = TuiEvent::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        state.prepare_tui_event(&default_queue, &target),
+        TuiEventDisposition::BlockUnknownSubmission { disclose: true }
+    );
+    assert_eq!(
+        state.prepare_tui_event(&TuiEvent::Key(custom_queue), &target),
+        TuiEventDisposition::BlockUnknownSubmission { disclose: false }
+    );
     let enter = TuiEvent::Key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
         crossterm::event::KeyModifiers::NONE,
     ));
-    assert_eq!(
-        state.prepare_tui_event(&enter, &target),
-        TuiEventDisposition::BlockUnknownSubmission { disclose: true }
-    );
-    assert_eq!(
+    assert!(matches!(
         state.prepare_tui_event(&enter, &target),
         TuiEventDisposition::BlockUnknownSubmission { disclose: false }
-    );
+    ));
     assert!(matches!(
         state.prepare_command(
             ComposerCommand::Submit {
@@ -831,6 +1080,14 @@ fn unknown_submit_fences_exact_enter_until_the_user_relinquishes_the_draft() {
     assert!(fence.is_relinquished());
     assert_eq!(
         state.prepare_tui_event(&enter, &target),
+        TuiEventDisposition::Allow
+    );
+    assert_eq!(
+        state.prepare_tui_event(&default_queue, &target),
+        TuiEventDisposition::Allow
+    );
+    assert_eq!(
+        state.prepare_tui_event(&TuiEvent::Key(custom_queue), &target),
         TuiEventDisposition::Allow
     );
     assert!(matches!(

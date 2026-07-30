@@ -1769,8 +1769,8 @@ impl ChatWidget {
             && !self.bottom_pane.composer_has_pending_pastes()
     }
 
-    pub(crate) fn is_composer_submit_event(&self, event: &crate::tui::TuiEvent) -> bool {
-        matches!(event, crate::tui::TuiEvent::Key(key) if self.bottom_pane.is_composer_submit_key(*key))
+    pub(crate) fn is_composer_submission_event(&self, event: &crate::tui::TuiEvent) -> bool {
+        matches!(event, crate::tui::TuiEvent::Key(key) if self.bottom_pane.is_composer_submission_key(*key))
     }
 
     pub(crate) fn composer_text(&self) -> String {

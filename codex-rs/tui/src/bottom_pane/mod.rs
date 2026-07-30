@@ -1380,8 +1380,8 @@ impl BottomPane {
         self.composer.should_handle_vim_insert_escape(key_event)
     }
 
-    pub(crate) fn is_composer_submit_key(&self, key_event: KeyEvent) -> bool {
-        self.composer.is_submit_key(key_event)
+    pub(crate) fn is_composer_submission_key(&self, key_event: KeyEvent) -> bool {
+        self.composer.is_submission_key(key_event)
     }
 
     pub(crate) fn is_task_running(&self) -> bool {

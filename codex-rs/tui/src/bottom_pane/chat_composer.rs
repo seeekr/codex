@@ -711,8 +711,8 @@ impl ChatComposer {
         self.footer.reasoning_up_key = primary_binding(&keymap.chat.increase_reasoning_effort);
     }
 
-    pub(crate) fn is_submit_key(&self, key_event: KeyEvent) -> bool {
-        self.submit_keys.is_pressed(key_event)
+    pub(crate) fn is_submission_key(&self, key_event: KeyEvent) -> bool {
+        self.submit_keys.is_pressed(key_event) || self.queue_keys.is_pressed(key_event)
     }
 
     pub fn set_collaboration_mode_indicator(
@@ -9014,6 +9014,39 @@ mod tests {
 
         assert_eq!(InputResult::None, result);
         assert_eq!("queue me", composer.draft.textarea.text());
+    }
+
+    #[test]
+    fn semantic_submission_key_tracks_submit_and_queue_bindings() {
+        use crate::key_hint;
+        use crate::keymap::RuntimeKeymap;
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        assert!(composer.is_submission_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        assert!(composer.is_submission_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)));
+
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![key_hint::plain(KeyCode::F(2))];
+        keymap.composer.queue = vec![key_hint::ctrl(KeyCode::Char('q'))];
+        composer.set_keymap_bindings(&keymap);
+
+        assert!(composer.is_submission_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE,)));
+        assert!(
+            composer.is_submission_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL,))
+        );
+        assert!(!composer.is_submission_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+        assert!(!composer.is_submission_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)));
     }
 
     #[test]

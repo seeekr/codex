@@ -222,7 +222,7 @@ pub(crate) trait ComposerControlTarget {
         expected: &str,
         replacement: &str,
     ) -> Result<(), ComposerLeaseError>;
-    fn is_submit_event(&self, event: &TuiEvent) -> bool;
+    fn is_submission_event(&self, event: &TuiEvent) -> bool;
 }
 
 impl ComposerControlTarget for ChatWidget {
@@ -268,8 +268,8 @@ impl ComposerControlTarget for ChatWidget {
         self.replace_composer_owned_text(lease, expected, replacement)
     }
 
-    fn is_submit_event(&self, event: &TuiEvent) -> bool {
-        self.is_composer_submit_event(event)
+    fn is_submission_event(&self, event: &TuiEvent) -> bool {
+        self.is_composer_submission_event(event)
     }
 }
 
@@ -670,8 +670,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
         if !matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
             return TuiEventDisposition::Allow;
         }
-        let is_submit_event = target.is_submit_event(event);
-        if is_submit_event && let Some(dispatch_fence) = dispatch_fence {
+        let is_submission_event = target.is_submission_event(event);
+        if is_submission_event && let Some(dispatch_fence) = dispatch_fence {
             return TuiEventDisposition::BlockDispatchingSubmission {
                 disclose: dispatch_fence.disclose_once(),
             };
@@ -695,7 +695,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 continue;
             }
             let exact = lease.draft_witness.text_hash == text_hash(&snapshot.text);
-            if exact && is_submit_event {
+            if exact && is_submission_event {
                 return TuiEventDisposition::BlockUnknownSubmission {
                     disclose: fence.disclose_once(),
                 };
@@ -1457,9 +1457,11 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                                 && !has_unresolved_draft_provenance(lease)
                                 && !has_live_submit_fence(lease)
                         }
-                        ExternalLeaseState::SubmissionAbandoned { .. } => true,
+                        ExternalLeaseState::SubmittedIntact { .. }
+                        | ExternalLeaseState::SubmissionAbandoned { .. } => {
+                            !has_live_submit_fence(lease)
+                        }
                         ExternalLeaseState::SubmissionPending { .. }
-                        | ExternalLeaseState::SubmittedIntact { .. }
                         | ExternalLeaseState::CorrectionPending { .. } => false,
                     })
             }) else {
