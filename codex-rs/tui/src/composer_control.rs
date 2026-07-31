@@ -671,6 +671,7 @@ struct ExternalLease<L> {
     expected_hash: [u8; 32],
     draft_witness: DraftWitness,
     submit_attempt: Option<SubmitAttempt>,
+    release_on_settle: bool,
 }
 
 impl<L: Copy> Clone for ExternalLease<L> {
@@ -681,6 +682,7 @@ impl<L: Copy> Clone for ExternalLease<L> {
             expected_hash: self.expected_hash,
             draft_witness: self.draft_witness.clone(),
             submit_attempt: self.submit_attempt.clone(),
+            release_on_settle: self.release_on_settle,
         }
     }
 }
@@ -1345,6 +1347,7 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     input_epoch: self.input_epoch,
                 },
                 submit_attempt: None,
+                release_on_settle: false,
             },
         );
         self.lease_order.push_back(lease_id);
@@ -1618,7 +1621,10 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             return WireResult::Unknown;
         }
         if matches!(&lease.state, ExternalLeaseState::SubmissionPending { .. }) {
-            return WireResult::SubmissionPending;
+            if let Some(lease) = self.leases.get_mut(&lease_id) {
+                lease.release_on_settle = true;
+            }
+            return WireResult::Kept;
         }
         let draft_mutation_blocked = has_unresolved_draft_provenance(&lease)
             || self.leases.values().any(|candidate| {
@@ -2060,7 +2066,8 @@ impl<L: Copy + Eq> ComposerControlState<L> {
     }
 
     fn note_submission_committed_id(&mut self, thread_id: &str, submission_id: Uuid) {
-        for lease in self.leases.values_mut() {
+        let mut released = Vec::new();
+        for (lease_id, lease) in &mut self.leases {
             if lease.thread_id != thread_id {
                 continue;
             }
@@ -2076,6 +2083,10 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             if !matching_receipt {
                 continue;
             }
+            if lease.release_on_settle {
+                released.push(*lease_id);
+                continue;
+            }
             if let ExternalLeaseState::SubmissionPending { receipt } = &lease.state {
                 lease.state = ExternalLeaseState::SubmittedIntact {
                     receipt: receipt.clone(),
@@ -2083,10 +2094,14 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             }
             relinquish_unknown_submit(lease);
         }
+        for lease_id in released {
+            self.remove_lease_kept(lease_id);
+        }
     }
 
     fn note_submission_abandoned_id(&mut self, thread_id: &str, submission_id: Uuid) {
-        for lease in self.leases.values_mut() {
+        let mut released = Vec::new();
+        for (lease_id, lease) in &mut self.leases {
             if lease.thread_id != thread_id {
                 continue;
             }
@@ -2094,6 +2109,10 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                 continue;
             };
             if receipt.submission_id == submission_id {
+                if lease.release_on_settle {
+                    released.push(*lease_id);
+                    continue;
+                }
                 lease.state = ExternalLeaseState::SubmissionAbandoned {
                     receipt: receipt.clone(),
                 };
@@ -2102,6 +2121,9 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     fence: None,
                 });
             }
+        }
+        for lease_id in released {
+            self.remove_lease_kept(lease_id);
         }
     }
 
@@ -2116,10 +2138,11 @@ impl<L: Copy + Eq> ComposerControlState<L> {
             .retain(|_, capture| capture.thread_id != thread_id);
         self.capture_order
             .retain(|capture_id| self.captures.contains_key(capture_id));
-        for lease in self
+        let mut released = Vec::new();
+        for (lease_id, lease) in self
             .leases
-            .values_mut()
-            .filter(|lease| lease.thread_id == thread_id)
+            .iter_mut()
+            .filter(|(_, lease)| lease.thread_id == thread_id)
         {
             let receipt = match &lease.state {
                 ExternalLeaseState::SubmissionPending { receipt }
@@ -2139,6 +2162,18 @@ impl<L: Copy + Eq> ComposerControlState<L> {
                     fence: None,
                 });
             }
+            if lease.release_on_settle
+                && matches!(
+                    &lease.state,
+                    ExternalLeaseState::SubmittedIntact { .. }
+                        | ExternalLeaseState::SubmissionAbandoned { .. }
+                )
+            {
+                released.push(*lease_id);
+            }
+        }
+        for lease_id in released {
+            self.remove_lease_kept(lease_id);
         }
         self.leases.retain(|_, lease| {
             lease.thread_id != thread_id

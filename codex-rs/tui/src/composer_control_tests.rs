@@ -479,6 +479,7 @@ fn stored_lease(
             input_epoch: 0,
         },
         submit_attempt,
+        release_on_settle: false,
     }
 }
 
@@ -1724,6 +1725,7 @@ fn lease_capacity_reclaims_oldest_settled_draft_without_removing_its_text() {
                     input_epoch: 0,
                 },
                 submit_attempt: None,
+                release_on_settle: false,
             },
         );
         oldest_id.get_or_insert(lease_id);
@@ -2797,7 +2799,7 @@ fn live_unknown_draft_does_not_block_an_independent_submitted_correction() {
 }
 
 #[test]
-fn pending_submission_cannot_be_retired_before_commit_truth() {
+fn pending_submission_keep_releases_on_commit_without_resubmitting() {
     let (mut state, mut target, lease_id) = inserted_draft("dictated");
     let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
     let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
@@ -2813,23 +2815,32 @@ fn pending_submission_cannot_be_retired_before_commit_truth() {
             &mut target,
             /*app_overlay_active*/ false,
         ),
-        WireResult::SubmissionPending
+        WireResult::Kept
+    );
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Kept,
+        "a lost Keep response remains idempotent while the accepted submission is pending"
     );
     assert!(matches!(
         state.prepare_command(
-            ComposerCommand::Replace {
+            ComposerCommand::Submit {
                 lease_id,
                 expected: "dictated".to_string(),
-                replacement: "dictated".to_string(),
             },
             &mut target,
             /*app_overlay_active*/ false,
         ),
-        CommandExecution::Complete(WireResult::SubmissionPending)
+        CommandExecution::Complete(WireResult::SendAccepted)
     ));
     assert!(state.leases.contains_key(&lease_id));
 
     state.note_submission_committed_id("synthetic-thread", submission_id);
+    assert!(!state.leases.contains_key(&lease_id));
     assert_eq!(
         state.execute(
             ComposerCommand::Keep { lease_id },
@@ -2838,6 +2849,91 @@ fn pending_submission_cannot_be_retired_before_commit_truth() {
         ),
         WireResult::Kept
     );
+    assert!(matches!(
+        state.prepare_command(
+            ComposerCommand::Submit {
+                lease_id,
+                expected: "dictated".to_string(),
+            },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        CommandExecution::Complete(WireResult::Error {
+            code: ErrorCode::LeaseUnavailable,
+            outcome: MutationOutcome::NotApplied,
+        })
+    ));
+}
+
+#[test]
+fn pending_submission_keep_releases_on_abandonment() {
+    let (mut state, mut target, lease_id) = inserted_draft("dictated");
+    let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+    let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+    state.finish_submission(pending, SubmissionDispatchOutcome::Accepted, &mut target);
+    assert_eq!(
+        reply_rx.recv().expect("submit response"),
+        WireResult::SendAccepted
+    );
+
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Kept
+    );
+    state.note_submission_abandoned_id("synthetic-thread", submission_id);
+
+    assert!(!state.leases.contains_key(&lease_id));
+    assert_eq!(
+        state.execute(
+            ComposerCommand::Keep { lease_id },
+            &mut target,
+            /*app_overlay_active*/ false,
+        ),
+        WireResult::Kept
+    );
+}
+
+#[test]
+fn pending_submission_keep_releases_when_thread_settles() {
+    for survives_rollback in [false, true] {
+        let (mut state, mut target, lease_id) = inserted_draft("dictated");
+        let (pending, reply_rx) = start_submit(&mut state, &mut target, lease_id, "dictated");
+        let submission_id = mark_submission_pending(&mut state, &target, &[lease_id]);
+        state.finish_submission(pending, SubmissionDispatchOutcome::Accepted, &mut target);
+        assert_eq!(
+            reply_rx.recv().expect("submit response"),
+            WireResult::SendAccepted
+        );
+        assert_eq!(
+            state.execute(
+                ComposerCommand::Keep { lease_id },
+                &mut target,
+                /*app_overlay_active*/ false,
+            ),
+            WireResult::Kept
+        );
+
+        let surviving = if survives_rollback {
+            HashSet::from([submission_id])
+        } else {
+            HashSet::new()
+        };
+        state.note_thread_rolled_back("synthetic-thread", &surviving);
+
+        assert!(!state.leases.contains_key(&lease_id));
+        assert_eq!(
+            state.execute(
+                ComposerCommand::Keep { lease_id },
+                &mut target,
+                /*app_overlay_active*/ false,
+            ),
+            WireResult::Kept
+        );
+    }
 }
 
 #[test]
